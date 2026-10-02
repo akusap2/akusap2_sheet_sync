@@ -58,10 +58,35 @@ const RESEARCH_MIN_SPOT_PRICE = 5; // filters out penny-adjacent names from the 
 // weighted lower for Risky on purpose, since that bucket is explicitly
 // the higher-risk-tolerance one; weighted meaningfully for Quick and Leap.
 // 'priceFit' is the soft $300 preference — same modest weight everywhere.
+// 'pullback' is the mirror image of 'momentum' (see
+// pullbackOpportunityScore_ in Options_Validator.gs) — a "buy the dip on
+// an otherwise solid name" signal, rewarding a recent short-window
+// DECLINE instead of a recent rally. Added at the user's request after
+// noticing recommendations skewed toward names that had already popped
+// that day. Quick/Risky: momentum's old weight is split roughly in half
+// with pullback, so both a breakout and a pullback can still surface a
+// candidate, rather than one fully replacing the other. Leap never had
+// a momentum weight to split — a smaller amount is trimmed from trend
+// instead, since Leap's longer hold period makes a 5-day wiggle less
+// central than it is for Quick/Risky.
+// meanReversion (Quick only, 14%) — a quality company with a recent
+// pullback WHILE its longer-term trend is still intact (see
+// meanReversionSetupScore_ in Options_Validator.gs). This is a
+// genuinely different signal than standalone pullback (which rewards
+// ANY recent dip, trend or no trend) and standalone trend (which
+// rewards ANY uptrend, dip or no dip) — it specifically rewards the
+// combination. pullback's own weight trimmed harder than everything
+// else here since it overlaps most directly with the new factor.
+//
+// overextension (Quick only, 12%) — the mirror image: a fast, large
+// run well above trend carries more snapback risk than the same
+// distance climbed gradually (see overextensionRiskScore_). Built from
+// the same two inputs as momentum/trend, so those two are trimmed
+// specifically harder here too, same reasoning as pullback above.
 const RESEARCH_WEIGHTS = {
-  Quick: { momentum: 22, trend: 14, atr: 18, rs: 18, drawdown: 18, priceFit: 10 },
-  Risky: { momentum: 27, atr: 27, trend: 9, rs: 13, drawdown: 14, priceFit: 10 },
-  Leap: { quality: 22, trend: 18, rs: 14, upside: 18, drawdown: 18, priceFit: 10 }
+  Quick: { momentum: 5, pullback: 4, trend: 6, atr: 11, rs: 13, drawdown: 11, priceFit: 6, trackRecord: 5, quality: 13, meanReversion: 14, overextension: 12 },
+  Risky: { momentum: 14, pullback: 13, atr: 27, trend: 9, rs: 13, drawdown: 14, priceFit: 10 },
+  Leap: { quality: 22, trend: 12, pullback: 6, rs: 14, upside: 18, drawdown: 18, priceFit: 10 }
 };
 
 // Curated candidate universe — liquid, optionable, large/mid-cap US
@@ -203,7 +228,7 @@ function priceFitScore_(spot) {
  * logic, just gathering what already exists per ticker.
  * ========================================================================== */
 
-function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaVantageApiKey, slowCache, pendingWrites) {
+function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaVantageApiKey, slowCache, pendingWrites, personalTrackRecordMap) {
   let fetchAttempted = false;
 
   const barsResult = getSlowCached_(slowCache, pendingWrites, 'DAILYBARS', ticker, SLOW_REFRESH_DAYS.DAILYBARS, function () {
@@ -224,6 +249,9 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
   // below as a "least loss" factor: a smaller recent max drawdown scores
   // better, all else equal, across all three tabs.
   const maxDrawdownPercent = computeMaxDrawdownPercent_(bars);
+  // Same bars again — feeds Quick's meanReversionSetupScore_ snapback
+  // bonus (see computeSnapbackRecoveryPercent_ in Options_Validator.gs).
+  const snapbackRecoveryPercent = computeSnapbackRecoveryPercent_(bars);
 
   const analystResult = getSlowCached_(slowCache, pendingWrites, 'ANALYST', ticker, SLOW_REFRESH_DAYS.ANALYST, function () {
     let a = fetchYahooAnalystTarget_(ticker);
@@ -252,12 +280,16 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
   }
 
   const isLargeOrMegaCap = resolveIsLargeOrMegaCap_(ticker, slowCache, pendingWrites);
+  const tickerTrackRecord = personalTrackRecordMap ? personalTrackRecordMap[ticker] : null;
 
   return {
     ticker: ticker, spot: spot, atrPercent: atrPercent, trendPercent: trendPercent,
     momentumPercent: momentumPercent, rsPercent: rsPercent, upsidePercent: upsidePercent,
     qualityScore: qualityScoreValue, maxDrawdownPercent: maxDrawdownPercent,
-    isLargeOrMegaCap: isLargeOrMegaCap, fetchAttempted: fetchAttempted
+    isLargeOrMegaCap: isLargeOrMegaCap, fetchAttempted: fetchAttempted,
+    trackRecordAvgReturn: tickerTrackRecord ? tickerTrackRecord.avgReturnPercent : null,
+    trackRecordTradeCount: tickerTrackRecord ? tickerTrackRecord.tradeCount : 0,
+    snapbackRecoveryPercent: snapbackRecoveryPercent
   };
 }
 
@@ -276,15 +308,17 @@ function computeResearchScoreForTab_(tabName, inputs) {
   if (tabName === 'Leap') {
     const quality = qualityScore_(inputs.qualityScore);
     const trend = trendAlignmentScore_(inputs.trendPercent, 'C');
+    const pullback = pullbackOpportunityScore_(inputs.momentumPercent, 'C');
     const rs = relativeStrengthScore_(inputs.rsPercent, 'C');
     const upside = upsideAlignmentScore_(inputs.upsidePercent, 'C');
     const lowDrawdown = 100 - drawdownRiskScore_(inputs.maxDrawdownPercent);
-    const totalWeight = w.quality + w.trend + w.rs + w.upside + w.drawdown + w.priceFit;
-    const weightedSum = quality * w.quality + trend * w.trend + rs * w.rs + upside * w.upside + lowDrawdown * w.drawdown + priceFit * w.priceFit;
+    const totalWeight = w.quality + w.trend + w.pullback + w.rs + w.upside + w.drawdown + w.priceFit;
+    const weightedSum = quality * w.quality + trend * w.trend + pullback * w.pullback + rs * w.rs + upside * w.upside + lowDrawdown * w.drawdown + priceFit * w.priceFit;
     return Math.round((weightedSum / totalWeight) * 10) / 10;
   }
 
   const momentum = momentumAlignmentScore_(inputs.momentumPercent, 'C');
+  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, 'C');
   const trend = trendAlignmentScore_(inputs.trendPercent, 'C');
   // Quick is large/mega-cap only — use the scale calibrated for that
   // pool (see atrOpportunityScoreLargeCap_'s doc comment). Risky is
@@ -292,8 +326,24 @@ function computeResearchScoreForTab_(tabName, inputs) {
   const atr = (tabName === 'Quick') ? atrOpportunityScoreLargeCap_(inputs.atrPercent) : atrOpportunityScore_(inputs.atrPercent);
   const rs = relativeStrengthScore_(inputs.rsPercent, 'C');
   const lowDrawdown = 100 - drawdownRiskScore_(inputs.maxDrawdownPercent);
-  const totalWeight = w.momentum + w.trend + w.atr + w.rs + w.drawdown + w.priceFit;
-  const weightedSum = momentum * w.momentum + trend * w.trend + atr * w.atr + rs * w.rs + lowDrawdown * w.drawdown + priceFit * w.priceFit;
+  // trackRecord and quality only exist in Quick's weights (undefined for
+  // Risky) — ||0 means neither contributes anything for Risky, leaving
+  // that formula completely unchanged.
+  const trackRecordWeight = w.trackRecord || 0;
+  const trackRecord = trackRecordWeight ? personalTrackRecordScore_(inputs.trackRecordAvgReturn, inputs.trackRecordTradeCount) : 0;
+  const qualityWeight = w.quality || 0;
+  const quality = qualityWeight ? qualityScore_(inputs.qualityScore) : 0;
+  const meanReversionWeight = w.meanReversion || 0;
+  const meanReversion = meanReversionWeight ? meanReversionSetupScore_(inputs.momentumPercent, inputs.trendPercent, inputs.snapbackRecoveryPercent) : 0;
+  const overextensionWeight = w.overextension || 0;
+  // Inverted — overextensionRiskScore_ is "higher = riskier", but every
+  // other factor here is "higher = better", same reason lowDrawdown
+  // inverts drawdownRiskScore_ above.
+  const lowOverextension = overextensionWeight ? (100 - overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent)) : 0;
+  const totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + trackRecordWeight + qualityWeight + meanReversionWeight + overextensionWeight;
+  const weightedSum = momentum * w.momentum + pullback * w.pullback + trend * w.trend + atr * w.atr + rs * w.rs +
+    lowDrawdown * w.drawdown + priceFit * w.priceFit + trackRecord * trackRecordWeight + quality * qualityWeight +
+    meanReversion * meanReversionWeight + lowOverextension * overextensionWeight;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -311,19 +361,30 @@ function computeMissingWeightShare_(tabName, inputs) {
   let totalWeight;
 
   if (tabName === 'Leap') {
-    totalWeight = w.quality + w.trend + w.rs + w.upside + w.drawdown + w.priceFit;
+    totalWeight = w.quality + w.trend + w.pullback + w.rs + w.upside + w.drawdown + w.priceFit;
     if (inputs.qualityScore == null) missingWeight += w.quality;
     if (inputs.trendPercent == null) missingWeight += w.trend;
+    if (inputs.momentumPercent == null) missingWeight += w.pullback;
     if (inputs.rsPercent == null) missingWeight += w.rs;
     if (inputs.upsidePercent == null) missingWeight += w.upside;
     if (inputs.maxDrawdownPercent == null) missingWeight += w.drawdown;
   } else {
-    totalWeight = w.momentum + w.trend + w.atr + w.rs + w.drawdown + w.priceFit;
-    if (inputs.momentumPercent == null) missingWeight += w.momentum;
+    // trackRecord deliberately excluded here — a ticker with no trades
+    // yet isn't "missing data," it's a normal, expected state, already
+    // handled by personalTrackRecordScore_'s own neutral default.
+    // quality (Quick-only; w.quality is undefined for Risky) follows
+    // the same null-check pattern as everywhere else.
+    const qualityWeight = w.quality || 0;
+    const meanReversionWeight = w.meanReversion || 0;
+    const overextensionWeight = w.overextension || 0;
+    totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + qualityWeight + meanReversionWeight + overextensionWeight;
+    if (inputs.momentumPercent == null) missingWeight += (w.momentum + w.pullback + meanReversionWeight + overextensionWeight);
+    else if (inputs.trendPercent == null) missingWeight += (meanReversionWeight + overextensionWeight); // avoid double-adding if momentum was already null
     if (inputs.trendPercent == null) missingWeight += w.trend;
     if (inputs.atrPercent == null) missingWeight += w.atr;
     if (inputs.rsPercent == null) missingWeight += w.rs;
     if (inputs.maxDrawdownPercent == null) missingWeight += w.drawdown;
+    if (qualityWeight && inputs.qualityScore == null) missingWeight += qualityWeight;
   }
 
   return totalWeight > 0 ? (missingWeight / totalWeight) * 100 : 0;
@@ -341,18 +402,38 @@ function buildResearchReason_(tabName, inputs) {
   const capTierText = (tabName !== 'Risky') ? 'Large/mega-cap. ' : '';
 
   if (tabName === 'Leap') {
+    const leapMomentumLabel = inputs.momentumPercent == null ? ''
+      : inputs.momentumPercent < 0 ? ' (pullback)' : inputs.momentumPercent > 0 ? ' (momentum)' : '';
     return capTierText + priceText + 'Quality ' + (inputs.qualityScore != null ? inputs.qualityScore.toFixed(1) + '/5' : 'n/a') +
       ', analyst upside ' + pctText_(inputs.upsidePercent) +
       ', trend ' + pctText_(inputs.trendPercent) + ' vs 20DMA' +
+      ', 5D change ' + pctText_(inputs.momentumPercent) + leapMomentumLabel +
       ', RS ' + pctText_(inputs.rsPercent) + ' vs SPY' +
       ', ~2mo max drawdown ' + drawdownText +
       ' \u2014 steady long-term conviction pick.' + confidenceNote;
   }
-  return capTierText + priceText + '5D momentum ' + pctText_(inputs.momentumPercent) +
+  const momentumLabel = inputs.momentumPercent == null ? ''
+    : inputs.momentumPercent < 0 ? ' (pullback)' : inputs.momentumPercent > 0 ? ' (momentum)' : '';
+  const trackRecordText = (tabName === 'Quick' && inputs.trackRecordTradeCount > 0)
+    ? (', your last ' + inputs.trackRecordTradeCount + ' trade(s) on this ticker averaged ' + pctText_(inputs.trackRecordAvgReturn))
+    : '';
+  const qualityText = (tabName === 'Quick')
+    ? (', Quality ' + (inputs.qualityScore != null ? inputs.qualityScore.toFixed(1) + '/5' : 'n/a'))
+    : '';
+  const overextensionScoreForText = (tabName === 'Quick') ? overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent) : 0;
+  const overextensionText = (tabName === 'Quick' && overextensionScoreForText >= 40)
+    ? ' \u2014 run up fast and far above trend, elevated snapback risk'
+    : '';
+  const meanReversionText = (tabName === 'Quick' && inputs.snapbackRecoveryPercent != null && inputs.snapbackRecoveryPercent > 0)
+    ? (' \u2014 sharp drop on volume, already ' + round2_(inputs.snapbackRecoveryPercent) + '% off the low (snapback)')
+    : (tabName === 'Quick' && inputs.momentumPercent != null && inputs.momentumPercent < 0 && inputs.trendPercent != null && inputs.trendPercent > 0)
+    ? ' \u2014 pulled back short-term with the longer trend still intact (mean-reversion setup)'
+    : '';
+  return capTierText + priceText + '5D change ' + pctText_(inputs.momentumPercent) + momentumLabel +
     ', RS ' + pctText_(inputs.rsPercent) + ' vs SPY' +
     ', ATR ' + (inputs.atrPercent != null ? round2_(inputs.atrPercent) + '%' : 'n/a') +
     ', trend ' + pctText_(inputs.trendPercent) + ' vs 20DMA' +
-    ', ~2mo max drawdown ' + drawdownText +
+    ', ~2mo max drawdown ' + drawdownText + qualityText + trackRecordText + meanReversionText + overextensionText +
     (tabName === 'Risky' ? ' \u2014 fast mover suited to a short hold.' : ' \u2014 solid short-term setup.') + confidenceNote;
 }
 
@@ -447,11 +528,18 @@ function collectCurrentTabTickers_(sheetName) {
   const map = getColumnMap_(sheet);
   if (!map.ticker) return [];
   const lastRow = sheet.getLastRow();
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 0) return [];
+  // One bulk read of the ticker column instead of a getValue() call per
+  // row — same fix as validateAndUpdate's row-read batching, applied
+  // here since this runs at the very start of every Research pass, three
+  // times (once per tab), before anything else even begins.
+  const values = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
   const tickers = [];
-  for (let row = DATA_START_ROW; row <= lastRow; row++) {
-    const v = sheet.getRange(row, map.ticker).getValue();
+  values.forEach(function (r) {
+    const v = r[0];
     if (v) tickers.push(String(v).trim().toUpperCase());
-  }
+  });
   return tickers;
 }
 
@@ -589,7 +677,15 @@ function prefetchDailyBarsViaCloudFunction_(tickers, slowCache, pendingWrites) {
 }
 
 
-function runDailyResearch(timeBudgetMsOverride) {
+// Safe diagnostic entry point — runs Research's full real scoring logic,
+// but skips writing the Research tab and skips updating RESEARCH_LAST_*
+// (so Promote isn't affected if run afterward). See dryRun checks inside
+// runDailyResearch.
+function runDailyResearchDryRun() {
+  runDailyResearch(null, true);
+}
+
+function runDailyResearch(timeBudgetMsOverride, dryRun) {
   const ui = tryGetUi_();
   const scriptStartTime = Date.now();
   const timeBudgetMs = timeBudgetMsOverride || RESEARCH_EXECUTION_TIME_BUDGET_MS;
@@ -628,6 +724,11 @@ function runDailyResearch(timeBudgetMsOverride) {
   });
   const spyBars = spyBarsResult.value;
 
+  // Quick-specific, but computed once here regardless (pure local sheet
+  // read, no network call) and passed into every candidate — see
+  // computePersonalTrackRecordByTicker_ in Options_Validator.gs.
+  const personalTrackRecordMap = computePersonalTrackRecordByTicker_('Quick');
+
   const scored = [];
   let processed = 0;
   let timeBudgetExceeded = false;
@@ -635,7 +736,7 @@ function runDailyResearch(timeBudgetMsOverride) {
   for (let i = 0; i < candidateTickers.length; i++) {
     if (Date.now() - scriptStartTime > timeBudgetMs) { timeBudgetExceeded = true; break; }
     const ticker = candidateTickers[i];
-    const inputs = gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaVantageApiKey, slowCache, pendingWrites);
+    const inputs = gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaVantageApiKey, slowCache, pendingWrites, personalTrackRecordMap);
     processed++;
     if (inputs && !inputs.unusable) scored.push(inputs);
     // Only throttle when a real network call actually happened for this
@@ -676,8 +777,21 @@ function runDailyResearch(timeBudgetMsOverride) {
       added: currentTickers.filter(function (t) { return prevTickers.indexOf(t) === -1; }),
       removed: prevTickers.filter(function (t) { return currentTickers.indexOf(t) === -1; })
     };
-    props.setProperty('RESEARCH_LAST_' + tabName.toUpperCase(), JSON.stringify(currentTickers));
+    if (!dryRun) {
+      props.setProperty('RESEARCH_LAST_' + tabName.toUpperCase(), JSON.stringify(currentTickers));
+    }
   });
+
+  if (dryRun) {
+    tabs.forEach(function (tabName) {
+      const top5 = picks[tabName].slice(0, 5).map(function (p) { return p.ticker + ' (' + p.score + ')'; }).join(', ');
+      logToSheet_('DRY RUN (Research, ' + tabName + ') — would write top pick(s): ' + top5 +
+        '. Would record ' + changes[tabName].added.length + ' added, ' + changes[tabName].removed.length + ' removed vs last run.' +
+        ' RESEARCH_LAST_' + tabName.toUpperCase() + ' was NOT updated (Promote would see the OLD snapshot if run after this).');
+    });
+    notify_(ui, 'Dry Run Complete', 'Nothing was written to the Research tab, and RESEARCH_LAST_* was not updated. Check ScriptLog for one line per tab.');
+    return { timeBudgetExceeded: timeBudgetExceeded };
+  }
 
   writeResearchSheet_(picks, nearMisses, changes, timeBudgetExceeded, processed, candidateTickers.length);
 

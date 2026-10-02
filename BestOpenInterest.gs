@@ -673,7 +673,7 @@ function runDeepDiveScan(tickerOverride) {
     return [
       0,                                            // Rank (filled in below)
       ticker,                                        // B
-      new Date((row.expEpoch + 86400) * 1000),        // C — +1 day corrects tz offset
+      new Date(row.expEpoch * 1000),                   // C — expEpoch is already correctly noon-anchored; the old +86400 (+1 day) adjustment here was a leftover from before the Cloud Function migration and was double-correcting, confirmed by tracing the exact math against a real observed bug (a Friday expiration landing on the following, nonexistent Saturday)
       formatStrikeLabel_(row.strike, optionType),      // D
       round2DeepDive_(row.delta),                       // E
       ivColumnIsPercentFormatted ? row.iv : (round2DeepDive_(row.iv * 100) + '%'), // F

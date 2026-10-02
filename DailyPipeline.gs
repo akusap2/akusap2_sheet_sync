@@ -304,7 +304,7 @@ function findTickersNeedingContract_(sheet, map) {
 // Reads the LAST Research run's top-20 picks for tabName straight from the
 // same snapshot ResearchEngine.gs already writes (RESEARCH_LAST_<TAB>) —
 // no need to re-read or re-parse the Research sheet itself.
-function promoteResearchPicksForTab_(tabName) {
+function promoteResearchPicksForTab_(tabName, dryRun) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(tabName);
   if (!sheet) return { added: 0, deleted: 0, keptWithPosition: 0, keptColored: 0, addedTickers: [] };
@@ -323,12 +323,26 @@ function promoteResearchPicksForTab_(tabName) {
   let keptWithPosition = 0;
   let keptColored = 0;
 
+  const numRows = lastRow - DATA_START_ROW + 1;
+  // Bulk reads instead of three individual getValue()/getBackground()
+  // calls per row — same fix as validateAndUpdate and
+  // collectCurrentTabTickers_, applied here since this loop was
+  // measured taking well over a minute even for a small handful of rows
+  // with nothing to add or remove.
+  let tickerValues = [], entryPriceValues = [], tickerBackgrounds = [];
+  if (numRows > 0) {
+    tickerValues = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
+    entryPriceValues = map.entryPrice ? sheet.getRange(DATA_START_ROW, map.entryPrice, numRows, 1).getValues() : null;
+    tickerBackgrounds = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getBackgrounds();
+  }
+
   for (let row = DATA_START_ROW; row <= lastRow; row++) {
-    const ticker = String(sheet.getRange(row, map.ticker).getValue()).trim().toUpperCase();
+    const rowIdx = row - DATA_START_ROW;
+    const ticker = String(tickerValues[rowIdx][0]).trim().toUpperCase();
     if (!ticker) continue;
     existingTickerSet[ticker] = true;
 
-    const entryPriceRaw = map.entryPrice ? sheet.getRange(row, map.entryPrice).getValue() : '';
+    const entryPriceRaw = entryPriceValues ? entryPriceValues[rowIdx][0] : '';
     const hasPosition = isPlausible_(parseFloat(entryPriceRaw), 0.01, null);
 
     if (hasPosition) {
@@ -341,7 +355,7 @@ function promoteResearchPicksForTab_(tabName) {
     // Research's current view. Any non-white background counts; this
     // script never colors the Ticker column itself for any other
     // reason, so a color there can only mean you set it yourself.
-    const tickerBackground = sheet.getRange(row, map.ticker).getBackground();
+    const tickerBackground = tickerBackgrounds[rowIdx][0];
     const isColored = tickerBackground && tickerBackground !== '#ffffff' && tickerBackground !== '';
 
     if (isColored) {
@@ -356,17 +370,48 @@ function promoteResearchPicksForTab_(tabName) {
 
   // Delete from the bottom up so earlier row numbers in the list stay valid.
   rowsToDelete.sort(function (a, b) { return b - a; });
+  const newTickers = researchTickers.filter(function (t) { return !existingTickerSet[t]; });
+
+  if (dryRun) {
+    logToSheet_('DRY RUN (Promote, ' + tabName + ') — would delete ' + rowsToDelete.length + ' row(s): ' +
+      (rowsToDelete.length ? rowsToDelete.join(', ') : 'none') + '. Would add ' + newTickers.length + ' ticker(s): ' +
+      (newTickers.length ? newTickers.join(', ') : 'none') + '. Kept (open position): ' + keptWithPosition +
+      '. Kept (manually colored): ' + keptColored + '.');
+    return { added: newTickers.length, deleted: rowsToDelete.length, keptWithPosition: keptWithPosition, keptColored: keptColored, addedTickers: newTickers };
+  }
+
   rowsToDelete.forEach(function (row) { sheet.deleteRow(row); });
 
-  const newTickers = researchTickers.filter(function (t) { return !existingTickerSet[t]; });
   if (newTickers.length) {
-    const startRow = sheet.getLastRow() + 1;
-    newTickers.forEach(function (t, i) {
-      sheet.getRange(startRow + i, map.ticker).setValue(t);
-    });
+    // Anchored on the actual last row with a real Ticker value, not
+    // sheet.getLastRow() — that can be inflated by stray formatting or a
+    // leftover trailing-formula extension in a far-right column from an
+    // earlier, larger dataset, which would insert new tickers several
+    // rows below the real data and leave a blank-row gap in between.
+    const sheetLastRow = sheet.getLastRow();
+    let lastTickerRow = DATA_START_ROW - 1;
+    if (sheetLastRow >= DATA_START_ROW) {
+      const freshTickerValues = sheet.getRange(DATA_START_ROW, map.ticker, sheetLastRow - DATA_START_ROW + 1, 1).getValues();
+      for (let i = freshTickerValues.length - 1; i >= 0; i--) {
+        if (freshTickerValues[i][0]) { lastTickerRow = DATA_START_ROW + i; break; }
+      }
+    }
+    const startRow = lastTickerRow + 1;
+    sheet.getRange(startRow, map.ticker, newTickers.length, 1).setValues(newTickers.map(function (t) { return [t]; }));
   }
 
   return { added: newTickers.length, deleted: rowsToDelete.length, keptWithPosition: keptWithPosition, keptColored: keptColored, addedTickers: newTickers };
+}
+
+// Safe diagnostic entry point — runs Promote's real read/decide logic
+// for every tab, but every delete/add is logged instead of actually
+// happening. Check ScriptLog after running this for one line per tab.
+function promoteResearchPicksForTabDryRun() {
+  ['Quick', 'Risky', 'Leap'].forEach(function (tabName) {
+    promoteResearchPicksForTab_(tabName, true);
+  });
+  const ui = tryGetUi_();
+  notify_(ui, 'Dry Run Complete', 'Nothing was added or removed. Check ScriptLog for one line per tab showing what would have happened.');
 }
 
 
@@ -474,7 +519,9 @@ function runDailyPipelineAutofillStage_(state) {
       sheet.getRange(row, map.strike).setValue(formatStrikeLabel_(best.strike, optionType));
     }
     if (map.expiry && (currentExpiry === '' || currentExpiry == null)) {
-      sheet.getRange(row, map.expiry).setValue(new Date((best.expEpoch + 86400) * 1000));
+      // expEpoch is already correctly noon-anchored — see the matching
+      // fix and explanation in BestOpenInterest.gs's own row conversion.
+      sheet.getRange(row, map.expiry).setValue(new Date(best.expEpoch * 1000));
     }
     passFilled++; totals.filled++;
   }

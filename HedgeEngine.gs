@@ -55,7 +55,16 @@ const HEDGE_EXECUTION_TIME_BUDGET_MS = 5 * 60 * 1000;
 
 // Target DTE buckets for candidate expiries. "mid" is the ideal DTE within
 // each bucket, used to pick the closest real listed expiration.
+// '1-5 DTE' added for short-hold strategies (e.g. Quick's 5-day target) —
+// every other bucket here is longer than that entire hold period, so
+// there was previously no way to get a Friday-matched tail hedge sized to
+// a position you're planning to exit within the week anyway. mid:3 lands
+// on the nearest listed expiry to 3 days out — for a Monday-Thursday
+// entry, this reliably finds that same week's Friday, since weekly
+// options expire on Fridays; pickExpiryForBucket_ needs no changes to
+// handle this correctly, since its own logic is already generic.
 const HEDGE_DTE_BUCKETS = [
+  { label: '1-5 DTE', min: 1, max: 5, mid: 3 },
   { label: '7-14 DTE', min: 7, max: 14, mid: 10 },
   { label: '15-21 DTE', min: 15, max: 21, mid: 18 },
   { label: '22-35 DTE', min: 22, max: 35, mid: 28 },

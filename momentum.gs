@@ -62,6 +62,15 @@ const HEADER_MAP = {
   // You're expected to have your own =GOOGLEFINANCE(ticker,"price") formula
   // in this column; the script reads whatever it shows.
   stockPrice: ['StockPrice', 'Current Stock Price', 'Current'],
+  // 52-week low/high and market cap — script-fetched now (see
+  // fetchStockPriceAnd52WeekRange_) only when the cell is blank; never
+  // overwrites an existing value.
+  l52: ['L52', '52 Week Low', '52-Week Low', 'Low52'],
+  h52: ['H52', '52 Week High', '52-Week High', 'High52'],
+  cap: ['Cap', 'Market Cap', 'MarketCap'],
+  // Optional — only written if this column exists on the sheet. See
+  // getNewsRisk in NewsRisk.gs.
+  news: ['News', 'News Risk', 'NewsFlags'],
   greekDelta: ['Delta'],
   gamma: ['Gamma'],
   bidAskSpread: ['Slippage', 'Bid/Ask Spread', 'Bid-Ask Spread', 'Spread %', 'Spread'],
@@ -210,6 +219,15 @@ const RS_LOOKBACK_DAYS = 5;
 // if your actual targets change; nothing else needs updating.
 const RISK_PROFIT_TARGET_PERCENT = 20;
 const RISK_LOSS_TOLERANCE_PERCENT = 50;
+
+// Quick's own Risk score is calibrated against THIS, not the 50% above —
+// built after confirming (via the Results tab) that real Quick trades
+// target 1-3% and close within 1-5 days, not the 20%-profit/50%-loss
+// framework the rest of this constant block assumes. 15% is a judgment
+// call — roughly a 1:5 ratio against a typical ~3% win, asymmetric but
+// not extreme — worth a sanity check against real numbers as more
+// trades come in, same as drawdownRiskScore_'s own clamp range.
+const QUICK_RISK_LOSS_TOLERANCE_PERCENT = 15;
 
 // Leap bucket's own thresholds — a completely different exit philosophy
 // from the swing/put side: long-dated, high-delta, stock-replacement
@@ -1057,6 +1075,11 @@ function removeScheduledRuns_() {
 }
 
 
+// STANDING RULE: every debug/diagnostic menu item goes in the "⚙ More
+// Tools" submenu below, never at a menu's top level — keeps the
+// top-level menus to the actions actually used day to day. Applies to
+// any new debug tool added to this project going forward, across any
+// of its menus (Options Validator, DeepDive, Hedge, Research).
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Options Validator')
@@ -1083,10 +1106,16 @@ function onOpen() {
       .addItem('⏰ Enable Scheduled Runs (weekdays)', 'installScheduledRuns_')
       .addItem('⏰ Disable Scheduled Runs', 'removeScheduledRuns_')
       .addSeparator()
+      // All debug tools live here from now on — see note at onOpen's
+      // definition for the standing rule that any new debug tool added
+      // to this project goes in this submenu, not at the top level.
       .addItem('🔍 Debug: Show Detected Columns', 'debugShowColumns')
       .addItem('🔬 Debug: Fetch Raw Quote (one row)', 'debugFetchRawQuote')
       .addItem('📅 Debug: Fetch Earnings (one ticker)', 'debugFetchEarnings')
-      .addItem('🔎 Debug: Scan One Ticker\'s Chain', 'debugScanTickerChain'))
+      .addItem('🔎 Debug: Scan One Ticker\'s Chain', 'debugScanTickerChain')
+      .addItem('🔬 Debug: Scan Chain Dry Run (no writes)', 'scanOptionChainForBestOiDryRun')
+      .addItem('🔬 Debug: Best-OI Raw Expiration Dates (one ticker)', 'debugBestOiExpirationDates')
+      .addItem('🔬 Debug: Validate & Update + Sort (stops before highlight)', 'validateAndUpdateDryRun'))
     .addToUi();
 
   // Separate top-level menu for BestOpenInterest.gs's single-ticker,
@@ -1117,6 +1146,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('🔎 Research')
     .addItem('Run Daily Research', 'runDailyResearch')
+    .addItem('🔬 Debug: Promote Dry Run (no writes)', 'promoteResearchPicksForTabDryRun')
+    .addItem('🔬 Debug: Research Dry Run (no writes)', 'runDailyResearchDryRun')
     .addItem('🚀 Run Full Daily Pipeline (Research + Promote + Auto-fill / Best OI)', 'runDailyPipeline')
     .addItem('☁️ Set Cloud Function URL/Secret', 'setCloudFunctionCredentials')
     .addToUi();
@@ -1518,6 +1549,20 @@ function extendFormulaColumnsToLastRow_(sheet, map) {
   const lastCol = sheet.getLastColumn();
   if (lastCol < 1) return 0;
 
+  // These columns are always plain values by design — user-typed or
+  // script-written (Ticker, Strike, Expiry, Entry Date, Entry Price) —
+  // never formulas. Excluded here so a stray formula that ever ended up
+  // in one of them (e.g. an old copy-paste) can never get detected as
+  // "the formula for this column" and copied down into newly-added rows,
+  // overwriting Auto-fill's freshly-written Strike/Expiry with a formula
+  // that evaluates to blank once its relative references shift onto a
+  // row with different data. Confirmed as the cause of Strike/Expiry
+  // disappearing on rows the Pipeline had just added and auto-filled.
+  const excludedCols = {};
+  [map.ticker, map.strike, map.expiry, map.entryDate, map.entryPrice].forEach(function (c) {
+    if (c) excludedCols[c] = true;
+  });
+
   const numRows = lastRow - DATA_START_ROW + 1;
   const dataRange = sheet.getRange(DATA_START_ROW, 1, numRows, lastCol);
   const allFormulas = dataRange.getFormulasR1C1();
@@ -1525,6 +1570,7 @@ function extendFormulaColumnsToLastRow_(sheet, map) {
   let extendedCols = 0;
 
   for (let col = 1; col <= lastCol; col++) {
+    if (excludedCols[col]) continue;
     let lowestFormulaRowIndex = -1; // 0-based index into allFormulas
     for (let i = numRows - 1; i >= 0; i--) {
       const f = allFormulas[i][col - 1];
@@ -1832,6 +1878,12 @@ function debugFetchRawQuote() {
     output += 'Raw cell formatted in spreadsheet tz: ' + safe_(function () {
       return Utilities.formatDate(rawExpiryCellValue, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy-MM-dd HH:mm:ss');
     }) + '\n';
+    output += 'Raw cell via LOCAL getters (getFullYear/getMonth/getDate \u2014 confirmed WRONG, reads through the script timezone): ' + safe_(function () {
+      return (rawExpiryCellValue.getFullYear()) + '-' + (rawExpiryCellValue.getMonth() + 1) + '-' + rawExpiryCellValue.getDate();
+    }) + '\n';
+    output += 'Raw cell via UTC getters (getUTCFullYear/getUTCMonth/getUTCDate \u2014 what the new fix actually uses): ' + safe_(function () {
+      return (rawExpiryCellValue.getUTCFullYear()) + '-' + (rawExpiryCellValue.getUTCMonth() + 1) + '-' + rawExpiryCellValue.getUTCDate();
+    }) + '\n';
   }
   output += 'parseExpiryCell_ result as ISO: ' + safe_(function () { return parsedExpiry.toISOString(); }) + '\n';
   output += 'parseExpiryCell_ result formatted in script tz: ' + safe_(function () {
@@ -1889,24 +1941,45 @@ function parseStrikeCell_(value) {
 
 function parseExpiryCell_(value) {
   if (value instanceof Date) {
-    // A raw Date straight from a Sheets date-typed cell sits at midnight.
-    // buildOccSymbol_ later formats it via Utilities.formatDate in the
-    // script's own timezone — and midnight has ZERO buffer before any
-    // timezone mismatch (even a few hours) rolls the formatted date to
-    // the PREVIOUS calendar day, producing an OCC symbol for a contract
-    // that doesn't exist (confirmed via Debug: Fetch Raw Quote — a
-    // 3/19/2027 expiry cell produced OCC date 270318, one day early).
-    // Re-anchoring to noon in the script's own timezone — reading the
-    // year/month/day as they'd actually display here, then rebuilding
-    // at noon — gives ~11 hours of buffer either direction, matching
-    // the string-parsing path below, which already does this
-    // deliberately for the same reason.
-    const tz = Session.getScriptTimeZone();
-    const y = Number(Utilities.formatDate(value, tz, 'yyyy'));
-    const mo = Number(Utilities.formatDate(value, tz, 'MM')) - 1;
-    const da = Number(Utilities.formatDate(value, tz, 'dd'));
+    // Confirmed directly via Debug: Fetch Raw Quote — a Sheets
+    // date-only cell (typed with no time component) is stored as
+    // MIDNIGHT UTC, e.g. a typed 3/19/2027 sits as
+    // 2027-03-19T00:00:00.000Z, independent of any timezone setting on
+    // the script or spreadsheet. Two earlier fix attempts both read
+    // that value through a LOCAL timezone (Utilities.formatDate with
+    // Session.getScriptTimeZone(), then plain getFullYear/getMonth/
+    // getDate) — both interpret UTC midnight through Eastern time
+    // (4-5 hours behind), which lands on the PREVIOUS calendar day,
+    // reproducing the exact 3/19 -> 3/18 bug both times. Reading it
+    // back with the matching UTC getters instead recovers the original
+    // date correctly regardless of any timezone setting, since the
+    // value was stored as UTC in the first place.
+    const y = value.getUTCFullYear();
+    const mo = value.getUTCMonth();
+    const da = value.getUTCDate();
     return new Date(y, mo, da, 12, 0, 0);
   }
+
+  // A plain number here means a raw Google Sheets date serial number
+  // (days since Dec 30, 1899) that was written to this cell directly via
+  // setValue(aNumber) rather than setValue(aDateObject) — Sheets only
+  // auto-applies a date display format when it receives an actual Date
+  // object, so a raw number like this sits with no usable format and
+  // renders as visually blank, even though the value itself is intact.
+  // Confirmed via dry-run diagnostics as the true root cause of the
+  // Strike/Expiry "disappearing" bug: these cells were never actually
+  // cleared — parseExpiryCell_ simply had no case that could parse a
+  // bare number, so every affected row silently hit PARSE ERROR and got
+  // skipped on every single run, correctly never overwriting anything
+  // (which is exactly why the batching refactor's own snapshots always
+  // showed the value unchanged), while just never getting fixed either.
+  if (typeof value === 'number' && !isNaN(value) && value > 0) {
+    const epochUtcMs = Date.UTC(1899, 11, 30);
+    const wholeDay = Math.floor(value); // drop the time-of-day fraction — only the calendar day matters for an expiry
+    const d = new Date(epochUtcMs + wholeDay * 86400000);
+    return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 12, 0, 0);
+  }
+
   const s = String(value).trim();
   const m = s.match(/([A-Za-z]{3,9})\s+(\d{1,2})\D*'?(\d{2,4})/);
 
@@ -2157,6 +2230,54 @@ function fetchTastyEquityQuote_(ticker, accessToken) {
   }
 
   return { price: validPrice, change: change, changePercent: changePercent, source: 'TastyTrade' };
+}
+
+// StockPrice + 52-week range + market cap — used as the individual
+// fallback for any ticker prefetchStockPriceRangeViaCloudFunction_
+// didn't cover; refreshed on EVERY row, every run (used to be a
+// fill-once-when-blank pattern, changed after StockPrice was found sitting
+// stale by a huge margin since nothing ever touched it again once set).
+// TastyTrade's endpoints here don't include a 52-week range (confirmed —
+// fetchTastyMarketMetrics_ only has IV Rank), so this goes straight to
+// Yahoo's quote object, which reliably includes fiftyTwoWeekLow/
+// fiftyTwoWeekHigh as standard fields — reusing the same session/fetch
+// already proven working for option chains elsewhere in this project,
+// just reading its .quote instead of its .calls/.puts.
+// Renamed in spirit only — still called fetchStockPriceAnd52WeekRange_
+// everywhere it's used, now also returns market cap (in billions, to
+// match how this sheet already shows Cap — e.g. 157.3 for a $157.3B
+// company) from the same Yahoo quote object, no extra call needed.
+function fetchStockPriceAnd52WeekRange_(ticker) {
+  let session;
+  try {
+    session = getYahooSession_();
+  } catch (e) {
+    return null;
+  }
+
+  let chainRoot;
+  try {
+    chainRoot = fetchYahooOptionsRoot_(ticker, null, session);
+  } catch (e) {
+    return null;
+  }
+
+  const quote = chainRoot && chainRoot.quote;
+  if (!quote) return null;
+
+  const price = quote.regularMarketPrice != null ? parseFloat(quote.regularMarketPrice) : null;
+  const low52 = quote.fiftyTwoWeekLow != null ? parseFloat(quote.fiftyTwoWeekLow) : null;
+  const high52 = quote.fiftyTwoWeekHigh != null ? parseFloat(quote.fiftyTwoWeekHigh) : null;
+  const marketCapRaw = quote.marketCap != null ? parseFloat(quote.marketCap) : null;
+  const marketCapBillions = marketCapRaw != null ? marketCapRaw / 1e9 : null;
+
+  return {
+    price: isPlausible_(price, 0.01, null) ? price : null,
+    low52: isPlausible_(low52, 0.01, null) ? low52 : null,
+    high52: isPlausible_(high52, 0.01, null) ? high52 : null,
+    cap: isPlausible_(marketCapBillions, 0.001, null) ? marketCapBillions : null,
+    source: 'Yahoo'
+  };
 }
 
 function fetchTastyMarketMetrics_(ticker, accessToken) {
@@ -2616,6 +2737,101 @@ function findHighestOiContractForScanner_(ticker, type, minDelta, minExpiryDays,
  * to fetching individually (with its own Tasty+Yahoo fallback intact)
  * exactly as before.
  * ========================================================================== */
+/* ============================================================================
+ * DEBUG: BEST-OI RAW EXPIRATION DATES (one ticker)
+ * ----------------------------------------------------------------------------
+ * Bypasses the normal batch scan entirely, calling the Cloud Function's
+ * single-ticker debug path directly. Shows every expiration TastyTrade's
+ * nested chain actually reported for this ticker (raw date string
+ * alongside the parsed result), and flags any contract symbol that
+ * appeared under more than one expiration-date group in that response --
+ * built specifically to find the root cause behind a wrong expiry
+ * showing up on a Scan Chain / Best-OI result, rather than guessing.
+ * ========================================================================== */
+function debugBestOiExpirationDates() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  const tickerResp = ui.prompt('Debug: Best-OI Raw Expiration Dates', 'Ticker to check:', ui.ButtonSet.OK_CANCEL);
+  if (tickerResp.getSelectedButton() !== ui.Button.OK) return;
+  const ticker = tickerResp.getResponseText().trim().toUpperCase();
+  if (!ticker) { ui.alert('No ticker provided.'); return; }
+
+  const cloudFunctionUrl = getCloudFunctionUrl_();
+  const sharedSecret = getCloudFunctionSharedSecret_();
+  if (!cloudFunctionUrl || !sharedSecret) { ui.alert('Cloud Function not configured.'); return; }
+
+  let settings;
+  try {
+    settings = readChainScannerSettings_(sheet.getName());
+  } catch (e) {
+    ui.alert('Could not read scanner settings for "' + sheet.getName() + '": ' + e.message);
+    return;
+  }
+
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(cloudFunctionUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        apiKey: sharedSecret,
+        bestOiScan: {
+          tickers: [ticker], debug: true, type: settings.type, minDelta: settings.minDelta,
+          minExpiryDays: settings.minExpiryDays, maxExpiryDays: settings.maxExpiryDays,
+          minStrikePercent: settings.minStrikePercent
+        }
+      }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    ui.alert('Network error: ' + e);
+    return;
+  }
+
+  if (resp.getResponseCode() !== 200) {
+    ui.alert('Cloud Function returned HTTP ' + resp.getResponseCode() + ':\n\n' + resp.getContentText().substring(0, 500));
+    return;
+  }
+
+  const json = JSON.parse(resp.getContentText());
+  const info = json.debugInfo || {};
+
+  let output = 'Ticker: ' + ticker + ' | Settings: ' + settings.type + ', delta>=' + settings.minDelta +
+    ', minExpiry=' + settings.minExpiryDays + 'd, maxExpiry=' + settings.maxExpiryDays + 'd, minStrike=' + settings.minStrikePercent + '%\n\n';
+
+  if (json.debugError) {
+    output += 'ERROR: ' + json.debugError + '\n\n';
+  } else {
+    output += 'RESULT: strike=$' + json.debugResult.strike + json.debugResult.type +
+      ' expiry=' + json.debugResult.expiry + ' oi=' + json.debugResult.oi + ' bestSymbol=' + info.bestSymbol + '\n\n';
+  }
+
+  output += '--- ALL expirations TastyTrade reported (raw date string \u2192 parsed) ---\n';
+  (info.allExpirations || []).forEach(function (e) {
+    output += e.rawDateStr + ' \u2192 ' + e.parsedISO + ' (' + e.strikeCount + ' strikes)\n';
+  });
+
+  output += '\n--- QUALIFYING expirations (after date-window filter, sorted, capped) ---\n';
+  (info.qualifying || []).forEach(function (e) {
+    output += e.rawDateStr + ' \u2192 ' + e.parsedISO + ' (' + e.strikeCount + ' strikes)\n';
+  });
+
+  output += '\n--- SYMBOL COLLISIONS (same contract symbol under 2+ expiration groups \u2014 the likely bug, if any show here) ---\n';
+  const collisions = info.symbolCollisions || [];
+  if (!collisions.length) {
+    output += 'None found \u2014 every symbol appeared under exactly one expiration group.\n';
+  } else {
+    collisions.forEach(function (c) {
+      output += c.symbol + ':\n';
+      c.sources.forEach(function (s) { output += '  ' + s.rawDateStr + ' \u2192 ' + s.parsedISO + '\n'; });
+    });
+  }
+
+  logToSheet_('Debug Best-OI Raw Expiration Dates (' + ticker + '):\n' + output);
+  ui.alert('Debug: Best-OI Raw Expiration Dates \u2014 ' + ticker, output.substring(0, 3500), ui.ButtonSet.OK);
+}
+
 function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings) {
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
@@ -2712,7 +2928,16 @@ function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings) {
 // "$0C"), finds the highest-OI contract meeting this sheet's Input-tab
 // floors and overwrites that row's Strike/Expiry with it.
 // ----------------------------------------------------------------------------
-function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride) {
+// Safe diagnostic entry point — same real read/scan logic, but every
+// Strike/Expiry/etc. write is logged instead of actually happening. See
+// dryRun checks inside scanOptionChainForBestOi.
+function scanOptionChainForBestOiDryRun() {
+  scanOptionChainForBestOi(null, null, true);
+  const ui = tryGetUi_();
+  notify_(ui, 'Dry Run Complete', 'Nothing was written to the sheet. Check ScriptLog for one line per row showing what would have been written.');
+}
+
+function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
   const sheet = sheetOverride || SpreadsheetApp.getActiveSheet();
   const map = getColumnMap_(sheet);
   const ui = tryGetUi_();
@@ -2783,6 +3008,15 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride) {
     }
 
     if (best.source && best.source.indexOf('TastyTrade') === 0) fromTasty++; else fromYahoo++;
+
+    if (dryRun) {
+      logToSheet_('DRY RUN (Scan Chain, ' + sheet.getName() + ') — row ' + row + ' ' + ticker +
+        ': would write strike=$' + round2_(best.strike) + best.type + ' expiry=' + best.expiry.toDateString() +
+        ' oi=' + best.oi + ' price=' + (best.price != null ? round2_(best.price) : 'n/a') + ' source=' + best.source);
+      updated++;
+      continue;
+    }
+
     sheet.getRange(row, map.strike).setValue('$' + round2_(best.strike) + best.type);
     sheet.getRange(row, map.expiry).setValue(best.expiry);
 
@@ -3146,6 +3380,46 @@ function computeRelativeVolumePercent_(tickerBars, avgPeriod) {
 // Risky's "Drawdown Exposure" risk factor. A rolling-peak scan over
 // ~2 months of daily bars; small-sample (this is a real number, but over
 // a short window, not a robust multi-year drawdown study).
+// Detects a sharp, short (<=3 day) drop confirmed by elevated volume
+// (a real panic reaction, not drift), followed by at least partial
+// recovery since — a measurable proxy for "the market overreacted and
+// is now correcting itself." Built as an honest alternative to trying
+// to algorithmically judge whether a headline was "fundamental" or
+// not, which isn't reliably detectable from news text alone. Returns
+// the % recovered off the low, or null if bars are insufficient or no
+// such pattern is present (including: no sharp-enough drop, no volume
+// confirmation, or no recovery has started yet).
+function computeSnapbackRecoveryPercent_(bars) {
+  if (!bars || bars.length < 12) return null;
+  const recent = bars.slice(-10);
+
+  let lowIdx = 0;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i].close < recent[lowIdx].close) lowIdx = i;
+  }
+  // The low needs room on both sides — to measure the drop into it and
+  // the recovery since it — so skip if it sits at either edge.
+  if (lowIdx === 0 || lowIdx === recent.length - 1) return null;
+
+  const priorIdx = Math.max(0, lowIdx - 3);
+  const priorClose = recent[priorIdx].close;
+  const lowClose = recent[lowIdx].close;
+  if (!isPlausible_(priorClose, 0.01, null) || !isPlausible_(lowClose, 0.01, null)) return null;
+  const dropPercent = ((lowClose - priorClose) / priorClose) * 100;
+  if (dropPercent > -3) return null; // not sharp enough to read as a knee-jerk drop
+
+  const avgVolume = recent.reduce(function (s, b) { return s + (b.volume || 0); }, 0) / recent.length;
+  const dropDayVolume = recent[lowIdx].volume || 0;
+  if (avgVolume <= 0 || dropDayVolume < avgVolume * 1.3) return null; // no real volume spike on the drop — likely just drift, not a panic reaction
+
+  const currentClose = recent[recent.length - 1].close;
+  if (!isPlausible_(currentClose, 0.01, null)) return null;
+  const recoveryPercent = ((currentClose - lowClose) / lowClose) * 100;
+  if (recoveryPercent <= 0) return null; // hasn't actually started recovering yet
+
+  return recoveryPercent;
+}
+
 function computeMaxDrawdownPercent_(tickerBars) {
   if (!tickerBars || tickerBars.length < 5) return null;
   let peak = tickerBars[0].close;
@@ -3772,6 +4046,188 @@ function momentumAlignmentScore_(momentumPercent, optionType) {
   const directional = optionType === 'P' ? -momentumPercent : momentumPercent;
   const clamped = clamp_(directional, -5, 5);
   return ((clamped + 5) / 10) * 100;
+}
+
+// Deliberately the mirror image of momentumAlignmentScore_ above, using
+// the exact same input — a "buy the dip on an otherwise solid name"
+// signal: a recent SHORT-WINDOW DECLINE scores highest here, a recent
+// rally scores lowest. Same 5-day lookback, same +/-5% clamp, same
+// directional flip for puts — just inverted, so a -5% pullback scores
+// 100 here (and would have scored 0 on the momentum factor), a +5%
+// rally scores 0 here (and 100 on momentum).
+/* ============================================================================
+ * PERSONAL TRACK RECORD (Quick only, by explicit request)
+ * ----------------------------------------------------------------------------
+ * Built after noticing that sticking with a small set of personally-
+ * trusted tickers, even against the algorithmic recommendation,
+ * outperformed over a real 3-week sample. Rather than hardcoding which
+ * tickers are "good" (which would just overfit to that exact moment and
+ * quietly go stale the day one of them stops working), this measures
+ * YOUR OWN recent, demonstrated results per ticker directly from the
+ * Results tab you already maintain — "trust" as an actual number, not a
+ * guess at which names are good.
+ * ========================================================================== */
+
+const PERSONAL_TRACK_RECORD_LOOKBACK_DAYS = 90;
+// "Worth" of a neutral prior blended into a ticker's own average —
+// higher means a ticker needs more real trades before its own track
+// record can swing the score hard. A ticker traded once isn't treated
+// with the same confidence as one traded five times.
+const PERSONAL_TRACK_RECORD_SHRINKAGE_TRADES = 3;
+
+// Reads the Results tab (flexible header matching, same pattern as
+// getColumnMap_ elsewhere in this project) and returns, per ticker,
+// { avgReturnPercent, tradeCount } for CLOSED trades of the given
+// strategy within the rolling lookback window. Fails soft (empty
+// object) if the tab or expected columns aren't found — this factor is
+// a bonus signal, never a dependency.
+function computePersonalTrackRecordByTicker_(strategyName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Results');
+  if (!sheet) return {};
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return {};
+
+  const headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const colIndex = {};
+  headerRow.forEach(function (h, i) {
+    const key = String(h).trim().toLowerCase();
+    if (key === 'strategy') colIndex.strategy = i;
+    if (key === 'ticker') colIndex.ticker = i;
+    if (key === 'exit date') colIndex.exitDate = i;
+    if (key === 'return %' || key === 'return%' || key === 'return') colIndex.returnPct = i;
+  });
+  if (colIndex.strategy == null || colIndex.ticker == null || colIndex.exitDate == null || colIndex.returnPct == null) {
+    return {}; // Results tab doesn't have the expected columns — fail soft
+  }
+
+  const data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - PERSONAL_TRACK_RECORD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+
+  const byTicker = {};
+  data.forEach(function (row) {
+    const strategy = String(row[colIndex.strategy] || '').trim();
+    if (strategy.toLowerCase() !== strategyName.toLowerCase()) return;
+
+    // Strips trailing annotations like "(hedge)" or "(Roth IRA-minor)"
+    // so they roll up under the same base ticker.
+    const ticker = String(row[colIndex.ticker] || '').trim().toUpperCase().replace(/\s*\(.*\)\s*$/, '');
+    if (!ticker) return;
+
+    const exitDateRaw = row[colIndex.exitDate];
+    let exitDate = null;
+    if (exitDateRaw instanceof Date) {
+      exitDate = exitDateRaw;
+    } else {
+      const s = String(exitDateRaw || '').trim();
+      if (!s || /tbd/i.test(s)) return; // still open — not a closed result yet
+      const parsed = new Date(s + ' ' + now.getFullYear());
+      if (!isNaN(parsed.getTime())) exitDate = parsed;
+    }
+    if (!exitDate || isNaN(exitDate.getTime())) return;
+    if (exitDate.getTime() < cutoff.getTime()) return; // outside the rolling window
+
+    let returnPct = row[colIndex.returnPct];
+    if (typeof returnPct === 'string') {
+      returnPct = parseFloat(returnPct.replace('%', ''));
+    } else if (typeof returnPct === 'number' && Math.abs(returnPct) < 1) {
+      returnPct = returnPct * 100; // a stored fraction (0.043) rather than a stored percent (4.3)
+    }
+    if (returnPct == null || isNaN(returnPct)) return;
+
+    if (!byTicker[ticker]) byTicker[ticker] = [];
+    byTicker[ticker].push(returnPct);
+  });
+
+  const result = {};
+  Object.keys(byTicker).forEach(function (ticker) {
+    const returns = byTicker[ticker];
+    const avg = returns.reduce(function (s, r) { return s + r; }, 0) / returns.length;
+    result[ticker] = { avgReturnPercent: avg, tradeCount: returns.length };
+  });
+  return result;
+}
+
+// Converts a ticker's own recent average return % into a 0-100 score,
+// shrunk toward neutral (50) based on sample size. An untested ticker
+// (no trades in the window) scores exactly 50 — no penalty for being
+// new, only credit for demonstrated success, so this never blocks a
+// genuinely new idea the way DHR/ISRG turned out to be.
+function personalTrackRecordScore_(avgReturnPercent, tradeCount) {
+  if (tradeCount == null || tradeCount <= 0 || avgReturnPercent == null || isNaN(avgReturnPercent)) return 50;
+  // Same +/-5% clamp-to-100 scale as momentumAlignmentScore_ above, for
+  // consistency — recent Quick trades ranged roughly -0.1% to +7.3%, so
+  // +/-5% is a reasonable ceiling/floor for a single trade's return.
+  const clamped = clamp_(avgReturnPercent, -5, 5);
+  const rawScore = ((clamped + 5) / 10) * 100;
+  const shrinkage = PERSONAL_TRACK_RECORD_SHRINKAGE_TRADES;
+  return (rawScore * tradeCount + 50 * shrinkage) / (tradeCount + shrinkage);
+}
+
+// "Mean Reversion Setup" — a quality company with recent short-term
+// weakness (pullback) WHILE its longer-term trend is still intact
+// (still above its 20-day average) is a genuinely different, better
+// setup than either signal alone. Deliberately a GEOMETRIC mean, not an
+// arithmetic one: a pullback that's ALSO broken the trend isn't mean
+// reversion, it's a breakdown, and a weak trend score needs to drag the
+// combined result down hard, not just get averaged against a strong
+// pullback score. (Arithmetic mean of 100 and 20 is 60 — still looks
+// decent; geometric mean is ~45 — correctly reflects that one half of
+// the setup is genuinely broken.)
+function meanReversionSetupScore_(momentumPercent, trendPercent, snapbackRecoveryPercent) {
+  if (momentumPercent == null || trendPercent == null) return 50;
+  const pullbackComponent = pullbackOpportunityScore_(momentumPercent, 'C');
+  const trendComponent = trendAlignmentScore_(trendPercent, 'C');
+  let combined = Math.sqrt(pullbackComponent * trendComponent);
+
+  // Bonus for a confirmed sharp-drop-then-recovery pattern (see
+  // computeSnapbackRecoveryPercent_) — stronger, more specific evidence
+  // of "the market overreacted and is correcting" than pullback+trend
+  // alone, so this ADDS on top rather than being blended/averaged in.
+  // 0% recovered = no bonus; 5%+ recovered off the low = full +20,
+  // capped so it respects the base score's own 100 ceiling.
+  if (snapbackRecoveryPercent != null && snapbackRecoveryPercent > 0) {
+    const snapbackBonus = (clamp_(snapbackRecoveryPercent, 0, 5) / 5) * 20;
+    combined = Math.min(100, combined + snapbackBonus);
+  }
+
+  return Math.round(combined * 10) / 10;
+}
+
+// Penalizes an "overextended" setup — a stock that's run up both FAR
+// (well above its 20-day average) AND FAST (a large recent 5-day move)
+// is more prone to a sharp snapback than one that's climbed the same
+// distance gradually. Deliberately NOT based on proximity to the
+// 52-week high: a slow grind to a high and a two-day sprint to the same
+// high look identical by that measure, but carry very different
+// near-term risk — and most of this project's other factors (RS,
+// momentum, trend) already reward "near the high" on its own merits,
+// so directly penalizing that would fight the system's own momentum
+// thesis. This only fires when BOTH conditions are true and upward —
+// geometric mean, same reasoning as meanReversionSetupScore_, so a
+// large move with a merely-normal trend distance (or vice versa) stays
+// low, not just averaged into a false-moderate reading.
+// Thresholds are a judgment call, calibrated for Quick's large/mega-cap
+// universe: a 5-day move past ~4% and a 20DMA distance past ~5% start
+// registering, maxing out around 12%/15% respectively. Worth a sanity
+// check against real positions as more data comes in, same as the
+// other calibration choices flagged elsewhere in this project.
+function overextensionRiskScore_(momentumPercent, trendPercent) {
+  if (momentumPercent == null || trendPercent == null) return 0; // missing data fails toward neutral, not toward risk
+  if (momentumPercent <= 0 || trendPercent <= 0) return 0; // only an upward run can be "overextended" in this sense
+  const momentumExcess = clamp_(((momentumPercent - 4) / 8) * 100, 0, 100);
+  const trendExcess = clamp_(((trendPercent - 5) / 10) * 100, 0, 100);
+  return Math.round(Math.sqrt(momentumExcess * trendExcess) * 10) / 10;
+}
+
+function pullbackOpportunityScore_(momentumPercent, optionType) {
+  if (momentumPercent == null || isNaN(momentumPercent)) return 50;
+  const directional = optionType === 'P' ? -momentumPercent : momentumPercent;
+  const clamped = clamp_(directional, -5, 5);
+  return ((5 - clamped) / 10) * 100;
 }
 
 function sectorAlignmentScore_(sectorPercent, optionType) {
@@ -4465,10 +4921,44 @@ function computeTargetForObjective_(entryPrice, daysHeld, currentStockPrice, cur
  * own Target Score as an input.
  * ========================================================================== */
 
+// quality (15% in both filter and target) is the primary factor here —
+// reuses the exact same analyst-rating-derived score Leap already has,
+// which Quick had never used at all. After a direct challenge on an
+// earlier version of this, the real answer turned out to be: tickers
+// were picked by asking whether the company has a moat, a judgment of
+// business quality — not by echoing back whichever names happened to
+// work before. trackRecord shrunk from 12 to 6 to make room (still
+// real signal, just secondary, not the main explanation). Every other
+// weight trimmed proportionally to fit both.
+// meanReversion (15%) — see meanReversionSetupScore_ above. This
+// formula never had standalone momentum/pullback/trend factors at all,
+// so there's no overlap to trim here, unlike Research's ranking score.
+// Where a negative-news flag is available (it already is here, via the
+// same News Risk batch this loop already fetches for Risk Score), it
+// sharply discounts this specific factor — a pullback alongside a real,
+// known negative headline isn't the "no obvious reason" setup this is
+// meant to find.
 const QUICK_SHEET_WEIGHTS = {
-  quick: { rs: 25, atr: 20, requiredMove: 20, risk: 15, sector: 10, ivRank: 5, delta: 5 },
-  risk: { atr: 50, omega: 30, ivRank: 20 },
-  target: { volProb: 30, momentum: 20, rs: 15, sector: 10, trend: 10, volume: 5, marketRegime: 5, ivEvent: 5 }
+  quick: { rs: 18, atr: 14, requiredMove: 13, risk: 9, sector: 7, ivRank: 3, delta: 3, trackRecord: 5, quality: 13, meanReversion: 15 },
+  // Rebuilt after confirming the old {atr, omega, ivRank} formula was
+  // calibrated against a 20%-profit/50%-loss assumption that doesn't
+  // match actual Quick behavior (1-5 day hold, 1-3% typical target —
+  // see QUICK_RISK_LOSS_TOLERANCE_PERCENT above), and had no event-risk
+  // factor at all despite a 5-day hold being exactly the window where a
+  // surprise catalyst matters most. velocity folds in leverage (Omega)
+  // directly, so Omega isn't weighted separately here — that would
+  // double-count the same thing. overextension (see
+  // overextensionRiskScore_ above) added afterward — a fast, large run
+  // well above trend genuinely carries more snapback risk than the same
+  // distance climbed gradually, which proximity to the 52-week high
+  // alone can't distinguish. The other three trimmed proportionally to
+  // fit it.
+  risk: { velocity: 40, catalystProximity: 24, ivRank: 16, overextension: 20 },
+  // momentum's old weight (20) split evenly with pullback — same "buy
+  // the dip on an otherwise good setup" logic added to Research's
+  // ranking score earlier, applied here too so Target Probability
+  // doesn't only reward a name that's already rallied.
+  target: { volProb: 27, momentum: 8, pullback: 8, rs: 11, sector: 8, trend: 8, volume: 3, marketRegime: 3, ivEvent: 3, trackRecord: 6, quality: 15 }
 };
 
 const RISKY_SHEET_WEIGHTS = {
@@ -4476,7 +4966,9 @@ const RISKY_SHEET_WEIGHTS = {
   // Recovery Time's original 30% was folded into Drawdown Exposure (70%
   // total) per your call — see the conversation this was built from.
   risk: { drawdown: 70, optionRisk: 20, liquidityRisk: 10 },
-  target: { hitRate: 35, volProb: 20, momentum: 15, rs: 10, sector: 7.5, marketRegime: 5, volume: 5, ivEvent: 2.5 }
+  // momentum's old weight (15) split evenly with pullback — same reason
+  // as Quick's target above.
+  target: { hitRate: 35, volProb: 20, momentum: 7.5, pullback: 7.5, rs: 10, sector: 7.5, marketRegime: 5, volume: 5, ivEvent: 2.5 }
 };
 
 // Horizon for the Volatility Probability factor: the sooner of days-to-
@@ -4492,13 +4984,29 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
 
 function computeQuickSheetRiskScore_(inputs) {
   const w = QUICK_SHEET_WEIGHTS.risk;
-  const atr = atrOpportunityScore_(inputs.atrPercent);
+  // How many days a plausible ATR-sized move, amplified by this
+  // position's own leverage, would take to swing the PREMIUM down by
+  // QUICK_RISK_LOSS_TOLERANCE_PERCENT — directly answering "how exposed
+  // am I within my actual hold window," not a generic volatility score.
+  // Reuses the same sqrt(N) estimator and 1-20 day velocity scale the
+  // older generic risk formula already uses, just with Quick's own
+  // tighter loss tolerance instead of the 50% default.
   const omega = computeOmega_(inputs.delta, inputs.stockPrice, inputs.optionPrice);
-  const omegaExposure = capitalEfficiencyScore_(omega);
+  const daysToLoss = (omega != null)
+    ? estimatedDaysForPremiumMove_(inputs.atrPercent, omega, QUICK_RISK_LOSS_TOLERANCE_PERCENT)
+    : null;
+  const velocity = velocityRiskScore_(daysToLoss);
+  // 100 = far from a catalyst = safe for Balance Score's purposes;
+  // inverted here since for RISK, near-catalyst is the bad direction —
+  // same inversion computeRiskScore_ already uses for the generic
+  // formula, SWING_WINDOW_DAYS (5) already matches Quick's actual hold.
+  const catalystProximity = 100 - catalystRiskScore_(inputs.daysToCatalyst, SWING_WINDOW_DAYS);
   const ivRankRisk = ivRankRiskScore_(inputs.ivRank);
+  const overextension = overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent);
 
-  const totalWeight = w.atr + w.omega + w.ivRank;
-  const weightedSum = atr * w.atr + omegaExposure * w.omega + ivRankRisk * w.ivRank;
+  const totalWeight = w.velocity + w.catalystProximity + w.ivRank + w.overextension;
+  const weightedSum = velocity * w.velocity + catalystProximity * w.catalystProximity + ivRankRisk * w.ivRank +
+    overextension * w.overextension;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -4510,16 +5018,19 @@ function computeQuickSheetTargetScore_(inputs, config) {
   );
   const volProb = volProbRaw != null ? volProbRaw : 50;
   const momentum = momentumAlignmentScore_(inputs.momentumPercent, inputs.optionType);
+  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, inputs.optionType);
   const rs = relativeStrengthScore_(inputs.rsPercent, inputs.optionType);
   const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
   const trend = trendAlignmentScore_(inputs.trendPercent, inputs.optionType);
   const volume = relativeVolumeScore_(inputs.relativeVolumePercent);
   const regime = marketRegimeScore_(inputs.marketRegimePercent, inputs.optionType);
   const ivEvent = catalystRiskScore_(inputs.daysToCatalyst, SWING_WINDOW_DAYS);
+  const trackRecord = personalTrackRecordScore_(inputs.trackRecordAvgReturn, inputs.trackRecordTradeCount);
+  const quality = qualityScore_(inputs.ratingScore);
 
-  const totalWeight = w.volProb + w.momentum + w.rs + w.sector + w.trend + w.volume + w.marketRegime + w.ivEvent;
-  const weightedSum = volProb * w.volProb + momentum * w.momentum + rs * w.rs + sector * w.sector +
-    trend * w.trend + volume * w.volume + regime * w.marketRegime + ivEvent * w.ivEvent;
+  const totalWeight = w.volProb + w.momentum + w.pullback + w.rs + w.sector + w.trend + w.volume + w.marketRegime + w.ivEvent + w.trackRecord + w.quality;
+  const weightedSum = volProb * w.volProb + momentum * w.momentum + pullback * w.pullback + rs * w.rs + sector * w.sector +
+    trend * w.trend + volume * w.volume + regime * w.marketRegime + ivEvent * w.ivEvent + trackRecord * w.trackRecord + quality * w.quality;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -4536,10 +5047,18 @@ function computeQuickSheetQuickScore_(inputs, config) {
   const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
   const ivRank = ivRankSuitabilityScore_(inputs.ivRank);
   const delta = deltaExposureScore_(inputs.delta);
+  const trackRecord = personalTrackRecordScore_(inputs.trackRecordAvgReturn, inputs.trackRecordTradeCount);
+  const quality = qualityScore_(inputs.ratingScore);
+  let meanReversion = meanReversionSetupScore_(inputs.momentumPercent, inputs.trendPercent, inputs.snapbackRecoveryPercent);
+  // Sharply discount when there IS a known negative reason (block-worthy
+  // headline/filing) — this factor is specifically for a pullback with
+  // no obvious cause, not any pullback regardless of why.
+  if (inputs.hasNegativeNews === true) meanReversion = meanReversion * 0.3;
 
-  const totalWeight = w.rs + w.atr + w.requiredMove + w.risk + w.sector + w.ivRank + w.delta;
+  const totalWeight = w.rs + w.atr + w.requiredMove + w.risk + w.sector + w.ivRank + w.delta + w.trackRecord + w.quality + w.meanReversion;
   const weightedSum = rs * w.rs + atr * w.atr + requiredMove * w.requiredMove + lowRisk * w.risk +
-    sector * w.sector + ivRank * w.ivRank + delta * w.delta;
+    sector * w.sector + ivRank * w.ivRank + delta * w.delta + trackRecord * w.trackRecord + quality * w.quality +
+    meanReversion * w.meanReversion;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -4565,14 +5084,15 @@ function computeRiskySheetTargetScore_(inputs, config) {
   );
   const volProb = volProbRaw != null ? volProbRaw : 50;
   const momentum = momentumAlignmentScore_(inputs.momentumPercent, inputs.optionType);
+  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, inputs.optionType);
   const rs = relativeStrengthScore_(inputs.rsPercent, inputs.optionType);
   const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
   const regime = marketRegimeScore_(inputs.marketRegimePercent, inputs.optionType);
   const volume = relativeVolumeScore_(inputs.relativeVolumePercent);
   const ivEvent = catalystRiskScore_(inputs.daysToCatalyst, SWING_WINDOW_DAYS);
 
-  const totalWeight = w.hitRate + w.volProb + w.momentum + w.rs + w.sector + w.marketRegime + w.volume + w.ivEvent;
-  const weightedSum = hitRate * w.hitRate + volProb * w.volProb + momentum * w.momentum + rs * w.rs +
+  const totalWeight = w.hitRate + w.volProb + w.momentum + w.pullback + w.rs + w.sector + w.marketRegime + w.volume + w.ivEvent;
+  const weightedSum = hitRate * w.hitRate + volProb * w.volProb + momentum * w.momentum + pullback * w.pullback + rs * w.rs +
     sector * w.sector + regime * w.marketRegime + volume * w.volume + ivEvent * w.ivEvent;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
@@ -4608,10 +5128,12 @@ function computeRiskySheetQuickScore_(inputs, config) {
  * shown in the cell's note, not written to the cell itself.
  * ========================================================================== */
 
+// filter's and target's momentum weights each split evenly with a new
+// pullback weight — same reasoning as Quick/Risky's target above.
 const LEAP_SHEET_WEIGHTS = {
-  filter: { quality: 25, upside: 20, delta: 20, capitalEfficiency: 20, liquidity: 10, momentum: 5 },
+  filter: { quality: 25, upside: 20, delta: 20, capitalEfficiency: 20, liquidity: 10, momentum: 2.5, pullback: 2.5 },
   risk: { velocity: 60, catalystRisk: 20, execution: 20 },
-  target: { volProb: 30, momentum: 25, rs: 15, sector: 10, trend: 10, marketRegime: 5, ivEvent: 5 }
+  target: { volProb: 30, momentum: 12.5, pullback: 12.5, rs: 15, sector: 10, trend: 10, marketRegime: 5, ivEvent: 5 }
 };
 
 function computeLeapSheetFilterScore_(inputs) {
@@ -4623,10 +5145,11 @@ function computeLeapSheetFilterScore_(inputs) {
   const capitalEfficiency = capitalEfficiencyScore_(omega);
   const liquidity = liquidityScore_(inputs.openInterest, inputs.volume);
   const momentum = momentumAlignmentScore_(inputs.momentumPercent, inputs.optionType);
+  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, inputs.optionType);
 
-  const totalWeight = w.quality + w.upside + w.delta + w.capitalEfficiency + w.liquidity + w.momentum;
+  const totalWeight = w.quality + w.upside + w.delta + w.capitalEfficiency + w.liquidity + w.momentum + w.pullback;
   const weightedSum = quality * w.quality + upside * w.upside + delta * w.delta +
-    capitalEfficiency * w.capitalEfficiency + liquidity * w.liquidity + momentum * w.momentum;
+    capitalEfficiency * w.capitalEfficiency + liquidity * w.liquidity + momentum * w.momentum + pullback * w.pullback;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -4655,14 +5178,15 @@ function computeLeapSheetTargetScore_(inputs, config) {
   );
   const volProb = volProbRaw != null ? volProbRaw : 50;
   const momentum = momentumAlignmentScore_(inputs.momentumPercent, inputs.optionType);
+  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, inputs.optionType);
   const rs = relativeStrengthScore_(inputs.rsPercent, inputs.optionType);
   const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
   const trend = trendAlignmentScore_(inputs.trendPercent, inputs.optionType);
   const regime = marketRegimeScore_(inputs.marketRegimePercent, inputs.optionType);
   const ivEvent = catalystRiskScore_(inputs.daysToCatalyst, SWING_WINDOW_DAYS);
 
-  const totalWeight = w.volProb + w.momentum + w.rs + w.sector + w.trend + w.marketRegime + w.ivEvent;
-  const weightedSum = volProb * w.volProb + momentum * w.momentum + rs * w.rs + sector * w.sector +
+  const totalWeight = w.volProb + w.momentum + w.pullback + w.rs + w.sector + w.trend + w.marketRegime + w.ivEvent;
+  const weightedSum = volProb * w.volProb + momentum * w.momentum + pullback * w.pullback + rs * w.rs + sector * w.sector +
     trend * w.trend + regime * w.marketRegime + ivEvent * w.ivEvent;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
@@ -4930,7 +5454,183 @@ function prefetchTastyQuotesViaCloudFunction_(sheet, map, lastRow) {
   return tastyResults;
 }
 
-function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
+// Diagnostic entry point — runs validateAndUpdate's full read/calculate
+// logic, then the REAL write-back and REAL sort (both confirmed safe for
+// Strike/Expiry by the first two snapshots), then stops before
+// highlight/best-row/cache-flush. Built specifically to isolate the
+// Expiry/Strike-disappearing bug by testing the sort step in isolation —
+// check ScriptLog after running this for four SNAPSHOT entries to compare.
+function validateAndUpdateDryRun() {
+  validateAndUpdate(null, null, true);
+  const ui = tryGetUi_();
+  notify_(ui, 'Diagnostic Complete', 'The normal write-back and sort DID run for real this time (confirmed safe by the first two snapshots). Highlight/best-row/cache-flush were skipped. Check ScriptLog for four SNAPSHOT entries to compare.');
+}
+
+/* ============================================================================
+ * CLOUD FUNCTION NEWS RISK BATCH PREFETCH (for Validate & Update)
+ * ----------------------------------------------------------------------------
+ * Same shared Cloud Function as the other prefetch helpers in this
+ * project. Sends every row's ticker (plus its existing, pre-run
+ * changeNow value as the gap% input — the only value available before
+ * this run computes a fresh one) in ONE request; the Cloud Function
+ * scores them concurrently (same NEWS_RULES/SEC_ITEMS/scoring logic as
+ * getNewsRisk in the News Risk section below, just batched). Fully
+ * optional and fails soft — returns an empty map on any problem, so the
+ * per-row News Risk block's own `newsRiskMap[ticker] || getNewsRisk(...)`
+ * falls back to fetching individually exactly as before.
+ * ========================================================================== */
+function prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow) {
+  const cloudFunctionUrl = getCloudFunctionUrl_();
+  const sharedSecret = getCloudFunctionSharedSecret_();
+  if (!cloudFunctionUrl || !sharedSecret) return {};
+
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 0) return {};
+
+  const tickerValues = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
+  const changeNowValues = map.changeNow ? sheet.getRange(DATA_START_ROW, map.changeNow, numRows, 1).getValues() : null;
+
+  const tickers = [];
+  const gapPctByTicker = {};
+  const seen = {};
+  for (let i = 0; i < numRows; i++) {
+    const tickerVal = tickerValues[i][0];
+    if (!tickerVal) continue;
+    const ticker = String(tickerVal).trim().toUpperCase();
+    if (seen[ticker]) continue;
+    seen[ticker] = true;
+    tickers.push(ticker);
+    if (changeNowValues) {
+      const gapVal = parseFloat(changeNowValues[i][0]);
+      if (!isNaN(gapVal)) gapPctByTicker[ticker] = gapVal;
+    }
+  }
+  if (!tickers.length) return {};
+
+  const startTime = Date.now();
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(cloudFunctionUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ apiKey: sharedSecret, newsRisk: { tickers: tickers, gapPctByTicker: gapPctByTicker } }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    logToSheet_('Cloud Function News Risk prefetch FAILED (network error) \u2014 falling back to per-row fetching: ' + e);
+    return {};
+  }
+
+  if (resp.getResponseCode() !== 200) {
+    logToSheet_('Cloud Function News Risk prefetch FAILED (HTTP ' + resp.getResponseCode() + ') \u2014 falling back to per-row fetching: ' +
+      resp.getContentText().substring(0, 300));
+    return {};
+  }
+
+  let json;
+  try {
+    json = JSON.parse(resp.getContentText());
+  } catch (e) {
+    logToSheet_('Cloud Function News Risk prefetch FAILED (unparseable response) \u2014 falling back to per-row fetching: ' + e);
+    return {};
+  }
+
+  const elapsedMs = Date.now() - startTime;
+  const results = json.newsRiskResults || {};
+  const errorCount = Object.keys(json.newsRiskErrors || {}).length;
+  logToSheet_('Cloud Function News Risk prefetch: ' + tickers.length + ' ticker(s) requested in ' + elapsedMs + 'ms \u2014 ' +
+    Object.keys(results).length + ' scored' +
+    (errorCount ? (', ' + errorCount + ' failed (will retry individually)') : '') + '.' +
+    (tickers.length > 40 ? (' Note: only the first 40 are attempted per request (Finnhub rate-limit pacing) — the rest fall back to individual fetching.') : ''));
+
+  const diag = json.newsRiskDiagnostics || {};
+  if (diag.newsRisk) {
+    logToSheet_('Cloud Function News Risk prefetch \u2014 sample failure reason: ' + diag.newsRisk);
+  }
+
+  return results;
+}
+
+/* ============================================================================
+ * CLOUD FUNCTION STOCKPRICE/L52/H52/CAP BATCH PREFETCH (for Validate & Update)
+ * ----------------------------------------------------------------------------
+ * Same shared Cloud Function as the other prefetch helpers in this
+ * project. Sends every row's ticker in ONE request; the Cloud Function
+ * fetches StockPrice/L52/H52/Cap concurrently for all of them (same
+ * Yahoo quote fields fetchStockPriceAnd52WeekRange_ already uses, just
+ * batched). Runs every time now — this used to only fill blank cells,
+ * but that meant a value, once set, never got refreshed even as the
+ * real price moved far away from it (confirmed directly: TSLA sat at
+ * $194 while the real price was $352+). Fully optional and fails soft —
+ * empty map on any problem, so the per-row block's own
+ * `stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker)`
+ * falls back to fetching individually exactly as before.
+ * ========================================================================== */
+function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
+  const cloudFunctionUrl = getCloudFunctionUrl_();
+  const sharedSecret = getCloudFunctionSharedSecret_();
+  if (!cloudFunctionUrl || !sharedSecret) return {};
+
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 0) return {};
+
+  const tickerValues = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
+  const tickers = [];
+  const seen = {};
+  for (let i = 0; i < numRows; i++) {
+    const tickerVal = tickerValues[i][0];
+    if (!tickerVal) continue;
+    const ticker = String(tickerVal).trim().toUpperCase();
+    if (seen[ticker]) continue;
+    seen[ticker] = true;
+    tickers.push(ticker);
+  }
+  if (!tickers.length) return {};
+
+  const startTime = Date.now();
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(cloudFunctionUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ apiKey: sharedSecret, stockRange: { tickers: tickers } }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch FAILED (network error) \u2014 falling back to per-row fetching: ' + e);
+    return {};
+  }
+
+  if (resp.getResponseCode() !== 200) {
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch FAILED (HTTP ' + resp.getResponseCode() + ') \u2014 falling back to per-row fetching: ' +
+      resp.getContentText().substring(0, 300));
+    return {};
+  }
+
+  let json;
+  try {
+    json = JSON.parse(resp.getContentText());
+  } catch (e) {
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch FAILED (unparseable response) \u2014 falling back to per-row fetching: ' + e);
+    return {};
+  }
+
+  const elapsedMs = Date.now() - startTime;
+  const results = json.stockRangeResults || {};
+  const errorCount = Object.keys(json.stockRangeErrors || {}).length;
+  logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch: ' + tickers.length + ' ticker(s) requested in ' + elapsedMs + 'ms \u2014 ' +
+    Object.keys(results).length + ' succeeded' +
+    (errorCount ? (', ' + errorCount + ' failed (will retry individually)') : '') + '.');
+
+  const diag = json.stockRangeDiagnostics || {};
+  if (diag.stockRange) {
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch \u2014 sample failure reason: ' + diag.stockRange);
+  }
+
+  return results;
+}
+
+function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const sheet = sheetOverride || SpreadsheetApp.getActiveSheet();
   const map = getColumnMap_(sheet);
   const ui = tryGetUi_();
@@ -5012,6 +5712,11 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
   // RISKY — REVISED FORMULAS" section. Any other sheet (or a future
   // objective sheet not named Quick/Risky) keeps the generic path.
   const revisedFormulaSheetName = (sheet.getName() === 'Quick' || sheet.getName() === 'Risky' || sheet.getName() === 'Leap') ? sheet.getName() : null;
+  // Moved up from right before its original use (near the sort call,
+  // further down) so the dry-run diagnostic block can also use it — both
+  // revisedFormulaSheetName and map.score are already available this
+  // early, so nothing else needed to change.
+  const sortKey = (revisedFormulaSheetName && map.score) ? 'score' : 'filterScore';
 
   const lastRow = sheet.getLastRow();
   const lastCol = sheet.getLastColumn();
@@ -5111,6 +5816,30 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
   // below just falls back to fetching individually, exactly as before.
   const tastyQuoteMap = prefetchTastyQuotesViaCloudFunction_(sheet, map, lastRow);
 
+  // News Risk batch prefetch: fetches every row's news/SEC-filing risk
+  // concurrently instead of one ticker at a time (three sequential
+  // calls each — Finnhub news, Finnhub earnings, SEC filings — which is
+  // what made this slow). Fails soft: not configured, unreachable, or
+  // misses a specific ticker, and the per-row News Risk block below
+  // falls back to the original individual getNewsRisk() call exactly as
+  // before, so nothing loses coverage.
+  const newsRiskMap = prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow);
+
+  // StockPrice/L52/H52/Cap batch prefetch: fetches every row's current
+  // price/range/cap concurrently instead of one ticker at a time. Runs
+  // on every row now (not just blank ones) — see the note where
+  // stockRangeMap is used below for why. Fails soft: not configured,
+  // unreachable, or misses a specific ticker, and the per-row block
+  // falls back to the original individual fetch exactly as before.
+  const stockRangeMap = prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow);
+
+  // Personal track record — Quick only, by explicit request. Pure local
+  // sheet read (no network call), so computed once here regardless of
+  // row count.
+  const personalTrackRecordMap = (sheet.getName() === 'Quick')
+    ? computePersonalTrackRecordByTicker_('Quick')
+    : {};
+
   // Full batching: the whole data range's values/backgrounds/font colors/
   // notes/number formats are read ONCE here, mutated in place as each
   // row is processed below (exactly the same logic as before — only how
@@ -5126,8 +5855,28 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
     allBackgrounds = dataRange.getBackgrounds();
     allFontColors = dataRange.getFontColors();
     allNotes = dataRange.getNotes();
+
+    // Captured here (formulas, not values) so the write-back at the end
+    // of this function can restore any formula this code never intended
+    // to touch (PtC, PtN, Invested, or any other formula on the sheet).
+    // Kept separate from allValues on purpose — allValues needs to stay
+    // the CALCULATED result for reads during the loop below (StockPrice
+    // in particular is legitimately a live GOOGLEFINATE formula that
+    // gets read and parsed as a number for internal math); substituting
+    // formula strings in here at read time would break that. The
+    // formula is layered back in only at the very last moment, right
+    // before writing, once nothing further will read from allValues.
+    var allFormulas = dataRange.getFormulas();
     allNumberFormats = dataRange.getNumberFormats();
   }
+
+  if (dryRun) {
+    const snap1 = allValues.map(function (r, i) {
+      return (DATA_START_ROW + i) + ':' + r[map.ticker - 1] + '|strike=' + r[map.strike - 1] + '|expiry=' + r[map.expiry - 1];
+    }).join('\n');
+    logToSheet_('DRY RUN — SNAPSHOT 1 (right after bulk read, before any processing):\n' + snap1);
+  }
+
   // Rows needing the Target cell's conditional border, tracked separately
   // since borders aren't part of the bulk setValues/setBackgrounds/
   // setNotes calls — applied in a small dedicated pass after the loop,
@@ -5182,9 +5931,40 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
       continue;
     }
 
+    // Self-heal: always write the correctly-parsed Date back with a
+    // clean date-only format, regardless of what shape the cell
+    // started in (a raw number — the malformed state diagnosed earlier
+    // today — a Date object, or a typed string like "12/17/2027").
+    // Without this, whichever format a cell happened to already be in
+    // stays as-is, which is why some rows showed a bare date and others
+    // showed "12:00:00" appended — the underlying format was never
+    // normalized, only the in-memory parsing was. This makes every row
+    // display identically from here on, and parseExpiryCell_ already
+    // reads all three input shapes correctly, so typing a date in by
+    // hand works exactly the same as a script-written one.
+    rowOut[map.expiry - 1] = parsedExpiry;
+    fmtOut[map.expiry - 1] = 'm/d/yyyy';
+
     const ticker = String(tickerVal).trim().toUpperCase();
     const occSymbol = buildOccSymbol_(ticker, parsedExpiry, parsedStrike.strike, parsedStrike.type);
     const daysToExpiry = Math.round((parsedExpiry.getTime() - runTimestamp.getTime()) / (24 * 60 * 60 * 1000));
+
+    // StockPrice / L52 / H52 / Cap — refreshed on EVERY run now (changed
+    // from fill-once-when-blank after StockPrice was found stale by a
+    // huge margin — a snapshot taken once and never touched again is
+    // exactly the failure mode that produced that). Checks the batch
+    // prefetch first (see prefetchStockPriceRangeViaCloudFunction_
+    // above), falling back to the individual per-ticker fetch for any
+    // ticker the prefetch didn't cover.
+    if (map.stockPrice || map.l52 || map.h52 || map.cap) {
+      const range52 = stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker);
+      if (range52) {
+        if (map.stockPrice && range52.price != null) rowOut[map.stockPrice - 1] = round2_(range52.price);
+        if (map.l52 && range52.low52 != null) rowOut[map.l52 - 1] = round2_(range52.low52);
+        if (map.h52 && range52.high52 != null) rowOut[map.h52 - 1] = round2_(range52.high52);
+        if (map.cap && range52.cap != null) rowOut[map.cap - 1] = round2_(range52.cap);
+      }
+    }
 
     const tastyFromPrefetch = !!tastyQuoteMap[occSymbol];
     const tastyOptionQuote = tastyQuoteMap[occSymbol] || fetchTastyTradeQuote_(occSymbol, accessToken);
@@ -5283,7 +6063,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
     // QUICK/RISKY REVISED-FORMULA FIELDS — see getCachedTickerData_ for
     // how each is derived. Only used on sheets with an entry in
     // TRADE_OBJECTIVE_SHEETS; harmless (just unused) elsewhere.
-    if (tickerData.momentumInfo) merged.momentumPercent = tickerData.momentumInfo.momentumPercent;
+    if (tickerData.momentumInfo) {
+      merged.momentumPercent = tickerData.momentumInfo.momentumPercent;
+      merged.snapbackRecoveryPercent = tickerData.momentumInfo.snapbackRecoveryPercent;
+    }
     if (tickerData.trendInfo) merged.trendPercent = tickerData.trendInfo.trendPercent;
     if (tickerData.volumeTrendInfo) merged.relativeVolumePercent = tickerData.volumeTrendInfo.relativeVolumePercent;
     if (tickerData.drawdownInfo) merged.maxDrawdownPercent = tickerData.drawdownInfo.maxDrawdownPercent;
@@ -5562,6 +6345,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
     // now instead of only a display price).
     let targetScoreValue = null;
     if (revisedFormulaSheetName && quickTargetResult != null) {
+      const tickerTrackRecord = personalTrackRecordMap[ticker];
       const targetInputs = {
         stockPrice: merged.stockPrice, targetStockPrice: quickTargetResult.targetStockPrice,
         iv: merged.iv, daysToExpiry: daysToExpiry, optionType: parsedStrike.type,
@@ -5569,7 +6353,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
         sectorPercent: sectorMomentumNumeric, trendPercent: merged.trendPercent,
         relativeVolumePercent: merged.relativeVolumePercent, marketRegimePercent: merged.marketRegimePercent,
         daysToCatalyst: daysToCatalystNumeric,
-        hitRateCallPercent: merged.hitRateCallPercent, hitRatePutPercent: merged.hitRatePutPercent
+        hitRateCallPercent: merged.hitRateCallPercent, hitRatePutPercent: merged.hitRatePutPercent,
+        trackRecordAvgReturn: tickerTrackRecord ? tickerTrackRecord.avgReturnPercent : null,
+        trackRecordTradeCount: tickerTrackRecord ? tickerTrackRecord.tradeCount : 0,
+        ratingScore: tickerData.qualityInfo ? tickerData.qualityInfo.ratingScore : null
       };
       targetScoreValue = revisedFormulaSheetName === 'Quick'
         ? computeQuickSheetTargetScore_(targetInputs, objectiveConfig)
@@ -5586,7 +6373,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
       const riskScoreValue = revisedFormulaSheetName === 'Quick'
         ? computeQuickSheetRiskScore_({
             atrPercent: merged.atrPercent, delta: merged.greekDelta,
-            stockPrice: merged.stockPrice, optionPrice: merged.optionPrice, ivRank: merged.ivRank
+            stockPrice: merged.stockPrice, optionPrice: merged.optionPrice, ivRank: merged.ivRank,
+            daysToCatalyst: daysToCatalystNumeric,
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent
           })
         : revisedFormulaSheetName === 'Risky'
         ? computeRiskySheetRiskScore_({
@@ -5627,6 +6416,33 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
       }
     }
 
+    // NEWS RISK (see NewsRisk.gs) — event/headline risk layered onto
+    // Risk Score. This project's Risk Score is "lower is better," so a
+    // negative penalty INCREASES risk here (opposite sign from how
+    // NewsRisk.gs's own docstring suggests using it directly against a
+    // "higher is better" score). Only adjusts a Risk Score that was
+    // actually computed above — nothing to layer onto for a row with no
+    // other data yet. Fails soft: any error (missing key, network issue)
+    // just skips this row's adjustment rather than breaking the run.
+    var newsBlockWarning = null;
+    var newsHasBlock = false; // outside the try block for the same reason newsBlockWarning is — needed later by Quick's Filter score, which newsResult itself (declared inside try) isn't visible to
+    try {
+      const newsResult = newsRiskMap[ticker] || getNewsRisk(ticker, { gapPct: merged.changeNow });
+      newsHasBlock = !!newsResult.block;
+      if (merged.riskScore != null && newsResult.penalty < 0) {
+        merged.riskScore = Math.min(100, merged.riskScore + Math.abs(newsResult.penalty));
+      }
+      if (newsResult.block) {
+        newsBlockWarning = 'NEWS: ' + (newsResult.headline || newsResult.flags.join(', '));
+      }
+      if (map.news) {
+        rowOut[map.news - 1] = newsResult.flags.length ? newsResult.flags.join(', ') : '';
+        if (newsResult.headline) noteOut[map.news - 1] = newsResult.headline;
+      }
+    } catch (e) {
+      // News risk is a bonus signal, not a dependency — skip silently.
+    }
+
     // FILTER — combines Risk (inverted) with sheet-specific factors. All
     // three revised-formula sheets now compute this the same way.
     if (scoreRelevance.needsFilterScore) {
@@ -5634,7 +6450,13 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
         ? computeQuickSheetQuickScore_({
             rsPercent: merged.relativeStrength, optionType: parsedStrike.type, atrPercent: merged.atrPercent,
             delta: merged.greekDelta, stockPrice: merged.stockPrice, optionPrice: merged.optionPrice,
-            riskScoreValue: merged.riskScore, sectorPercent: sectorMomentumNumeric, ivRank: merged.ivRank
+            riskScoreValue: merged.riskScore, sectorPercent: sectorMomentumNumeric, ivRank: merged.ivRank,
+            trackRecordAvgReturn: personalTrackRecordMap[ticker] ? personalTrackRecordMap[ticker].avgReturnPercent : null,
+            trackRecordTradeCount: personalTrackRecordMap[ticker] ? personalTrackRecordMap[ticker].tradeCount : 0,
+            ratingScore: tickerData.qualityInfo ? tickerData.qualityInfo.ratingScore : null,
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent,
+            snapbackRecoveryPercent: merged.snapbackRecoveryPercent,
+            hasNegativeNews: newsHasBlock
           }, objectiveConfig)
         : revisedFormulaSheetName === 'Risky'
         ? computeRiskySheetQuickScore_({
@@ -5907,7 +6729,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
     const baseStatusText = rowChanges.length > 0
       ? ('OK — ' + sourceLabel + ' | Changed: ' + rowChanges.join(', '))
       : ('OK — ' + sourceLabel + ' | No changes');
-    const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning].filter(function (w) { return w != null; });
+    const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning].filter(function (w) { return w != null; });
     const statusText = warnings.length ? (baseStatusText + ' | ⚠️ ' + warnings.join(' ⚠️ ')) : baseStatusText;
 
     writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'));
@@ -5935,21 +6757,63 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
   // Range.sort() doesn't carry borders with a row the way it does
   // values/backgrounds/fonts, so the border has to land before the sort,
   // same as it always did.
+  if (dryRun) {
+    const snap2 = allValues.map(function (r, i) {
+      return (DATA_START_ROW + i) + ':' + r[map.ticker - 1] + '|strike=' + r[map.strike - 1] + '|expiry=' + r[map.expiry - 1];
+    }).join('\n');
+    logToSheet_('DRY RUN — SNAPSHOT 2 (right before write-back, after the full loop ran — nothing has been written to the sheet yet):\n' + snap2);
+  }
   if (numDataRows > 0) {
+    // Now writes for real even in dry-run mode — SNAPSHOT 1/2 already
+    // confirmed the buffer itself is untouched for Strike/Expiry, so this
+    // specific write is known-safe. Target's border is still skipped in
+    // dry-run (line below), since it's not relevant to this test and
+    // keeps this run as minimal as possible.
     const dataRange = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
+    // Layer formulas back in now, right before writing — see the note
+    // where allFormulas was captured above. Any cell that still has its
+    // original formula (this code never explicitly overwrites a formula
+    // cell) gets that formula string written instead of the stale
+    // computed value sitting in allValues; setValues() correctly
+    // re-creates a formula from a string starting with "=".
+    for (let r = 0; r < allValues.length; r++) {
+      for (let c = 0; c < allValues[r].length; c++) {
+        if (allFormulas[r][c]) allValues[r][c] = allFormulas[r][c];
+      }
+    }
     dataRange.setValues(allValues);
     dataRange.setBackgrounds(allBackgrounds);
     dataRange.setFontColors(allFontColors);
     dataRange.setNotes(allNotes);
     dataRange.setNumberFormats(allNumberFormats);
   }
-  if (map.target) {
+  if (map.target && !dryRun) {
     targetBorderRows.forEach(function (b) {
       sheet.getRange(b.row, map.target).setBorder(
         b.on, b.on, b.on, b.on, false, false,
         COLOR_TARGET_ACTIVE_HIGHLIGHT, SpreadsheetApp.BorderStyle.SOLID_THICK
       );
     });
+  }
+  if (dryRun) {
+    const snap3Range = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
+    const snap3Values = snap3Range.getValues();
+    const snap3 = snap3Values.map(function (r, i) {
+      return (DATA_START_ROW + i) + ':' + r[map.ticker - 1] + '|strike=' + r[map.strike - 1] + '|expiry=' + r[map.expiry - 1];
+    }).join('\n');
+    logToSheet_('DRY RUN — SNAPSHOT 3 (fresh read straight from the sheet, right after the real write-back \u2014 BEFORE the sort runs):\n' + snap3);
+
+    sortRowsByQuickScoreDescending_(sheet, map, lastRow, sortKey);
+
+    const snap4Range = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
+    const snap4Values = snap4Range.getValues();
+    const snap4 = snap4Values.map(function (r, i) {
+      return (DATA_START_ROW + i) + ':' + r[map.ticker - 1] + '|strike=' + r[map.strike - 1] + '|expiry=' + r[map.expiry - 1];
+    }).join('\n');
+    logToSheet_('DRY RUN — SNAPSHOT 4 (fresh read straight from the sheet, right after the sort ran):\n' + snap4);
+
+    logToSheet_('DRY RUN — stopping here, before highlight/best-row/cache-flush. The write-back and sort above DID run for real this time (SNAPSHOT 1/2 already proved the loop itself never touches Strike/Expiry, so this specific write was known-safe). Compare SNAPSHOT 3 and SNAPSHOT 4 by ticker (rows will be in a different ORDER after the sort, so match by ticker, not row number): if a ticker\u2019s Strike/Expiry match between them, the sort is not the cause either, and the next suspect is applyTopFilterHighlight_ or findBestScoreRow_. If they DON\u2019T match for some ticker, that confirms Range.sort() itself is the cause.');
+    return;
   }
 
   // Reorders every row by the ranking key (Score on Quick/Risky/Leap once
@@ -5959,7 +6823,6 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride) {
   // borders behave as an edge property, not a per-cell one), so
   // highlighting has to target the FINAL sorted positions or it ends up
   // on the wrong rows.
-  const sortKey = (revisedFormulaSheetName && map.score) ? 'score' : 'filterScore';
   sortRowsByQuickScoreDescending_(sheet, map, lastRow, sortKey);
 
   // Now that rows are in final position, flag the top 5 by the same
@@ -6204,8 +7067,12 @@ function getCachedTickerData_(
   // computed once, and the per-row code below picks the one it needs.
   // ---------------------------------------------------------------
   const momentumPercentValue = computeMomentumPercent_(barsResult.value, MOMENTUM_LOOKBACK_DAYS);
+  // Reuses barsResult.value again — zero extra network cost. null when
+  // no sharp-drop-then-recovery pattern is present, which is the normal
+  // case for most tickers most of the time.
+  const snapbackRecoveryPercentValue = computeSnapbackRecoveryPercent_(barsResult.value);
   const momentumInfo = momentumPercentValue != null
-    ? { momentumPercent: momentumPercentValue, source: 'Yahoo Finance (unofficial, ' + MOMENTUM_LOOKBACK_DAYS + 'd own return)' }
+    ? { momentumPercent: momentumPercentValue, snapbackRecoveryPercent: snapbackRecoveryPercentValue, source: 'Yahoo Finance (unofficial, ' + MOMENTUM_LOOKBACK_DAYS + 'd own return)' }
     : null;
 
   const trendPercentValue = computeTrendPercent_(barsResult.value, TREND_MA_PERIOD);
@@ -6377,3 +7244,213 @@ function writeStatus_(sheet, map, row, text, color, runTimestamp) {
  * ========================================================================== */
 
 function round2_(n) { return Math.round(n * 100) / 100; }
+
+
+/* ============================================================================
+ * NEWS RISK — event/headline risk layer for the Momentum score.
+ * Merged into this file directly (was a separate NewsRisk.gs) per request —
+ *
+ * Sources:
+ *   - Finnhub company news + earnings calendar (reuses this project's
+ *     existing FINNHUB_API_KEY script property — same key
+ *     getFinnhubApiKey_() already uses elsewhere, no separate setup)
+ *   - SEC EDGAR 8-K filings (no key; SEC wants a contact email in the User-Agent)
+ *
+ * Setup:
+ *   1. FINNHUB_API_KEY should already be set (used elsewhere in this
+ *      project for Research's catalyst data) — nothing new needed here.
+ *   2. Set NEWS_CFG.SEC_CONTACT below to your own email — SEC requires
+ *      a real contact in the User-Agent on every request, or it may
+ *      start rejecting calls.
+ *   3. Run testNewsRisk() once and approve permissions.
+ *
+ * ----------------------------------------------------------------------------
+ * Wired into validateAndUpdate (see the "NEWS RISK" section there):
+ *   - penalty is added into Risk Score (this project's Risk Score is
+ *     "lower is better", so a negative penalty INCREASES risk)
+ *   - block surfaces as a warning in Status, same pattern as the
+ *     existing OI-stale / expired / max-hold warnings
+ *   - flags / headline are written to a "News" column if one exists on
+ *     the sheet (optional — add a column named "News" to use it)
+ */
+
+const NEWS_CFG = {
+  LOOKBACK_DAYS: 5,          // headline/filing window (covers weekends)
+  FULL_WEIGHT_HOURS: 72,     // newer items count full; older count half and can't block
+  EARNINGS_WINDOW_DAYS: 10,  // flag upcoming earnings inside this window
+  GAP_ALERT_PCT: -4,         // gap-down with no explaining headline = something happened
+  BLOCK_AT: -25,             // total penalty at/below this = block entry
+  CACHE_MIN: 30,             // per-ticker cache, keeps Finnhub under 60 calls/min
+  SEC_CONTACT: 'you@example.com',  // TODO: set your own email — SEC requires a real contact
+  TZ: 'America/New_York',
+};
+
+// Headline rules. Within a group only the strongest hit counts, so one event isn't double-counted.
+const NEWS_RULES = [
+  { tag: 'EXEC_EXIT', group: 'exec', pts: -20, block: true,
+    re: /\b(ceo|cfo|cro|coo|cto|chief\b[\w\s-]{0,25}officer|president|head of)\b.{0,80}\b(step(s|ping)? down|resign\w*|depart\w*|exit\w*|leav(e|es|ing)|retir\w*|fired|ousted|replaced)\b|\b(step(s|ping)? down|resign\w*|depart\w*)\b.{0,80}\b(ceo|cfo|cro|coo|chief)\b/i },
+  { tag: 'GUIDANCE_CUT', group: 'guide', pts: -25, block: true,
+    re: /\b(cut|cuts|lower\w*|slash\w*|withdraw\w*|weak|soft|disappointing)\b.{0,50}\b(guidance|outlook|forecast)\b|\b(guidance|outlook|forecast)\b.{0,50}\b(cut|lower\w*|slash\w*|withdraw\w*|disappoint\w*|misses|below)\b/i },
+  { tag: 'EARNINGS_MISS', group: 'miss', pts: -15, block: false,
+    re: /\b(miss(es|ed)?|fall(s)? short of|below)\b.{0,30}\b(estimates|expectations|consensus)\b/i },
+  { tag: 'DOWNGRADE', group: 'analyst', pts: -10, block: false,
+    re: /\bdowngrad\w*\b|\b(cut|cuts|lowers?|slash\w*)\b.{0,20}\bprice target\b|\bprice target\b.{0,20}\b(cut|lowered)\b/i },
+  { tag: 'OFFERING', group: 'dilution', pts: -10, block: false,
+    re: /\b(secondary|public|stock|share) offering\b|\bconvertible (senior )?notes\b|\bdilut\w*/i },
+  { tag: 'REGULATORY', group: 'legal', pts: -10, block: false,
+    re: /\b(sec|doj|ftc|fda)\b.{0,40}\b(probe|investigat\w*|charges?|subpoena|warning letter|lawsuit)\b|\b(recall|data breach|hacked|major outage)\b/i },
+  { tag: 'LAWFIRM_NOISE', group: 'lawfirm', pts: -2, block: false, // shareholder-firm PRs fire constantly
+    re: /\b(class action|shareholder rights|law firm|on behalf of investors|securities fraud)\b/i },
+  { tag: 'UPGRADE', group: 'positive', pts: 5, block: false,
+    re: /\bupgrad\w*\b|\b(raises?|lifts?|boosts?|hikes?)\b.{0,20}\b(guidance|outlook|price target)\b/i },
+];
+
+// 8-K item codes. 5.02 also covers appointments/comp changes, so it's scored lighter
+// and shares the 'exec' group with the headline rule.
+const SEC_ITEMS = {
+  '5.02': { tag: '8K_EXEC_CHANGE', group: 'exec', pts: -10, block: false },
+  '4.02': { tag: '8K_RESTATEMENT', group: 'sec_severe', pts: -30, block: true },
+  '1.03': { tag: '8K_BANKRUPTCY', group: 'sec_severe', pts: -40, block: true },
+  '3.01': { tag: '8K_DELISTING', group: 'sec_severe', pts: -30, block: true },
+  '4.01': { tag: '8K_AUDITOR_CHANGE', group: 'auditor', pts: -15, block: false },
+  '2.06': { tag: '8K_IMPAIRMENT', group: 'impair', pts: -10, block: false },
+};
+
+/** Main entry: returns { penalty, block, flags[], headline, errors[] } */
+function getNewsRisk(ticker, opts) {
+  opts = opts || {};
+  ticker = String(ticker).trim().toUpperCase();
+  const cache = CacheService.getScriptCache();
+  const ck = 'NEWS_' + ticker;
+  let base;
+  const cached = cache.get(ck);
+  if (cached) {
+    base = JSON.parse(cached);
+  } else {
+    // Earnings-window check dropped here — matches the Cloud Function
+    // path (see NEWS RISK section notes above), so a ticker behaves the
+    // same regardless of whether the prefetch or this individual
+    // fallback ends up handling it. earnDays stays null; scoreNewsRisk_
+    // already handles that gracefully (that check just never fires).
+    const hits = [];
+    const errors = [];
+    try { hits.push.apply(hits, newsHeadlineHits_(ticker)); } catch (e) { errors.push('news: ' + e.message); }
+    try { hits.push.apply(hits, newsSecHits_(ticker)); } catch (e) { errors.push('sec: ' + e.message); }
+    base = { hits: hits, earnDays: null, errors: errors };
+    try { cache.put(ck, JSON.stringify(base), NEWS_CFG.CACHE_MIN * 60); } catch (e) {}
+  }
+  return scoreNewsRisk_(base, opts);
+}
+
+function scoreNewsRisk_(base, opts) {
+  const best = {};
+  base.hits.forEach(function (h) {
+    if (!best[h.group] || Math.abs(h.wpts) > Math.abs(best[h.group].wpts)) best[h.group] = h;
+  });
+  const kept = Object.keys(best).map(function (k) { return best[k]; });
+
+  let penalty = kept.reduce(function (s, h) { return s + h.wpts; }, 0);
+  let block = kept.some(function (h) { return h.block && h.fresh; });
+  const flags = kept.map(function (h) { return h.tag; });
+
+  if (base.earnDays !== null && base.earnDays <= NEWS_CFG.EARNINGS_WINDOW_DAYS) {
+    flags.push('EARNINGS_' + base.earnDays + 'D');
+    penalty -= base.earnDays <= 2 ? 10 : 5;
+    if (base.earnDays <= 1) block = true;
+  }
+
+  const gap = Number(opts.gapPct);
+  const hasNeg = kept.some(function (h) { return h.wpts < 0; });
+  if (opts.gapPct !== undefined && !isNaN(gap) && gap <= NEWS_CFG.GAP_ALERT_PCT && !hasNeg) {
+    flags.push('UNEXPLAINED_GAP');
+    penalty -= 10;
+  }
+
+  penalty = Math.max(-50, Math.min(5, Math.round(penalty)));
+  if (penalty <= NEWS_CFG.BLOCK_AT) block = true;
+
+  const worst = kept.filter(function (h) { return h.wpts < 0; })
+                    .sort(function (a, b) { return a.wpts - b.wpts; })[0];
+  return { penalty: penalty, block: block, flags: flags,
+           headline: worst ? worst.text : '', errors: base.errors };
+}
+
+function newsHeadlineHits_(ticker) {
+  const key = getFinnhubApiKey_();
+  if (!key) throw new Error('FINNHUB_API_KEY missing in Script Properties');
+  const now = new Date();
+  const from = newsFmt_(new Date(now.getTime() - NEWS_CFG.LOOKBACK_DAYS * 864e5));
+  const url = 'https://finnhub.io/api/v1/company-news?symbol=' + encodeURIComponent(ticker) +
+              '&from=' + from + '&to=' + newsFmt_(now) + '&token=' + key;
+  const items = newsFetchJson_(url, false) || [];
+  const hits = [];
+  items.forEach(function (it) {
+    const text = (it.headline || '') + ' ' + String(it.summary || '').slice(0, 300);
+    const ageH = (now.getTime() / 1000 - it.datetime) / 3600;
+    NEWS_RULES.forEach(function (r) {
+      if (r.re.test(text)) hits.push(newsHit_(r, ageH, it.headline));
+    });
+  });
+  return hits;
+}
+
+function newsSecHits_(ticker) {
+  const cik = newsCik_(ticker);
+  if (!cik) return [];
+  const j = newsFetchJson_('https://data.sec.gov/submissions/CIK' + cik + '.json', true);
+  const r = j && j.filings && j.filings.recent;
+  if (!r || !r.form) return [];
+  const now = Date.now();
+  const hits = [];
+  for (let i = 0; i < r.form.length && i < 60; i++) {
+    const ageH = (now - new Date(r.acceptanceDateTime[i]).getTime()) / 36e5;
+    if (ageH > NEWS_CFG.LOOKBACK_DAYS * 24) break; // newest-first
+    if (r.form[i] !== '8-K') continue;
+    String(r.items[i] || '').split(',').forEach(function (code) {
+      const rule = SEC_ITEMS[code.trim()];
+      if (rule) hits.push(newsHit_(rule, ageH, '8-K item ' + code.trim() + ' filed ' + r.filingDate[i]));
+    });
+  }
+  return hits;
+}
+
+function newsCik_(ticker) {
+  const props = PropertiesService.getScriptProperties();
+  const map = JSON.parse(props.getProperty('CIK_MAP') || '{}');
+  if (map[ticker]) return map[ticker];
+  const all = newsFetchJson_('https://www.sec.gov/files/company_tickers.json', true) || {};
+  Object.keys(all).forEach(function (k) {
+    if (all[k].ticker === ticker) map[ticker] = String(all[k].cik_str).padStart(10, '0');
+  });
+  if (map[ticker]) props.setProperty('CIK_MAP', JSON.stringify(map));
+  return map[ticker] || null;
+}
+
+function newsHit_(rule, ageH, text) {
+  const fresh = ageH <= NEWS_CFG.FULL_WEIGHT_HOURS;
+  return { tag: rule.tag, group: rule.group || rule.tag,
+           wpts: fresh ? rule.pts : rule.pts / 2,
+           block: !!rule.block, fresh: fresh,
+           text: String(text || '').slice(0, 140) };
+}
+
+function newsFetchJson_(url, isSec) {
+  const params = { muteHttpExceptions: true };
+  if (isSec) params.headers = { 'User-Agent': 'OptionsTrading ' + NEWS_CFG.SEC_CONTACT };
+  const res = UrlFetchApp.fetch(url, params);
+  if (res.getResponseCode() !== 200) {
+    throw new Error(url.split('?')[0] + ' → HTTP ' + res.getResponseCode());
+  }
+  return JSON.parse(res.getContentText());
+}
+
+function newsFmt_(d) {
+  return Utilities.formatDate(d, NEWS_CFG.TZ, 'yyyy-MM-dd');
+}
+
+/** Quick check. Temporarily set LOOKBACK_DAYS to 7 to see last week's ZS news fire. */
+function testNewsRisk() {
+  ['ZS', 'APP', 'ORCL'].forEach(function (t) {
+    Logger.log(t + ' → ' + JSON.stringify(getNewsRisk(t, { gapPct: 0 })));
+  });
+}
