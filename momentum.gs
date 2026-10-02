@@ -173,11 +173,17 @@ const COLOR_TARGET_ACTIVE_HIGHLIGHT = '#ffff00';
 // highest Filter Score rows this run. See TOP_FILTER_COUNT and
 // applyTopFilterHighlight_ below.
 const COLOR_TOP_FILTER_BORDER = '#b45f06';
+
 const TOP_FILTER_COUNT = 5;
 // NEW: 'score' added so the top-5 highlight also frames the Score cell
 // itself whenever ranking is done by Score (Quick/Risky/Leap) instead of
 // Filter Score (any other sheet).
 const TOP_FILTER_HIGHLIGHT_COLS = ['filterScore', 'riskScore', 'score', 'sectorMomentum', 'changeNow', 'atrPercent', 'ivRank', 'daysToCatalyst'];
+// When rows are ranked by Score (Quick/Risky/Leap), the top-5 border goes on the
+// Score cell ONLY — the longer list above (used when ranking by Filter Score on
+// other sheets) looked too crowded. clearTopFilterHighlight_ still clears the
+// whole list above, so borders left over from earlier runs disappear.
+const TOP_SCORE_HIGHLIGHT_COLS = ['score'];
 
 // (NEGATIVE_NUMBER_RULE_ROWS/COLS and the letter-based sign rule that used
 // them were retired — see FONT COLOR POLICY further down for what
@@ -1148,7 +1154,7 @@ function onOpen() {
     .addItem('Run Daily Research', 'runDailyResearch')
     .addItem('🔬 Debug: Promote Dry Run (no writes)', 'promoteResearchPicksForTabDryRun')
     .addItem('🔬 Debug: Research Dry Run (no writes)', 'runDailyResearchDryRun')
-    .addItem('🚀 Run Full Daily Pipeline (Research + Promote + Auto-fill / Best OI)', 'runDailyPipeline')
+    .addItem('🚀 Run Daily Pipeline (Research + Promote)', 'runDailyPipeline')
     .addItem('☁️ Set Cloud Function URL/Secret', 'setCloudFunctionCredentials')
     .addToUi();
 }
@@ -4939,7 +4945,7 @@ function computeTargetForObjective_(entryPrice, daysHeld, currentStockPrice, cur
 // known negative headline isn't the "no obvious reason" setup this is
 // meant to find.
 const QUICK_SHEET_WEIGHTS = {
-  quick: { rs: 18, atr: 14, requiredMove: 13, risk: 9, sector: 7, ivRank: 3, delta: 3, trackRecord: 5, quality: 13, meanReversion: 15 },
+  quick: { rs: 18, atr: 14, requiredMove: 13, sector: 7, ivRank: 3, delta: 3, trackRecord: 5, quality: 13, meanReversion: 15 },
   // Rebuilt after confirming the old {atr, omega, ivRank} formula was
   // calibrated against a 20%-profit/50%-loss assumption that doesn't
   // match actual Quick behavior (1-5 day hold, 1-3% typical target —
@@ -4982,7 +4988,302 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
   return Math.min.apply(null, candidates);
 }
 
-function computeQuickSheetRiskScore_(inputs) {
+/* ============================================================================
+ * QUICK & RISKY RISK — PREMIUM-LOSS MODEL (replaces the old volatility/
+ * velocity Quick Risk and the drawdown-based Risky Risk).
+ *
+ * What Risk means here (your definition): the fear of LOSING THE PREMIUM
+ * you paid. Not "how much does this swing" — a volatile stock that
+ * swings up is not a risk to you; a position that ends underwater and
+ * stays there is.
+ *
+ * It simulates YOUR exit rules, path by path (1,000 paths with fat-tailed
+ * daily moves, fixed seed so a given input always gives the same number):
+ *   Days 1-5:   exit the moment the option can be sold for +3% over what
+ *               you paid (WIN).
+ *   Days 6-60:  "firefight" — no profit goal; exit the first day it can be
+ *               sold for what you paid (RECOVERED).
+ *   Day 60 (or expiry, whichever is sooner), still under water: STUCK —
+ *               you take whatever the option is worth.
+ *   Risk (0-100) = average of P(STUCK and down >= 10%), P(... >= 25%),
+ *   P(... >= 50%), as percentages. So a name that usually pops +3% early,
+ *   or climbs back, scores LOW even if it is wildly volatile (Tesla), and a
+ *   cheap out-of-the-money option that needs a big move to ever get back
+ *   scores HIGH.
+ *
+ * Priced in: theta (the option is re-priced with Black-Scholes every day,
+ * time shrinking), the bid/ask spread (you buy at the ask, sell at the
+ * bid, so +3% means +3% AFTER spread costs), a gradual IV give-back scaled
+ * by IV Rank, and — if a catalyst falls inside the window — an IV crush
+ * and an extra gap move on the catalyst day. Volatility is backed out of
+ * the option's own mark (calibrateVolToMark_, shared with Leap) so the
+ * model doesn't start you "underwater" because of a stale IV quote.
+ * Risky additionally blends in thin-liquidity risk (it trades thinner
+ * chains; 10%).
+ *
+ * Daily moves are Student-t (4 degrees of freedom, scaled to the same
+ * volatility) rather than bell-curve, so a sudden 10-20% drop is plausible —
+ * that is the real danger of a deep in-the-money call, which falls almost
+ * dollar for dollar with the stock. Same overall volatility, just more
+ * quiet days and more extreme ones.
+ *
+ * If the model can't run (no usable IV, price, strike or expiry) Risk is
+ * left BLANK, not filled with a neutral 50 — deep ITM options can't have
+ * their volatility backed out of the price (almost all intrinsic value), so
+ * they depend on the quoted IV, and a bogus 50 would be ~5x a typical value.
+ *
+ * Judgment calls, all editable below: the 10/25/50% loss tiers, the IV
+ * give-back (10%), the event IV crush (20% at IV Rank 100), the event gap
+ * size (3 days of normal movement), and the tail fatness (tailDof). The
+ * event numbers are the least grounded — there is no per-ticker
+ * expected-move input to anchor them.
+ * Needs bsPriceYears_ and calibrateVolToMark_ (defined in the Leap
+ * premium-loss block above).
+ * ========================================================================== */
+
+const QR_RISK_USE_PREMIUM_LOSS_MODEL = true; // false = previous formulas (computeQuickSheetRiskScoreVelocity_ / computeRiskySheetRiskScoreDrawdown_)
+
+const QR_RISK_MODEL = {
+  Quick: { winPercent: 3, winDays: 5, recoverDays: 60, lossTiers: [0.10, 0.25, 0.50], liquidityWeight: 0 },
+  Risky: { winPercent: 3, winDays: 5, recoverDays: 60, lossTiers: [0.10, 0.25, 0.50], liquidityWeight: 0.10 }
+};
+
+const QR_RISK_SIM = {
+  paths: 1000,              // even number (second half are mirror images of the first)
+  maxDays: 90,              // longest recoverDays supported
+  seed: 20261002,
+  ivReversionMax: 0.10,     // IV give-back by ivReversionRampDays at IV Rank 100 (scaled by rank)
+  ivReversionRampDays: 30,
+  eventIvCrushMax: 0.20,    // extra IV drop once the catalyst has passed, at IV Rank 100
+  eventGapDays: 3,          // catalyst-day gap = this many days of normal movement
+  tailDof: 4,               // Student-t degrees of freedom for daily moves; must be even and >= 4 (lower = fatter tails). 0 = plain bell curve
+  maxShockSd: 8,            // cap on any one day's move, in standard deviations
+  atrToDailyVol: 0.65       // fallback only: daily volatility ~= this x ATR% (Parkinson range estimator)
+};
+
+var QR_NORMALS_CACHE_ = null;
+
+// Validated tail setting: an even number >= 4, else 0 (plain normal).
+function SIM_DOF_() {
+  const d = QR_RISK_SIM.tailDof;
+  return (d >= 4 && d % 2 === 0) ? d : 0;
+}
+
+// Pre-generated standard normals shared by every row in an execution
+// (built once, ~36k numbers). Antithetic pairs keep the average shock at
+// exactly zero, and reusing the SAME shocks for every ticker means two
+// rows differ because of their inputs, not because of sampling luck.
+function qrNormals_() {
+  if (QR_NORMALS_CACHE_) return QR_NORMALS_CACHE_;
+  const n = QR_RISK_SIM.paths, days = QR_RISK_SIM.maxDays, half = n / 2;
+  let a = QR_RISK_SIM.seed >>> 0;
+  const rnd = function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const gauss = function () {
+    const u = Math.max(rnd(), 1e-12), v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  // Unit-variance Student-t draw (even dof >= 4): normal / sqrt(chi-square/dof),
+  // rescaled by sqrt((dof-2)/dof) so its variance is 1 like the plain normal.
+  const dof = SIM_DOF_();
+  const cap = QR_RISK_SIM.maxShockSd;
+  const shock = function () {
+    const g = gauss();
+    if (!dof) return g;
+    let chi2 = 0;
+    for (let i = 0; i < dof / 2; i++) chi2 += -2 * Math.log(Math.max(rnd(), 1e-12));
+    const t = g / Math.sqrt(chi2 / dof) * Math.sqrt((dof - 2) / dof);
+    return Math.max(-cap, Math.min(cap, t));
+  };
+  const z = [], ev = [];
+  for (let p = 0; p < half; p++) {
+    const row = new Float64Array(days), mirror = new Float64Array(days);
+    for (let d = 0; d < days; d++) { const g = shock(); row[d] = g; mirror[d] = -g; }
+    z.push(row); z.push(mirror);
+    const e = gauss(); ev.push(e); ev.push(-e);
+  }
+  QR_NORMALS_CACHE_ = { z: z, ev: ev };
+  return QR_NORMALS_CACHE_;
+}
+
+// Builds everything the simulation needs for ONE contract (volatility backed
+// out of the mark, costs, event timing) so Risk and Score can share it.
+// Returns null if price, strike, expiry or a usable volatility is missing.
+function prepareQuickRiskySim_(sheetName, inputs) {
+  const cfg = QR_RISK_MODEL[sheetName];
+  if (!cfg) return null;
+  const S0 = inputs.stockPrice, K = inputs.strike, price = inputs.optionPrice, dte = inputs.daysToExpiry;
+  const optionType = inputs.optionType === 'P' ? 'P' : 'C';
+  if (!isPlausible_(S0, 0.01, null) || !isPlausible_(K, 0.01, null) || !isPlausible_(price, 0.01, null) ||
+      !isPlausible_(dte, 1, null)) return null;
+
+  const SIM = QR_RISK_SIM;
+  // Volatility, best source first: (1) backed out of the option's own price
+  // whenever it has enough time value to do that (the usual case for your
+  // long-dated contracts); (2) the quoted IV; (3) an estimate from ATR%
+  // (daily range -> daily volatility -> annual) when neither exists.
+  let quoteSigma = null, quoteSource = null;
+  if (isPlausible_(inputs.ivPercent, 1, 1000)) {
+    quoteSigma = inputs.ivPercent / 100; quoteSource = 'quoted IV';
+  } else if (isPlausible_(inputs.atrPercent, 0.05, 50)) {
+    quoteSigma = clamp_(inputs.atrPercent / 100 * SIM.atrToDailyVol * Math.sqrt(252), 0.05, 3);
+    quoteSource = 'ATR% estimate';
+  }
+  const cal = calibrateVolToMark_(price, S0, K, dte / 365, optionType, quoteSigma);
+  if (!cal) return null;
+  const intrinsic = optionType === 'P' ? Math.max(K - S0, 0) : Math.max(S0 - K, 0);
+  const volSource = ((price - intrinsic) / price >= 0.15) ? 'backed out of option price' : quoteSource;
+
+  const halfSpread = isPlausible_(inputs.bidAskSpreadPct, 0, 100) ? (inputs.bidAskSpreadPct / 100) / 2 : 0;
+  const cost = price * (1 + halfSpread);   // you pay the ask
+  return {
+    sheetName: sheetName, cfg: cfg, S0: S0, K: K, dte: dte, optionType: optionType,
+    sigma: cal.sigma, scale: cal.scale, volSource: volSource,
+    halfSpread: halfSpread, cost: cost, exitFactor: 1 - halfSpread,   // you receive the bid
+    winLevel: cost * (1 + cfg.winPercent / 100),
+    rank: isPlausible_(inputs.ivRank, 0, 100) ? inputs.ivRank / 100 : 0.5,
+    daysToCatalyst: inputs.daysToCatalyst
+  };
+}
+
+// Runs the paths. opts.winOnly: stop at the end of the win window and report
+// only pWin (cheap; used for Score). opts.tiltSd: shift the stock's expected
+// move over the win window by this many standard deviations (stock-setup tilt;
+// Risk runs with 0).
+// Returns { risk, pWin, pRecover, pStuck, tierProbabilities, volSource }.
+function runQuickRiskySim_(ctx, opts) {
+  opts = opts || {};
+  const cfg = ctx.cfg, SIM = QR_RISK_SIM;
+  const sigma = ctx.sigma, K = ctx.K, dte = ctx.dte, optionType = ctx.optionType;
+  const endDay = opts.winOnly
+    ? Math.min(cfg.winDays, Math.floor(dte))
+    : Math.min(cfg.recoverDays, SIM.maxDays, Math.floor(dte));
+
+  const revMax = SIM.ivReversionMax * ctx.rank;
+  const crush = SIM.eventIvCrushMax * ctx.rank;
+  const dc = ctx.daysToCatalyst;
+  const eventDay = (isPlausible_(dc, 0, null) && Math.ceil(dc) >= 1 && Math.ceil(dc) <= endDay) ? Math.ceil(dc) : null;
+
+  const drift = -0.5 * sigma * sigma / 365;
+  const vol = sigma * Math.sqrt(1 / 365);
+  const gapSd = sigma * Math.sqrt(SIM.eventGapDays / 365);
+  const tiltPerDay = (opts.tiltSd || 0) * vol * Math.sqrt(cfg.winDays) / cfg.winDays;
+
+  const normals = qrNormals_();
+  const tiers = cfg.lossTiers;
+  const tierHits = tiers.map(function () { return 0; });
+  let nWin = 0, nRec = 0, nStuck = 0;
+
+  for (let p = 0; p < SIM.paths; p++) {
+    const z = normals.z[p];
+    let S = ctx.S0;
+    for (let d = 1; d <= endDay; d++) {
+      S *= Math.exp(drift + (d <= cfg.winDays ? tiltPerDay : 0) + vol * z[d - 1]);
+      if (d === eventDay) S *= Math.exp(gapSd * normals.ev[p] - 0.5 * gapSd * gapSd);
+
+      let sigD = sigma * (1 - revMax * Math.min(1, d / SIM.ivReversionRampDays));
+      if (eventDay != null && d >= eventDay) sigD *= (1 - crush);
+      if (sigD < 0.05) sigD = 0.05;
+
+      const proceeds = bsPriceYears_(S, K, (dte - d) / 365, sigD, optionType) * ctx.scale * ctx.exitFactor;
+
+      if (d <= cfg.winDays && proceeds >= ctx.winLevel) { nWin++; break; }
+      if (opts.winOnly) continue;
+      if (d > cfg.winDays && proceeds >= ctx.cost) { nRec++; break; }
+      if (d === endDay) {
+        nStuck++;
+        const lossFraction = 1 - proceeds / ctx.cost;
+        for (let t = 0; t < tiers.length; t++) if (lossFraction >= tiers[t]) tierHits[t]++;
+      }
+    }
+  }
+
+  const tierProbabilities = tierHits.map(function (h) { return h / SIM.paths; });
+  const avg = tierProbabilities.reduce(function (a, b) { return a + b; }, 0) / tierProbabilities.length;
+  return {
+    risk: Math.round(avg * 1000) / 10,
+    pWin: nWin / SIM.paths, pRecover: nRec / SIM.paths, pStuck: nStuck / SIM.paths,
+    tierProbabilities: tierProbabilities, volSource: ctx.volSource
+  };
+}
+
+// One-call convenience (prepare + run), used by tests and anything that
+// doesn't need to share the prepared context.
+function computeQuickRiskyPremiumLoss_(sheetName, inputs) {
+  const ctx = prepareQuickRiskySim_(sheetName, inputs);
+  return ctx ? runQuickRiskySim_(ctx, {}) : null;
+}
+
+// Risk (0-100) from a prepared context + sim result; null if not computable.
+function quickRiskyRiskFromSim_(ctx, r, inputs) {
+  if (!ctx || !r) return null;
+  const lw = ctx.cfg.liquidityWeight;
+  const risk = lw > 0 ? (r.risk * (1 - lw) + liquidityRiskScore_(inputs.oi, inputs.volume) * lw) : r.risk;
+  return Math.round(risk * 10) / 10;
+}
+
+function computeQuickRiskyRisk_(sheetName, inputs, holder) {
+  const ctx = prepareQuickRiskySim_(sheetName, inputs);
+  if (holder) { holder.ctx = ctx; holder.risk = null; }
+  if (!ctx) return null; // can't be computed -> blank Risk (see call site), NOT a neutral 50
+  const r = runQuickRiskySim_(ctx, {});
+  if (holder) holder.risk = r;
+  return quickRiskyRiskFromSim_(ctx, r, inputs);
+}
+
+// holder (optional): receives { ctx, risk } so Score and the cell notes can
+// reuse this row's prepared simulation instead of rebuilding it.
+function computeQuickSheetRiskScore_(inputs, holder) {
+  if (!QR_RISK_USE_PREMIUM_LOSS_MODEL) return computeQuickSheetRiskScoreVelocity_(inputs);
+  return computeQuickRiskyRisk_('Quick', inputs, holder);
+}
+
+function computeRiskySheetRiskScore_(inputs, holder) {
+  if (!QR_RISK_USE_PREMIUM_LOSS_MODEL) return computeRiskySheetRiskScoreDrawdown_(inputs);
+  return computeQuickRiskyRisk_('Risky', inputs, holder);
+}
+
+/* ----------------------------------------------------------------------------
+ * QUICK & RISKY SCORE — "CAN THIS CONTRACT BANK +3% FAST?"
+ *
+ * Score = the simulated chance (0-100) that THIS contract can be sold for at
+ * least +3% over what you paid, after paying the bid/ask spread, within 5
+ * days (same-day counts). It uses the same simulation as Risk, so it knows
+ * about the contract itself — leverage per dollar of premium, spread, time
+ * decay, IV give-back, a catalyst inside the window — which the old Score
+ * (a weighted average of Filter and Target, both stock-level signals) could
+ * not see. That is why the old Score tracked Filter so closely.
+ *
+ * The stock's setup enters as a small, capped tilt: Filter above 50 nudges the
+ * stock's expected 5-day move up, below 50 nudges it down, by at most
+ * QR_SCORE_TILT_MAX_SD standard deviations of the 5-day move (a few points of
+ * Score at most). The size of that tilt is a judgment call and is NOT
+ * validated against your trade history; set it to 0 for a purely mechanical
+ * Score. Risk never uses the tilt.
+ * ------------------------------------------------------------------------- */
+
+const QR_SCORE_USE_WIN_PROBABILITY = true; // false = previous Score (Filter + Target blend, see SCORE_WEIGHTS_BY_SHEET)
+const QR_SCORE_TILT_MAX_SD = 0.25;
+
+// Colour bands for the new scales (the old 70/40 and 33/66 cut-offs were set for
+// averaged scores that all sat near 70, and would paint everything one colour).
+const QR_SCORE_BANDS = { green: 50, yellow: 35 };  // Score >= green is good, >= yellow is fair, else poor
+const QR_RISK_BANDS = { green: 15, yellow: 25 };   // Risk <= green is low, <= yellow is moderate, else high
+
+function computeQuickRiskyScore_(ctx, filterScoreValue) {
+  if (!ctx) return null;
+  const f = isPlausible_(filterScoreValue, 0, 100) ? filterScoreValue : 50;
+  const tiltSd = clamp_((f - 50) / 50, -1, 1) * QR_SCORE_TILT_MAX_SD;
+  const r = runQuickRiskySim_(ctx, { winOnly: true, tiltSd: tiltSd });
+  return { score: Math.round(r.pWin * 1000) / 10, pWin: r.pWin, tiltSd: tiltSd };
+}
+
+function computeQuickSheetRiskScoreVelocity_(inputs) {
   const w = QUICK_SHEET_WEIGHTS.risk;
   // How many days a plausible ATR-sized move, amplified by this
   // position's own leverage, would take to swing the PREMIUM down by
@@ -5043,7 +5344,8 @@ function computeQuickSheetQuickScore_(inputs, config) {
   const daysToTarget = (omega != null) ? estimatedDaysForPremiumMove_(inputs.atrPercent, omega, config.minProfitPercent) : null;
   const requiredMove = targetFeasibilityScoreForObjective_(daysToTarget, config);
 
-  const lowRisk = isPlausible_(inputs.riskScoreValue, 0, 100) ? (100 - inputs.riskScoreValue) : 50;
+  // Risk (lowRisk) is deliberately NOT a Filter factor any more — Filter and
+  // Score stay independent of the premium-loss Risk column.
   const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
   const ivRank = ivRankSuitabilityScore_(inputs.ivRank);
   const delta = deltaExposureScore_(inputs.delta);
@@ -5055,14 +5357,14 @@ function computeQuickSheetQuickScore_(inputs, config) {
   // no obvious cause, not any pullback regardless of why.
   if (inputs.hasNegativeNews === true) meanReversion = meanReversion * 0.3;
 
-  const totalWeight = w.rs + w.atr + w.requiredMove + w.risk + w.sector + w.ivRank + w.delta + w.trackRecord + w.quality + w.meanReversion;
-  const weightedSum = rs * w.rs + atr * w.atr + requiredMove * w.requiredMove + lowRisk * w.risk +
+  const totalWeight = w.rs + w.atr + w.requiredMove + w.sector + w.ivRank + w.delta + w.trackRecord + w.quality + w.meanReversion;
+  const weightedSum = rs * w.rs + atr * w.atr + requiredMove * w.requiredMove +
     sector * w.sector + ivRank * w.ivRank + delta * w.delta + trackRecord * w.trackRecord + quality * w.quality +
     meanReversion * w.meanReversion;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
-function computeRiskySheetRiskScore_(inputs) {
+function computeRiskySheetRiskScoreDrawdown_(inputs) {
   const w = RISKY_SHEET_WEIGHTS.risk;
   const drawdown = drawdownRiskScore_(inputs.maxDrawdownPercent);
   const optionRisk = optionRiskScore_(inputs.bidAskSpreadPct, inputs.extrinsicValue, inputs.optionPrice);
@@ -5157,7 +5459,374 @@ function computeLeapSheetFilterScore_(inputs) {
 // PERCENT (10%) — same underlying "how many days to swing against your
 // actual loss threshold" idea as Quick/Risky's Risk, just calibrated to
 // a multi-month hold instead of days.
-function computeLeapSheetRiskScore_(inputs) {
+/* ============================================================================
+ * LEAP RISK — ONE-MONTH PREMIUM-LOSS MODEL (replaces the old velocity-based
+ * Leap Risk).
+ *
+ * Your Leap objective: a stock proxy held as long as you can, so Risk asks
+ * one thing — "if I buy this TODAY, what's the chance the premium is down
+ * 10% / 20% / 30% a month from now?" There is no profit-target/firefight
+ * phase here like Quick/Risky, so no path simulation is needed: it is the
+ * probability that the stock lands (at the 30-day mark) below the price at
+ * which the option would be worth that much less — a closed-form lognormal
+ * calculation, zero drift, volatility = this contract's own IV.
+ *   Risk (0-100) = average of P(down >= 10%), P(down >= 20%), P(down >= 30%)
+ *   at the 30-day mark, as percentages.
+ *
+ * Priced in: 30 days of theta (the reprice has 30 fewer days left), the
+ * bid/ask spread (half paid in, half paid out), and a small IV give-back
+ * scaled by IV Rank (a rich IV tends to drift lower, which hurts a premium
+ * holder even if the stock goes nowhere).
+ *
+ * NOT in here on purpose: company quality / moat — that is already scored
+ * in Leap's Filter (Quality, 25%); Risk stays a pure premium-exposure
+ * measure. It also isn't a "touched -10% at any point in the month" number
+ * (that would be roughly double); it is the mark at the 30-day point,
+ * which is how you phrased it. Judgment calls live in LEAP_RISK_MODEL.
+ * ========================================================================== */
+
+/* ----------------------------------------------------------------------------
+ * LEAP-ONLY helpers for the premium-loss Risk below (Black-Scholes price, and
+ * backing the volatility out of the option's own mark so price and vol agree).
+ * ------------------------------------------------------------------------- */
+function bsPriceYears_(S, K, T, sigma, optionType) {
+  if (T <= 0) return optionType === 'P' ? Math.max(K - S, 0) : Math.max(S - K, 0);
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(S / K) + (RISK_FREE_RATE + sigma * sigma / 2) * T) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  const disc = Math.exp(-RISK_FREE_RATE * T);
+  return optionType === 'P'
+    ? K * disc * normalCdf_(-d2) - S * normalCdf_(-d1)
+    : S * normalCdf_(d1) - K * disc * normalCdf_(d2);
+}
+
+// CALIBRATION: the model reprices options with Black-Scholes, but the cost
+// basis is the market MARK. If the quote's IV disagrees with the mark (stale
+// or mismatched IV, or price and IV from different sources), BS(S0) != mark
+// and the model starts you "underwater" before the stock moves — which was
+// inflating Risk toward 70-100. So the volatility is backed out of the mark
+// itself. When the option is mostly intrinsic (extrinsic < 15% of price) IV
+// is ill-defined, so the quote IV is used and values are scaled to the mark.
+// Returns { sigma, scale } or null if the mark can't be reconciled.
+function calibrateVolToMark_(price, S, K, T, optionType, quoteSigma) {
+  const intrinsic = optionType === 'P' ? Math.max(K - S, 0) : Math.max(S - K, 0);
+  if ((price - intrinsic) / price >= 0.15) {
+    const lo0 = 0.05, hi0 = 4;
+    if (bsPriceYears_(S, K, T, hi0, optionType) < price) return null;
+    if (bsPriceYears_(S, K, T, lo0, optionType) >= price) return { sigma: lo0, scale: 1 };
+    let lo = lo0, hi = hi0;
+    for (let i = 0; i < 40; i++) {
+      const mid = (lo + hi) / 2;
+      if (bsPriceYears_(S, K, T, mid, optionType) < price) lo = mid; else hi = mid;
+    }
+    return { sigma: (lo + hi) / 2, scale: 1 };
+  }
+  if (quoteSigma == null) return null;
+  const base = bsPriceYears_(S, K, T, quoteSigma, optionType);
+  const scale = base > 0.01 ? clamp_(price / base, 0.7, 1.4) : 1;
+  return { sigma: quoteSigma, scale: scale };
+}
+
+const LEAP_RISK_USE_PREMIUM_LOSS_MODEL = true; // false = old velocity-based formula (computeLeapSheetRiskScoreVelocity_)
+
+/* ----------------------------------------------------------------------------
+ * LEAP RISK — "WOULD I REGRET BUYING THIS TODAY?"
+ *
+ * Your Leap rule: if there is a high chance the premium takes a real hit within
+ * a month, don't buy — wait for that drawdown — otherwise consider it if the
+ * Score is good. So Risk (0-100) is the chance the premium (what you could
+ * SELL it for, after the bid/ask spread) is down at least 20% at the 30-day
+ * mark. You first framed the line as 10%, but on a ~3.5x-leveraged call that
+ * is only a ~3% stock dip, which is close to a coin flip for almost every
+ * candidate (40-50%), so it could not tell them apart; the 20% line does
+ * (about 10-40% on the same rows). The 10% and 30% chances are computed too
+ * and shown in the Risk cell's note; tierWeights = [1, 0, 0] puts Risk back on
+ * the 10% line.
+ *
+ * Priced in: 30 days of time decay, the spread (paid in and out), an IV
+ * give-back scaled by IV Rank, and — new — a catalyst (earnings etc.) landing
+ * inside the 30 days, which adds a gap move and an IV crush; plus a small
+ * "pullback" tilt when the stock has just run up well above its 20-day average
+ * (the setup where waiting for a dip is most often right). The tilt and the
+ * catalyst sizes are judgment calls (below), not validated on your history.
+ * ------------------------------------------------------------------------- */
+const LEAP_RISK_MODEL = {
+  horizonDays: 30,
+  lossTiers: [0.10, 0.20, 0.30],   // premium down by at least this much at the horizon
+  tierWeights: [0, 1, 0],          // Risk = the 20% line only; the other tiers are shown in the cell note. [1,0,0] = your original 10% line
+  ivReversionMax: 0.10,            // IV give-back by the horizon at IV Rank 100 (scaled down linearly with rank)
+  ivReversionDefault: 0.05,        // used when IV Rank is unknown
+  eventGapDays: 3,                 // catalyst inside the horizon: extra gap = this many days of normal movement
+  eventIvCrushMax: 0.20,           // ...and IV drops by this much at IV Rank 100
+  extensionTiltMaxSd: 0.25         // a fully "extended" stock shifts the expected 30-day move down by this many sd
+};
+
+// Solves for the stock price at which the option is worth `needMark` at the
+// horizon (calls: value rises with the stock; puts: it falls). Returns the
+// stock level, or a sentinel when `needMark` is out of reach at either end.
+function leapSolveStockForValue_(needMark, S0, K, T, sigmaH, optionType) {
+  let lo = S0 * 0.02, hi = S0 * 10;
+  const vLo = bsPriceYears_(lo, K, T, sigmaH, optionType), vHi = bsPriceYears_(hi, K, T, sigmaH, optionType);
+  if (optionType === 'P') {
+    if (vLo <= needMark) return { level: lo, outOfRange: 'low' };    // worth less than needMark even at the lowest stock price
+    if (vHi >= needMark) return { level: hi, outOfRange: 'high' };
+    for (let i = 0; i < 40; i++) {
+      const mid = (lo + hi) / 2;
+      if (bsPriceYears_(mid, K, T, sigmaH, optionType) > needMark) lo = mid; else hi = mid;
+    }
+    return { level: (lo + hi) / 2, outOfRange: null };
+  }
+  if (vLo >= needMark) return { level: lo, outOfRange: 'low' };      // worth more than needMark even at the lowest stock price
+  if (vHi <= needMark) return { level: hi, outOfRange: 'high' };
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (bsPriceYears_(mid, K, T, sigmaH, optionType) < needMark) lo = mid; else hi = mid;
+  }
+  return { level: (lo + hi) / 2, outOfRange: null };
+}
+
+// Volatility + costs for one Leap contract, shared by Risk and Score.
+// Volatility, best source first: backed out of the option's price (the normal
+// case for a long-dated call), then the quoted IV, then an ATR% estimate.
+function leapPrepare_(inputs) {
+  const S0 = inputs.stockPrice, K = inputs.strike, price = inputs.optionPrice, dte = inputs.daysToExpiry;
+  const optionType = inputs.optionType === 'P' ? 'P' : 'C';
+  if (!isPlausible_(S0, 0.01, null) || !isPlausible_(K, 0.01, null) || !isPlausible_(price, 0.01, null) ||
+      !isPlausible_(dte, 10, null)) return null;
+  let quoteSigma = null;
+  if (isPlausible_(inputs.ivPercent, 1, 1000)) quoteSigma = inputs.ivPercent / 100;
+  else if (isPlausible_(inputs.atrPercent, 0.05, 50)) {
+    quoteSigma = clamp_(inputs.atrPercent / 100 * QR_RISK_SIM.atrToDailyVol * Math.sqrt(252), 0.05, 3);
+  }
+  const cal = calibrateVolToMark_(price, S0, K, dte / 365, optionType, quoteSigma);
+  if (!cal) return null;
+  const halfSpread = isPlausible_(inputs.bidAskSpreadPct, 0, 100) ? (inputs.bidAskSpreadPct / 100) / 2 : 0;
+  return {
+    S0: S0, K: K, price: price, dte: dte, optionType: optionType,
+    sigma: cal.sigma, scale: cal.scale, halfSpread: halfSpread,
+    cost: price * (1 + halfSpread), exitFactor: 1 - halfSpread,
+    rank: isPlausible_(inputs.ivRank, 0, 100) ? inputs.ivRank / 100 : null
+  };
+}
+
+// Returns { risk, tierProbabilities:[p10,p20,p30], eventWithin, extension } or null if inputs are unusable.
+function computeLeapPremiumLoss_(inputs) {
+  const M = LEAP_RISK_MODEL;
+  const c = leapPrepare_(inputs);
+  if (!c || !isPlausible_(c.dte, M.horizonDays + 2, null)) return null;
+
+  const h = M.horizonDays / 365;
+  const rankOrHalf = c.rank == null ? 0.5 : c.rank;
+  const dc = inputs.daysToCatalyst;
+  const eventWithin = isPlausible_(dc, 0, null) && dc <= M.horizonDays;
+
+  // IV at the horizon: gradual give-back by rank, plus a crush if a catalyst passes.
+  let sigmaAtHorizon = c.sigma * (1 - (c.rank == null ? M.ivReversionDefault : M.ivReversionMax * c.rank));
+  if (eventWithin) sigmaAtHorizon *= (1 - M.eventIvCrushMax * rankOrHalf);
+
+  // Spread of the stock's move at the horizon: normal diffusion, plus a gap if a catalyst lands inside it.
+  const sd = Math.sqrt(c.sigma * c.sigma * h + (eventWithin ? c.sigma * c.sigma * M.eventGapDays / 365 : 0));
+  // Pullback tilt: an extended stock (big 5-day run AND far above its 20-day average) leans lower.
+  const extension = overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent) / 100;
+  const mu = -0.5 * sd * sd - extension * M.extensionTiltMaxSd * sd;
+  const T = (c.dte - M.horizonDays) / 365;
+
+  const probs = M.lossTiers.map(function (loss) {
+    const need = (c.cost * (1 - loss)) / (c.exitFactor * c.scale); // option value at the horizon below which you're down >= `loss`
+    const sol = leapSolveStockForValue_(need, c.S0, c.K, T, sigmaAtHorizon, c.optionType);
+    if (c.optionType === 'P') {
+      // Put value falls as S rises: loss when S ends ABOVE the solved level.
+      if (sol.outOfRange === 'low') return 1;
+      if (sol.outOfRange === 'high') return 0;
+      return 1 - normalCdf_((Math.log(sol.level / c.S0) - mu) / sd);
+    }
+    // Call value rises with S: loss when S ends BELOW the solved level.
+    if (sol.outOfRange === 'low') return 0;
+    if (sol.outOfRange === 'high') return 1;
+    return normalCdf_((Math.log(sol.level / c.S0) - mu) / sd);
+  });
+
+  let wSum = 0, pSum = 0;
+  for (let i = 0; i < probs.length; i++) { wSum += M.tierWeights[i]; pSum += probs[i] * M.tierWeights[i]; }
+  return { risk: Math.round((pSum / wSum) * 1000) / 10, tierProbabilities: probs, eventWithin: eventWithin, extension: extension };
+}
+
+// holder (optional) receives the full result so the cell note can show the 10/20/30% split.
+function computeLeapSheetRiskScore_(inputs, holder) {
+  if (!LEAP_RISK_USE_PREMIUM_LOSS_MODEL) return computeLeapSheetRiskScoreVelocity_(inputs);
+  const r = computeLeapPremiumLoss_(inputs);
+  if (holder) holder.leapRisk = r;
+  return r ? r.risk : null; // can't be computed -> blank (cleared at the call site), NOT a neutral 50
+}
+
+/* ----------------------------------------------------------------------------
+ * LEAP SCORE — "HOW GOOD IS THIS AS A YEAR-LONG STOCK REPLACEMENT?"
+ *
+ * Score (0-100) = the simulated chance that, a year from now (capped so at
+ * least 60 days of life remain), you could sell the contract for at least +50%
+ * over what you paid (LEAP_PROFIT_TARGET_PERCENT), after the bid/ask spread.
+ * Because it is measured per dollar of premium, it rewards exactly what you
+ * care about on Leap: stock-like exposure for less money (capital efficiency),
+ * minus the cost of a wide spread and of time value you overpay. It is
+ * independent of Risk — your rule is "Risk first (don't buy into a likely 10%
+ * dip), then pick the best Score".
+ *
+ * The stock's own setup (quality, analyst upside, delta, momentum — your Leap
+ * Filter) tilts the expected 12-month move by at most
+ * LEAP_SCORE_MODEL.tiltMaxSd standard deviations: a judgment call, NOT validated
+ * against your trades; set it to 0 for a purely mechanical Score. This is a
+ * year-end snapshot, not "touched +50% at any point", so it understates a bit.
+ * ------------------------------------------------------------------------- */
+const LEAP_SCORE_USE_UPSIDE_PROBABILITY = true; // false = previous Leap Score (Filter/Target/Risk blend, SCORE_WEIGHTS_BY_SHEET)
+const LEAP_SCORE_MODEL = { horizonDays: 365, minDaysLeft: 60, tiltMaxSd: 0.25 };
+
+// Color bands for the new scales (green = good for Score, green = low for Risk).
+// Both sets of cut-offs are guesses fitted to a handful of sample rows (Score ran ~14-25,
+// Risk ~10-40 on the 20% line) — adjust them once you've seen a few days of real values.
+const LEAP_SCORE_BANDS = { green: 22, yellow: 16 };   // Score >= green good, >= yellow fair, else poor
+const LEAP_RISK_BANDS = { green: 20, yellow: 30 };    // Risk <= green low, <= yellow moderate, else high (consider waiting for the dip)
+
+function computeLeapUpsideScore_(inputs, filterScoreValue) {
+  const M = LEAP_SCORE_MODEL;
+  const c = leapPrepare_(inputs);
+  if (!c) return null;
+  const H = Math.min(M.horizonDays, Math.floor(c.dte - M.minDaysLeft));
+  if (!isPlausible_(H, 30, null)) return null;
+  const h = H / 365;
+  const sigmaH = c.sigma * (1 - (c.rank == null ? LEAP_RISK_MODEL.ivReversionDefault : LEAP_RISK_MODEL.ivReversionMax * c.rank));
+  const sd = c.sigma * Math.sqrt(h);
+  const f = isPlausible_(filterScoreValue, 0, 100) ? filterScoreValue : 50;
+  const tiltSd = clamp_((f - 50) / 50, -1, 1) * M.tiltMaxSd;
+  const mu = -0.5 * sd * sd + tiltSd * sd;
+  const T = (c.dte - H) / 365;
+  const need = (c.cost * (1 + LEAP_PROFIT_TARGET_PERCENT / 100)) / (c.exitFactor * c.scale); // option value needed to sell at +target
+  const sol = leapSolveStockForValue_(need, c.S0, c.K, T, sigmaH, c.optionType);
+  let pUp;
+  if (c.optionType === 'P') {
+    pUp = sol.outOfRange === 'low' ? 0 : (sol.outOfRange === 'high' ? 1 : normalCdf_((Math.log(sol.level / c.S0) - mu) / sd));
+  } else {
+    pUp = sol.outOfRange === 'low' ? 1 : (sol.outOfRange === 'high' ? 0 : 1 - normalCdf_((Math.log(sol.level / c.S0) - mu) / sd));
+  }
+  return {
+    score: Math.round(pUp * 1000) / 10, pUp: pUp, tiltSd: tiltSd, horizonDays: H,
+    requiredStock: sol.outOfRange ? null : sol.level,
+    requiredMovePct: sol.outOfRange ? null : (sol.level / c.S0 - 1) * 100,
+    spreadPct: c.halfSpread * 200
+  };
+}
+
+/* ----------------------------------------------------------------------------
+ * RANKING — RISK GATE FIRST, THEN SCORE (Quick, Risky and Leap tabs)
+ *
+ * Your rule: look at Risk first; if it is low enough, look at Score and pick.
+ * So each of these tabs is ordered like that:
+ *   1. rows with Risk <= that tab's gate, best Score first;
+ *   2. then rows over the gate, lowest Risk first (closest to passing);
+ *   3. then rows with no Risk (no contract, or not computable).
+ * Sorting Risk and Score as two plain columns would not do this: Risk is
+ * continuous, so rows almost never tie and Score would never get a say.
+ *
+ * The order comes from one helper column (GATE_SORT_KEY_HEADER, created at the
+ * far right and hidden on first use, refilled every run) so the sort stays a
+ * native sheet sort — your own PtC / PtN / Invested formulas keep moving with
+ * their rows. The top GATE_TOP_BORDER_COLORS.length rows that pass the gate get
+ * a border on their Score cell, vivid green for #1 fading to pale green for
+ * #5; if only two pass, only two are marked, and if none pass, none are.
+ *
+ * Gates are set to the top of each tab's yellow Risk band (anything red fails):
+ * Leap 30 (chance of a 20% premium drop in a month), Quick/Risky 25 (chance of
+ * ending stuck and down at the 60-day limit). They are starting points — adjust
+ * once you've seen real values. Set a tab's `enabled` to false to put it back
+ * to a plain Score sort with the brown top-5 border.
+ * ------------------------------------------------------------------------- */
+const LEAP_RISK_GATE = 30;
+const GATE_RANKING_BY_SHEET = {
+  'Quick': { enabled: true, gate: 25 },
+  'Risky': { enabled: true, gate: 25 },
+  'Leap':  { enabled: true, gate: LEAP_RISK_GATE }
+};
+const GATE_SORT_KEY_HEADER = 'SortKey';
+const GATE_TOP_BORDER_COLORS = ['#00a843', '#2fbd5f', '#5fce80', '#8fdea1', '#b9ecc3']; // best -> fifth
+
+function gateIsNum_(v) { return v !== '' && v != null && !isNaN(v); }
+
+// The tab's gate config if gate ranking applies to it right now (the matching
+// new Risk model must be switched on, since the gate is defined on its scale), else null.
+function gateConfigForSheet_(sheetName, map) {
+  const cfg = GATE_RANKING_BY_SHEET[sheetName];
+  if (!cfg || !cfg.enabled || !map.score || !map.riskScore) return null;
+  const modelOn = sheetName === 'Leap' ? LEAP_RISK_USE_PREMIUM_LOSS_MODEL : QR_RISK_USE_PREMIUM_LOSS_MODEL;
+  return modelOn ? cfg : null;
+}
+
+// Higher key = higher on the sheet (sheet is sorted by this column, descending).
+function gateSortKey_(risk, score, gate) {
+  if (!gateIsNum_(risk)) return -1;                       // no Risk -> bottom
+  const r = Number(risk);
+  if (r <= gate) return 1000 + (gateIsNum_(score) ? Number(score) : -1); // passes: by Score
+  return 500 - r;                                         // over the gate: lowest Risk first
+}
+
+// Fills the helper column and sorts the whole data range by it. Returns true if it sorted.
+function gateSort_(sheet, map, lastRow, gate) {
+  if (!map.score || !map.riskScore) return false;
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 1) return false;
+
+  // Find (or create) the helper column.
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  let keyCol = headers.findIndex(function (h) { return normalizeHeader_(h) === normalizeHeader_(GATE_SORT_KEY_HEADER); }) + 1;
+  if (!keyCol) {
+    keyCol = sheet.getLastColumn() + 1;
+    if (keyCol > sheet.getMaxColumns()) sheet.insertColumnsAfter(sheet.getMaxColumns(), keyCol - sheet.getMaxColumns());
+    sheet.getRange(HEADER_ROW, keyCol).setValue(GATE_SORT_KEY_HEADER)
+      .setNote('Helper for the ordering (Risk gate, then Score). Script-managed; safe to leave hidden.');
+    try { sheet.hideColumns(keyCol); } catch (e) { /* hiding is cosmetic */ }
+  }
+
+  const scores = sheet.getRange(DATA_START_ROW, map.score, numRows, 1).getValues();
+  const risks = sheet.getRange(DATA_START_ROW, map.riskScore, numRows, 1).getValues();
+  const keys = [];
+  for (let i = 0; i < numRows; i++) keys.push([gateSortKey_(risks[i][0], scores[i][0], gate)]);
+  sheet.getRange(DATA_START_ROW, keyCol, numRows, 1).setValues(keys);
+
+  sheet.getRange(DATA_START_ROW, 1, numRows, sheet.getLastColumn()).sort({ column: keyCol, ascending: false });
+  return true;
+}
+
+// After the sort: marks the top rows that pass the gate with a graded-green
+// border on the Score cell. Borders don't travel with a sort, so this reads the
+// FINAL positions. Returns [{ row, score }] like applyTopFilterHighlight_.
+function applyGateHighlight_(sheet, map, lastRow, gate) {
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (!map.score || !map.riskScore || numRows <= 0) return [];
+  const scores = sheet.getRange(DATA_START_ROW, map.score, numRows, 1).getValues();
+  const risks = sheet.getRange(DATA_START_ROW, map.riskScore, numRows, 1).getValues();
+
+  const passing = [];
+  for (let i = 0; i < numRows; i++) {
+    if (gateIsNum_(risks[i][0]) && gateIsNum_(scores[i][0]) && Number(risks[i][0]) <= gate) {
+      passing.push({ row: DATA_START_ROW + i, score: Number(scores[i][0]), risk: Number(risks[i][0]) });
+    }
+  }
+  const ranked = passing.slice(0, GATE_TOP_BORDER_COLORS.length);
+  ranked.forEach(function (entry, i) {
+    sheet.getRange(entry.row, map.score).setBorder(
+      true, true, true, true, false, false,
+      GATE_TOP_BORDER_COLORS[i], SpreadsheetApp.BorderStyle.SOLID_THICK
+    );
+    if (map.ticker) {
+      sheet.getRange(entry.row, map.ticker).setFontWeight('bold')
+        .setNote('#' + (i + 1) + ' of ' + passing.length + ' ' + sheet.getName() + ' rows with Risk <= ' + gate +
+          ', ranked by Score this run (Score ' + entry.score + ', Risk ' + entry.risk + ').');
+    }
+  });
+  return ranked;
+}
+
+// Previous Leap Risk (velocity / catalyst / execution) — kept so
+// LEAP_RISK_USE_PREMIUM_LOSS_MODEL = false restores it exactly.
+function computeLeapSheetRiskScoreVelocity_(inputs) {
   const w = LEAP_SHEET_WEIGHTS.risk;
   const omega = computeOmega_(inputs.delta, inputs.stockPrice, inputs.optionPrice);
   const daysToLoss = (omega != null) ? estimatedDaysForPremiumMove_(inputs.atrPercent, omega, LEAP_LOSS_TOLERANCE_PERCENT) : null;
@@ -5201,19 +5870,26 @@ function computeLeapSheetTargetScore_(inputs, config) {
  * used as the new ranking/sort/top-5-border key on those three sheets.
  * ========================================================================== */
 
+// Quick and Risky: Score no longer includes Risk at all (risk: 0). Risk is a
+// separate premium-loss readout (see QUICK & RISKY RISK above), kept out of
+// the ranking on purpose. The old Filter:Target proportions are preserved
+// (Quick 50:30 -> 62.5:37.5, Risky 45:25 -> 64.3:35.7) so the two weights
+// still sum to 1. Leap is unchanged. To put Risk back, set risk > 0 and
+// reduce filter/targetProb so the three sum to 1.
 const SCORE_WEIGHTS_BY_SHEET = {
-  'Quick': { filter: 0.50, targetProb: 0.30, risk: 0.20 },
-  'Risky': { filter: 0.45, targetProb: 0.25, risk: 0.30 },
+  'Quick': { filter: 0.50 / 0.80, targetProb: 0.30 / 0.80, risk: 0 },
+  'Risky': { filter: 0.45 / 0.70, targetProb: 0.25 / 0.70, risk: 0 },
   'Leap':  { filter: 0.50, targetProb: 0.20, risk: 0.30 }
 };
 
 function computeCombinedScore_(sheetName, filterScoreValue, targetProbabilityValue, riskScoreValue) {
   const w = SCORE_WEIGHTS_BY_SHEET[sheetName];
   if (!w) return null;
-  if (!isPlausible_(filterScoreValue, 0, 100) || !isPlausible_(targetProbabilityValue, 0, 100) || !isPlausible_(riskScoreValue, 0, 100)) {
-    return null;
-  }
-  const value = w.filter * filterScoreValue + w.targetProb * targetProbabilityValue + w.risk * (100 - riskScoreValue);
+  if (!isPlausible_(filterScoreValue, 0, 100) || !isPlausible_(targetProbabilityValue, 0, 100)) return null;
+  // Risk is only required (and only used) on sheets where it carries weight.
+  if (w.risk > 0 && !isPlausible_(riskScoreValue, 0, 100)) return null;
+  const value = w.filter * filterScoreValue + w.targetProb * targetProbabilityValue +
+    (w.risk > 0 ? w.risk * (100 - riskScoreValue) : 0);
   return Math.round(value * 10) / 10;
 }
 
@@ -5284,7 +5960,7 @@ function applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel) {
   ranked.forEach(function (entry, i) {
     const rank = i + 1;
 
-    TOP_FILTER_HIGHLIGHT_COLS.forEach(function (key) {
+    (rankKey === 'score' ? TOP_SCORE_HIGHLIGHT_COLS : TOP_FILTER_HIGHLIGHT_COLS).forEach(function (key) {
       const col = map[key];
       if (!col) return;
       sheet.getRange(entry.row, col).setBorder(
@@ -5296,7 +5972,8 @@ function applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel) {
     if (map.ticker) {
       sheet.getRange(entry.row, map.ticker)
         .setFontWeight('bold')
-        .setNote('#' + rank + ' of ' + ranked.length + ' by ' + rankLabel + ' this run — cross-check the bordered Risk / Sector Momentum / %age / ATR% / IV Rank / Catalyst cells on this row.');
+        .setNote('#' + rank + ' of ' + ranked.length + ' by ' + rankLabel + ' this run' +
+          (rankKey === 'score' ? '.' : ' — cross-check the bordered Risk / Sector Momentum / %age / ATR% / IV Rank / Catalyst cells on this row.'));
     }
   });
 
@@ -6369,26 +7046,36 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // catalyst timing (or, for Risky, Drawdown/liquidity fields instead)
     // — all already computed above, so this is free. All three revised-
     // formula sheets (Quick/Risky/Leap) now compute this the same way.
+    let riskUnavailable = false; // Quick/Risky: model couldn't run this pass -> clear the old Risk value
+    const qrHolder = {};         // Quick/Risky: this row's prepared simulation, shared by Risk, Score and the cell notes
     if (scoreRelevance.needsRiskScore) {
       const riskScoreValue = revisedFormulaSheetName === 'Quick'
         ? computeQuickSheetRiskScore_({
             atrPercent: merged.atrPercent, delta: merged.greekDelta,
             stockPrice: merged.stockPrice, optionPrice: merged.optionPrice, ivRank: merged.ivRank,
             daysToCatalyst: daysToCatalystNumeric,
-            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent
-          })
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent,
+            optionType: parsedStrike.type, strike: parsedStrike.strike, daysToExpiry: daysToExpiry,
+            ivPercent: merged.iv, bidAskSpreadPct: merged.bidAskSpreadPct
+          }, qrHolder)
         : revisedFormulaSheetName === 'Risky'
         ? computeRiskySheetRiskScore_({
             maxDrawdownPercent: merged.maxDrawdownPercent, bidAskSpreadPct: merged.bidAskSpreadPct,
             extrinsicValue: merged.extrinsicValue, optionPrice: merged.optionPrice,
-            oi: merged.oi, volume: merged.volume
-          })
+            oi: merged.oi, volume: merged.volume,
+            stockPrice: merged.stockPrice, optionType: parsedStrike.type, strike: parsedStrike.strike,
+            daysToExpiry: daysToExpiry, ivPercent: merged.iv, ivRank: merged.ivRank,
+            daysToCatalyst: daysToCatalystNumeric, atrPercent: merged.atrPercent
+          }, qrHolder)
         : revisedFormulaSheetName === 'Leap'
         ? computeLeapSheetRiskScore_({
             atrPercent: merged.atrPercent, delta: merged.greekDelta,
             stockPrice: merged.stockPrice, optionPrice: merged.optionPrice,
-            bidAskSpreadPct: merged.bidAskSpreadPct, daysToCatalyst: daysToCatalystNumeric
-          })
+            bidAskSpreadPct: merged.bidAskSpreadPct, daysToCatalyst: daysToCatalystNumeric,
+            optionType: parsedStrike.type, strike: parsedStrike.strike, daysToExpiry: daysToExpiry,
+            ivPercent: merged.iv, ivRank: merged.ivRank,
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent
+          }, qrHolder)
         : hasObjectiveConfig
         ? computeRiskScoreForObjective_({
             atrPercent: merged.atrPercent,
@@ -6413,6 +7100,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         merged.riskScore = riskScoreValue;
         sourceByField.riskScore = revisedFormulaSheetName ? ('Computed (' + sheet.getName() + ' revised formula)')
           : hasObjectiveConfig ? ('Computed (' + sheet.getName() + ' objective)') : 'Computed';
+      } else if (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky' ||
+                 (revisedFormulaSheetName === 'Leap' && LEAP_RISK_USE_PREMIUM_LOSS_MODEL)) {
+        riskUnavailable = true;
       }
     }
 
@@ -6570,6 +7260,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
     });
 
+    // A null Risk is normally skipped (the cell keeps its old value). For
+    // Quick/Risky that would leave a STALE number sitting next to a row the
+    // model couldn't evaluate, so clear it instead.
+    if (riskUnavailable && map.riskScore) {
+      const oldRisk = rowOut[map.riskScore - 1];
+      if (oldRisk !== '' && oldRisk != null) {
+        rowOut[map.riskScore - 1] = '';
+        bgOut[map.riskScore - 1] = null;
+        rowChanges.push('Risk ' + formatForNote_(oldRisk) + '→blank (no usable IV/price/strike/expiry this run)');
+        changedCells++;
+      }
+    }
+
     // TARGET — for any sheet in TRADE_OBJECTIVE_SHEETS. Active positions
     // (non-blank Entry Price) get a real target based on what you paid,
     // highlighted YELLOW so it stands out as a real position; candidate
@@ -6649,9 +7352,35 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // a header cell literally named "Score" on this sheet (see HEADER_MAP).
     if (map.score) {
       const scoreCol = map.score - 1;
-      const scoreValue = revisedFormulaSheetName
-        ? computeCombinedScore_(revisedFormulaSheetName, merged.filterScore, targetScoreValue, merged.riskScore)
-        : null;
+      // Quick/Risky: Score = simulated chance of banking +3% within 5 days
+      // (see QUICK & RISKY SCORE). Reuses the simulation Risk already
+      // prepared for this row; prepares one itself if Risk didn't run.
+      const useWinScore = QR_SCORE_USE_WIN_PROBABILITY && (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky');
+      let winScore = null;
+      if (useWinScore) {
+        if (qrHolder.ctx === undefined) {
+          qrHolder.ctx = prepareQuickRiskySim_(revisedFormulaSheetName, {
+            stockPrice: merged.stockPrice, strike: parsedStrike.strike, optionPrice: merged.optionPrice,
+            daysToExpiry: daysToExpiry, optionType: parsedStrike.type, ivPercent: merged.iv, atrPercent: merged.atrPercent,
+            bidAskSpreadPct: merged.bidAskSpreadPct, ivRank: merged.ivRank, daysToCatalyst: daysToCatalystNumeric
+          });
+        }
+        winScore = computeQuickRiskyScore_(qrHolder.ctx, merged.filterScore);
+      }
+      // Leap: Score = chance of +50% a year out (see LEAP SCORE).
+      const useLeapScore = LEAP_SCORE_USE_UPSIDE_PROBABILITY && revisedFormulaSheetName === 'Leap';
+      const leapScore = useLeapScore ? computeLeapUpsideScore_({
+        stockPrice: merged.stockPrice, strike: parsedStrike.strike, optionPrice: merged.optionPrice,
+        daysToExpiry: daysToExpiry, optionType: parsedStrike.type, ivPercent: merged.iv, atrPercent: merged.atrPercent,
+        bidAskSpreadPct: merged.bidAskSpreadPct, ivRank: merged.ivRank
+      }, merged.filterScore) : null;
+      const scoreValue = useLeapScore
+        ? (leapScore ? leapScore.score : null)
+        : (useWinScore
+            ? (winScore ? winScore.score : null)
+            : (revisedFormulaSheetName
+                ? computeCombinedScore_(revisedFormulaSheetName, merged.filterScore, targetScoreValue, merged.riskScore)
+                : null));
 
       if (scoreValue != null) {
         const oldScore = rowOut[scoreCol];
@@ -6661,18 +7390,41 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           rowChanges.push('Score ' + formatForNote_(oldScore) + '→' + formatForNote_(scoreValue));
           changedCells++;
         }
-        bgOut[scoreCol] = higherIsBetterBandColor_(scoreValue);
-        const w = SCORE_WEIGHTS_BY_SHEET[revisedFormulaSheetName];
-        noteOut[scoreCol] =
-          Math.round(w.filter * 100) + '% Filter + ' + Math.round(w.targetProb * 100) +
-          '% Target Probability + ' + Math.round(w.risk * 100) + '% (100 - Risk). Recomputed each run.';
+        if (useLeapScore) {
+          bgOut[scoreCol] = scoreValue >= LEAP_SCORE_BANDS.green ? COLOR_RISK_LOW : (scoreValue >= LEAP_SCORE_BANDS.yellow ? COLOR_RISK_MED : COLOR_RISK_HIGH);
+          noteOut[scoreCol] =
+            'Chance this contract can be sold for +' + LEAP_PROFIT_TARGET_PERCENT + '% over what you pay (after the ' +
+            Math.round(leapScore.spreadPct * 10) / 10 + '% bid/ask spread) about ' + leapScore.horizonDays + ' days from now' +
+            (leapScore.requiredStock != null ? ' — needs the stock near $' + round2_(leapScore.requiredStock) +
+              ' (' + (leapScore.requiredMovePct >= 0 ? '+' : '') + Math.round(leapScore.requiredMovePct * 10) / 10 + '%) by then' : '') +
+            '. Stock-setup tilt from Filter: ' + (leapScore.tiltSd >= 0 ? '+' : '') + Math.round(leapScore.tiltSd * 100) / 100 +
+            ' sd (max ±' + LEAP_SCORE_MODEL.tiltMaxSd + '). Independent of Risk: read Risk first, then Score. Rows with Risk <= ' + GATE_RANKING_BY_SHEET.Leap.gate +
+            ' are listed first, best Score on top; the green border marks the best of those. Recomputed each run.';
+        } else if (useWinScore) {
+          bgOut[scoreCol] = scoreValue >= QR_SCORE_BANDS.green ? COLOR_RISK_LOW : (scoreValue >= QR_SCORE_BANDS.yellow ? COLOR_RISK_MED : COLOR_RISK_HIGH);
+          const cfgQ = QR_RISK_MODEL[revisedFormulaSheetName];
+          noteOut[scoreCol] =
+            'Chance this contract can be sold for +' + cfgQ.winPercent + '% over what you pay (after the bid/ask spread, ' +
+            Math.round(qrHolder.ctx.halfSpread * 2000) / 10 + '% here) within ' + cfgQ.winDays + ' days. Simulated from the ' +
+            "contract's leverage, spread and time decay, plus a stock-setup tilt of " + (winScore.tiltSd >= 0 ? '+' : '') +
+            Math.round(winScore.tiltSd * 100) / 100 + ' sd from Filter (max ±' + QR_SCORE_TILT_MAX_SD + '). Volatility: ' +
+            qrHolder.ctx.volSource + '. Not a price forecast. Read Risk first: rows with Risk <= ' + GATE_RANKING_BY_SHEET[revisedFormulaSheetName].gate +
+            ' are listed first, best Score on top; the green border marks the best of those. Recomputed each run.';
+        } else {
+          bgOut[scoreCol] = higherIsBetterBandColor_(scoreValue);
+          const w = SCORE_WEIGHTS_BY_SHEET[revisedFormulaSheetName];
+          noteOut[scoreCol] =
+            Math.round(w.filter * 1000) / 10 + '% Filter + ' + Math.round(w.targetProb * 1000) / 10 + '% Target Probability' +
+            (w.risk > 0 ? ' + ' + Math.round(w.risk * 100) + '% (100 - Risk)' : ' (Risk is not part of Score)') +
+            '. Recomputed each run.';
+        }
       } else {
         const existingScore = rowOut[scoreCol];
         if (existingScore !== '' && existingScore != null) {
           rowOut[scoreCol] = '';
           noteOut[scoreCol] = '';
           bgOut[scoreCol] = null;
-          rowChanges.push('Score cleared (missing Filter/Target Probability/Risk this run, or not a Quick/Risky/Leap sheet)');
+          rowChanges.push('Score cleared (missing inputs this run — price/strike/expiry/volatility, or Filter/Target on other sheets — or not a Quick/Risky/Leap sheet)');
           changedCells++;
         }
       }
@@ -6707,8 +7459,33 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // RISK CELL BACKGROUND — low/moderate/high band, same idea as the
     // Days to Catalyst proximity flag below.
     if (map.riskScore && merged.riskScore != null) {
-      const riskColor = merged.riskScore <= 33 ? COLOR_RISK_LOW : (merged.riskScore <= 66 ? COLOR_RISK_MED : COLOR_RISK_HIGH);
+      const qrRiskBands = (QR_RISK_USE_PREMIUM_LOSS_MODEL && (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky'))
+        ? QR_RISK_BANDS
+        : ((LEAP_RISK_USE_PREMIUM_LOSS_MODEL && revisedFormulaSheetName === 'Leap') ? LEAP_RISK_BANDS : { green: 33, yellow: 66 });
+      const riskColor = merged.riskScore <= qrRiskBands.green ? COLOR_RISK_LOW : (merged.riskScore <= qrRiskBands.yellow ? COLOR_RISK_MED : COLOR_RISK_HIGH);
       bgOut[map.riskScore - 1] = riskColor;
+      if (LEAP_RISK_USE_PREMIUM_LOSS_MODEL && revisedFormulaSheetName === 'Leap' && qrHolder.leapRisk) {
+        const lr = qrHolder.leapRisk, lp = lr.tierProbabilities, LM = LEAP_RISK_MODEL;
+        const riskTier = LM.tierWeights.indexOf(Math.max.apply(null, LM.tierWeights));
+        const otherTiers = LM.lossTiers.map(function (t, i) { return i === riskTier ? null : ('>=' + Math.round(t * 100) + '%: ' + Math.round(lp[i] * 100) + '%'); })
+          .filter(function (x) { return x; }).join(', ');
+        noteOut[map.riskScore - 1] =
+          'Chance the premium (what you could sell it for, after the spread) is down at least ' + Math.round(LM.lossTiers[riskTier] * 100) +
+          '% in ' + LM.horizonDays + ' days. Risk = that figure. Other lines — ' + otherTiers + '.' +
+          (lr.eventWithin ? ' A catalyst falls inside this window (gap + IV crush included).' : '') +
+          (lr.extension > 0.05 ? ' Stock looks extended after a run-up (pullback tilt applied).' : '') +
+          ' High = consider waiting for the dip. Recomputed each run.';
+      }
+      // Quick/Risky: show the outcome split behind the number.
+      if (QR_RISK_USE_PREMIUM_LOSS_MODEL && qrHolder.risk) {
+        const rr = qrHolder.risk, tp = rr.tierProbabilities;
+        noteOut[map.riskScore - 1] =
+          'Chance of ending stuck AND down at your ' + QR_RISK_MODEL[revisedFormulaSheetName].recoverDays + '-day limit (avg of >=10% / >=25% / >=50% losses: ' +
+          Math.round(tp[0] * 100) + '% / ' + Math.round(tp[1] * 100) + '% / ' + Math.round(tp[2] * 100) + '%). Outcomes: +' +
+          QR_RISK_MODEL[revisedFormulaSheetName].winPercent + '% win within ' + QR_RISK_MODEL[revisedFormulaSheetName].winDays + 'd ' +
+          Math.round(rr.pWin * 100) + '% | back to breakeven later ' + Math.round(rr.pRecover * 100) + '% | stuck ' +
+          Math.round(rr.pStuck * 100) + '%. Volatility: ' + rr.volSource + '. Recomputed each run.';
+      }
     }
 
     // FILTER CELL BACKGROUND — high score (good setup) = green, same
@@ -6823,7 +7600,13 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // borders behave as an edge property, not a per-cell one), so
   // highlighting has to target the FINAL sorted positions or it ends up
   // on the wrong rows.
-  sortRowsByQuickScoreDescending_(sheet, map, lastRow, sortKey);
+  // Quick / Risky / Leap: Risk gate first, then Score (see RANKING above).
+  // Any other sheet (or a tab with its gate switched off) keeps the plain Score sort.
+  const gateCfg = gateConfigForSheet_(sheet.getName(), map);
+  const useGate = !!gateCfg;
+  if (!(useGate && gateSort_(sheet, map, lastRow, gateCfg.gate))) {
+    sortRowsByQuickScoreDescending_(sheet, map, lastRow, sortKey);
+  }
 
   // Now that rows are in final position, flag the top 5 by the same
   // ranking key (see COLOR_TOP_FILTER_BORDER). No special highlight for
@@ -6832,9 +7615,13 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // other. Reads directly from the sheet's current state rather than
   // positions captured mid-loop, for the same reason.
   const rankKey = (revisedFormulaSheetForHighlight && map.score) ? 'score' : 'filterScore';
-  const rankLabel = rankKey === 'score' ? 'Score' : 'Filter Score';
-  const topFilterRanked = applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel);
-  const bestCombination = revisedFormulaSheetForHighlight ? findBestScoreRow_(sheet, map, lastRow) : null;
+  const rankLabel = useGate ? ('Score among Risk <= ' + gateCfg.gate) : (rankKey === 'score' ? 'Score' : 'Filter Score');
+  const topFilterRanked = useGate
+    ? applyGateHighlight_(sheet, map, lastRow, gateCfg.gate)
+    : applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel);
+  const bestCombination = useGate
+    ? (topFilterRanked.length ? { row: topFilterRanked[0].row, combinedScore: topFilterRanked[0].score } : null)
+    : (revisedFormulaSheetForHighlight ? findBestScoreRow_(sheet, map, lastRow) : null);
 
   // Persist all slow-cache updates from this run in ONE batched write.
   const slowWritesFlushed = flushSlowCacheWrites_(pendingSlowWrites);
