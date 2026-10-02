@@ -2,7 +2,8 @@
  * ============================================================================
  * DAILY PIPELINE (DailyPipeline.gs)
  * ----------------------------------------------------------------------------
- * One-click chain: Research -> Promote -> Auto-fill contracts, run in
+ * One-click chain: Research -> Promote (-> Auto-fill contracts, currently
+ * DISABLED via DAILY_PIPELINE_RUN_AUTOFILL; Best OI is run manually), run in
  * stages via triggers (same pattern MobileRemote.gs already uses for its
  * own background actions) so the whole thing never hits Apps Script's
  * ~6-minute execution ceiling. Tap "Run Full Daily Pipeline" once, close
@@ -45,8 +46,8 @@
  *                  already uses for its own highlight. Never overwrites a
  *                  value you've already entered — only fills what's
  *                  actually empty. Time-budget aware and resumable, same
- *                  as Research. This is the LAST stage — the pipeline
- *                  reaches DONE from here.
+ *                  as Research. SKIPPED while DAILY_PIPELINE_RUN_AUTOFILL is
+ *                  false — the pipeline reaches DONE at the end of PROMOTE.
  *
  * IMPORTANT — WHERE PER-TAB SCAN SETTINGS COME FROM:
  * BestOpenInterest.gs's interactive "Run Deep Dive Scan" menu action reads
@@ -78,6 +79,13 @@ const DAILY_PIPELINE_TRIGGER_FN = 'runDailyPipelineStage_';
 const DAILY_PIPELINE_STAGE_TIME_BUDGET_MS = 4 * 60 * 1000;
 const DAILY_PIPELINE_AUTOFILL_TIME_BUDGET_MS = 4 * 60 * 1000;
 const DAILY_PIPELINE_AUTOFILL_SLEEP_MS = 400;
+
+// When false (current setting), the pipeline ENDS after PROMOTE: Research ->
+// Promote -> DONE. Strike/Expiry auto-fill (Best Open Interest) is skipped
+// and must be run manually. Set to true to restore the original
+// Research -> Promote -> Auto-fill chain; the auto-fill stage code below is
+// unchanged and still fully wired up.
+const DAILY_PIPELINE_RUN_AUTOFILL = false;
 
 
 /**
@@ -258,6 +266,12 @@ function runDailyPipelinePromoteStage_(state) {
       ' removed (no position, dropped from top 20), ' + result.keptWithPosition + ' kept (open position), ' +
       result.keptColored + ' kept (manually colored).');
 
+    // Auto-fill is switched off (DAILY_PIPELINE_RUN_AUTOFILL = false), so
+    // skip building its queue entirely — findTickersNeedingContract_ does
+    // per-cell reads across every row of every tab, which is pure wasted
+    // time when nothing will consume the result.
+    if (!DAILY_PIPELINE_RUN_AUTOFILL) return;
+
     // The auto-fill queue covers EVERY row on this tab missing Strike or
     // Expiry — not just rows Promote just added. This naturally includes
     // newly-added rows (always blank) alongside any older row left
@@ -272,6 +286,14 @@ function runDailyPipelinePromoteStage_(state) {
       });
     }
   });
+
+  if (!DAILY_PIPELINE_RUN_AUTOFILL) {
+    state.autofillQueue = [];
+    state.autofillIndex = 0;
+    state.stage = 'DONE';
+    state.log.push('Pipeline stopped after Promote (auto-fill disabled). Run Best Open Interest manually to fill Strike/Expiry.');
+    return;
+  }
 
   state.autofillQueue = queue;
   state.autofillIndex = 0;
