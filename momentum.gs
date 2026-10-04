@@ -110,7 +110,14 @@ const HEADER_MAP = {
   // applyStandoutColumnHighlights_ further down.
   ptN: ['PtN', 'Pt N'],
   // Optional: nearest-the-money put for the upcoming Friday, refreshed every run via the Cloud Function.
-  atmPut: ['Put', 'ATM Put']
+  atmPut: ['Put', 'ATM Put'],
+  // Optional intraday readouts (Cloud Function): Aroon length 25 on 5-minute bars, RSI length 14 (Wilder) on 1-minute closes.
+  aroonUp: ['AUP', 'Aroon Up', 'AroonUp'],
+  aroonDown: ['ADN', 'Aroon Down', 'AroonDown'],
+  rsi1m: ['R30', 'RSI 1m', 'RSI 1M', 'RSI1m', 'RSI'],
+  // Price vs today's session VWAP (percent) and relative volume (today so far vs same time on prior days).
+  vwapPct: ['VW', 'VWAP %', 'VWAP'],
+  relVol: ['RV', 'RW', 'RVOL', 'Rel Vol']
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -144,6 +151,39 @@ const QUOTE_STALE_BLANKS_SCORE = false;   // true = also clear Score/Risk on a r
 const STALE_STATUS_COLOR = '#f9cb9c';
 // LastRun cell fill when any of that row's data is stale/unrefreshed this run; every other row's LastRun stays white.
 const LASTRUN_STALE_COLOR = '#ff9900';
+// AUP / ADN / R30 (Aroon Up, Aroon Down, RSI 1m) have their OWN colors, separate from LastRun, and only while the market is open:
+//   ENTRY (candidate rows = no Entry price, and Risk passes the tab's gate):
+//     light green  = trend up (AUP high, ADN low) and R30 is low             -> get ready
+//     strong green = trend up, R30 dipped to the dip level within the last 5 minutes and is now rising -> enter
+//   EXIT (rows WITH an Entry price): red = option up at least the minimum profit and R30 high;
+//     strong red = same, and AUP has already dropped (momentum fading)
+//   orange = these three values are stale; white = nothing to flag.
+const INTRADAY_STALE_MIN = 5;                 // newest 1-minute bar older than this (market open) = stale
+const INTRADAY_STALE_COLOR = '#ff9900';
+const INTRADAY_ENTRY_LIGHT_COLOR = '#d9ead3';
+const INTRADAY_ENTRY_COLOR = '#93c47d';
+const INTRADAY_EXIT_COLOR = '#ea9999';
+const INTRADAY_EXIT_STRONG_COLOR = '#e06666';
+const INTRADAY_SIGNAL = {
+  trendAupMin: 70,        // trend filter: Aroon Up at least this...
+  trendAdnMax: 40,        // ...and Aroon Down at most this
+  lightRsiMax: 40,        // light green: R30 at or below this
+  dipRsi: 30,             // strong green: R30 was at or below this within the last 5 minutes...
+  recoverRsiMax: 45,      // ...is rising now, and has not already run above this
+  exitRsiMin: 65,         // red: R30 at or above this
+  exitMinProfitPct: 3,    // red only when the option (Price vs Entry) is up at least this % (your playbook minimum)
+  exitStrongAupBelow: 50, // strong red: Aroon Up has dropped below this
+  maxSpreadPct: 1.5,      // no green when the option's bid/ask spread is wider than this % of its price (eats the +3% target)
+  vwapMinPct: -0.5,       // strong green needs price at most this far below session VWAP (pulled back to VWAP, not collapsing)
+  rvolMin: 1.0,           // strong green needs relative volume at or above this (volume at least normal for this time of day)
+  noEntryFirstMin: 15,    // no green in the first N minutes after the open...
+  noEntryLastMin: 15,     // ...or the last N minutes before the close (wide spreads, unreliable quotes)
+  logCooldownMin: 30      // the same signal on the same contract is logged at most once per this many minutes
+};
+// Entry/exit colors and the signal log apply only to these tabs; Leap just shows the values.
+const INTRADAY_SIGNAL_SHEETS = ['Quick', 'Risky'];
+const SIGNAL_LOG_SHEET = 'SignalLog';
+const SIGNAL_LOG_HEADERS = ['Time', 'Tab', 'Ticker', 'Strike', 'Expiry', 'Signal', 'AUP', 'ADN', 'RSI 1m', 'RSI low 5m', 'VW %', 'RV', 'SPY', 'Stock', 'Option', 'Spread %', 'Source', 'Outcome (fill later)'];
 const STALE_ROW_SHEETS = ['Quick', 'Risky', 'Leap'];
 
 // NYSE full-day closures and 1:00 pm early closes (ET). Source: NYSE Group holiday
@@ -6413,15 +6453,53 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
   return results;
 }
 
-// "Put" column: closest-to-the-money put expiring the upcoming Friday (today if it is
-// Friday and the market is still open), premium = mid. One Cloud Function request for
-// all unique tickers; returns {} (every row shows n/a + stale flag) if it can't run.
-function prefetchAtmPutsViaCloudFunction_(sheet, map, lastRow) {
+// Appends new strong-entry / exit signals to the SignalLog tab (created on first use). The same signal on the same
+// contract is logged at most once per INTRADAY_SIGNAL.logCooldownMin minutes (state kept in script properties).
+// Never lets a logging problem break the run.
+function appendSignalLog_(items, runTimestamp) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    let state = {};
+    try { state = JSON.parse(props.getProperty('SIGNAL_LOG_STATE') || '{}'); } catch (e) { state = {}; }
+    const nowMs = runTimestamp.getTime();
+    const cool = INTRADAY_SIGNAL.logCooldownMin * 60000;
+    const fresh = items.filter(function (it) {
+      if (state[it.key] && nowMs - state[it.key] < cool) return false;
+      state[it.key] = nowMs;
+      return true;
+    });
+    if (!fresh.length) return;
+    Object.keys(state).forEach(function (k) { if (nowMs - state[k] > 3 * 86400000) delete state[k]; });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let log = ss.getSheetByName(SIGNAL_LOG_SHEET);
+    if (!log) {
+      log = ss.insertSheet(SIGNAL_LOG_SHEET);
+      log.getRange(1, 1, 1, SIGNAL_LOG_HEADERS.length).setValues([SIGNAL_LOG_HEADERS]).setFontWeight('bold');
+      log.setFrozenRows(1);
+    }
+    const startRow = Math.max(log.getLastRow(), 1) + 1;
+    log.getRange(startRow, 1, fresh.length, SIGNAL_LOG_HEADERS.length).setValues(fresh.map(function (it) { return it.row; }));
+    log.getRange(startRow, 1, fresh.length, 1).setNumberFormat('m/d/yyyy h:mm:ss');
+    props.setProperty('SIGNAL_LOG_STATE', JSON.stringify(state));
+  } catch (e) {
+    logToSheet_('Signal log failed (run continues): ' + e);
+  }
+}
+
+// Optional columns served by the Cloud Function: "Put" (closest-to-the-money put for the upcoming
+// Friday, premium = mid) and "Aroon Up"/"Aroon Down"/"RSI 1m". Only the requests the sheet has columns
+// for are sent, all in parallel (fetchAll), one request per feature covering every unique ticker.
+// Anything that fails returns {} for that feature; its rows show blank/n/a and a stale flag.
+function prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow) {
+  const out = { atmPut: {}, intraday: {} };
+  const wantPut = !!map.atmPut;
+  const wantIntraday = !!(map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol);
+  if (!wantPut && !wantIntraday) return out;
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
-  if (!cloudFunctionUrl || !sharedSecret) return {};
+  if (!cloudFunctionUrl || !sharedSecret) return out;
   const numRows = lastRow - DATA_START_ROW + 1;
-  if (numRows <= 0) return {};
+  if (numRows <= 0) return out;
   const tickerValues = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
   const tickers = [];
   const seen = {};
@@ -6432,35 +6510,44 @@ function prefetchAtmPutsViaCloudFunction_(sheet, map, lastRow) {
     seen[t] = true;
     tickers.push(t);
   }
-  if (!tickers.length) return {};
+  if (!tickers.length) return out;
+
+  const reqs = [], kinds = [];
+  function add_(kind, body) {
+    kinds.push(kind);
+    reqs.push({ url: cloudFunctionUrl, method: 'post', contentType: 'application/json',
+      payload: JSON.stringify(Object.assign({ apiKey: sharedSecret }, body)), muteHttpExceptions: true });
+  }
+  if (wantPut) add_('atmPut', { atmPut: { tickers: tickers } });
+  if (wantIntraday) add_('intraday', { intraday: { tickers: seen['SPY'] ? tickers : tickers.concat(['SPY']) } });   // SPY rides along for the market filter
 
   const startTime = Date.now();
-  let resp;
+  let resps;
   try {
-    resp = UrlFetchApp.fetch(cloudFunctionUrl, {
-      method: 'post', contentType: 'application/json',
-      payload: JSON.stringify({ apiKey: sharedSecret, atmPut: { tickers: tickers } }),
-      muteHttpExceptions: true
-    });
+    resps = UrlFetchApp.fetchAll(reqs);
   } catch (e) {
-    logToSheet_('Cloud Function ATM Put prefetch FAILED (network error): ' + e);
-    return {};
+    logToSheet_('Cloud Function Put/Aroon/RSI prefetch FAILED (network error): ' + e);
+    return out;
   }
-  if (resp.getResponseCode() !== 200) {
-    logToSheet_('Cloud Function ATM Put prefetch FAILED (HTTP ' + resp.getResponseCode() + ') \u2014 is the Cloud Function redeployed? ' + resp.getContentText().substring(0, 200));
-    return {};
-  }
-  let json;
-  try { json = JSON.parse(resp.getContentText()); } catch (e) {
-    logToSheet_('Cloud Function ATM Put prefetch FAILED (unparseable response): ' + e);
-    return {};
-  }
-  const results = json.atmPutResults || {};
-  const errCount = Object.keys(json.atmPutErrors || {}).length;
-  logToSheet_('Cloud Function ATM Put prefetch: ' + tickers.length + ' ticker(s) requested in ' + (Date.now() - startTime) + 'ms \u2014 ' +
-    Object.keys(results).length + ' found' + (errCount ? (', ' + errCount + ' failed') : '') + '.' +
-    ((json.atmPutDiagnostics && json.atmPutDiagnostics.atmPut) ? (' Sample failure: ' + json.atmPutDiagnostics.atmPut) : ''));
-  return results;
+  resps.forEach(function (resp, i) {
+    const kind = kinds[i];
+    if (resp.getResponseCode() !== 200) {
+      logToSheet_('Cloud Function ' + kind + ' prefetch FAILED (HTTP ' + resp.getResponseCode() + ') \u2014 is the Cloud Function redeployed? ' + resp.getContentText().substring(0, 200));
+      return;
+    }
+    let json;
+    try { json = JSON.parse(resp.getContentText()); } catch (e) {
+      logToSheet_('Cloud Function ' + kind + ' prefetch FAILED (unparseable response): ' + e);
+      return;
+    }
+    const results = json[kind + 'Results'] || {};
+    const diag = json[kind + 'Diagnostics'] || {};
+    const errCount = Object.keys(json[kind + 'Errors'] || {}).length;
+    out[kind] = results;
+    logToSheet_('Cloud Function ' + kind + ' prefetch: ' + tickers.length + ' ticker(s), ' + (Date.now() - startTime) + 'ms total \u2014 ' +
+      Object.keys(results).length + ' ok' + (errCount ? (', ' + errCount + ' failed') : '') + '.' + (diag[kind] ? (' Sample failure: ' + diag[kind]) : '') + (diag.intradayTasty ? (' Tasty candles unavailable (Yahoo used): ' + diag.intradayTasty) : ''));
+  });
+  return out;
 }
 
 // "$270P 10/9 @ $3.45" (a weekday is added when the expiry is not a Friday, e.g. "10/8 Thu").
@@ -6676,7 +6763,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // unreachable, or misses a specific ticker, and the per-row block
   // falls back to the original individual fetch exactly as before.
   const stockRangeMap = prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow);
-  const atmPutMap = map.atmPut ? prefetchAtmPutsViaCloudFunction_(sheet, map, lastRow) : {};
+  const extraCols = prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow);
+  const atmPutMap = extraCols.atmPut;
+  const intradayMap = extraCols.intraday;
 
   // Personal track record — Quick only, by explicit request. Pure local
   // sheet read (no network call), so computed once here regardless of
@@ -6749,6 +6838,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const clearsStaleRows = STALE_ROW_SHEETS.indexOf(sheet.getName()) !== -1 && !!map.score && !!map.riskScore;
   // Rows whose data is stale this run -> reasons (drives the LastRun cell color/note at the end).
   const staleReasons = {};
+  const ivRowState = {};   // rowIdx -> intraday result (or null) for rows where the intraday values were written
+  const ivRowMeta = {};    // rowIdx -> { spreadPct, stockPrice } captured once the row's quote data is merged
   function markStale_(rowIdx, reason) {
     (staleReasons[rowIdx] = staleReasons[rowIdx] || []).push(reason);
   }
@@ -6852,6 +6943,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         noteOut[map.atmPut - 1] = '';
         markStale_(rowIdx, 'Put not refreshed');
       }
+    }
+
+    // AUP / ADN / R30 / VW / RV values (same for every row of a ticker). Colors and notes are applied after the loop
+    // (they need this row's final Risk / Price / Entry / spread).
+    if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol) {
+      const iv = intradayMap[ticker] || null;
+      ivRowState[rowIdx] = iv;
+      const put_ = function (col, val, fmt) { if (col) { rowOut[col - 1] = (iv && val != null) ? val : ''; if (iv && val != null) fmtOut[col - 1] = fmt; } };
+      put_(map.aroonUp, iv && iv.aroonUp, '0');
+      put_(map.aroonDown, iv && iv.aroonDown, '0');
+      put_(map.rsi1m, iv && iv.rsi1m, '0.0');
+      put_(map.vwapPct, iv && iv.vwapPct, '+0.00;-0.00;0.00');
+      put_(map.relVol, iv && iv.rvol, '0.00');
     }
 
     const tastyFromPrefetch = !!tastyQuoteMap[occSymbol];
@@ -7749,6 +7853,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning, quoteAgeWarning].filter(function (w) { return w != null; });
     const statusText = warnings.length ? (baseStatusText + ' | ⚠️ ' + warnings.join(' ⚠️ ')) : baseStatusText;
 
+    ivRowMeta[rowIdx] = { spreadPct: merged.bidAskSpreadPct, stockPrice: merged.stockPrice };
     writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'), true);
 
     // This delay exists to protect TastyTrade/Yahoo from rapid-fire
@@ -7773,6 +7878,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (!allValues[i] || !allValues[i][map.ticker - 1]) continue;
       clearDecisionCells_(i);
       markStale_(i, 'Not reached this run (time limit)');
+      [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol].forEach(function (c) { if (c) allBackgrounds[i][c - 1] = INTRADAY_STALE_COLOR; });
       if (map.status) {
         allValues[i][map.status - 1] = clearsStaleRows
           ? 'STALE — not reached this run (time limit), Score/Risk cleared; run again to refresh'
@@ -7781,6 +7887,108 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
       unreachedCount++;
     }
+  }
+
+  // AUP / ADN / R30 / VW / RV colors, notes and the signal log (see the INTRADAY_SIGNAL block at the top of this file).
+  if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol) {
+    const ivCols = [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol].filter(function (c) { return !!c; });
+    const S = INTRADAY_SIGNAL;
+    const sess = marketSessionAt_(runTimestamp);
+    const sigSheet = INTRADAY_SIGNAL_SHEETS.indexOf(sheet.getName()) !== -1;
+    const gateCfg = GATE_RANKING_BY_SHEET[sheet.getName()];
+    const gateOn = !!(gateCfg && gateCfg.enabled && map.riskScore);
+    const closeMin = US_MARKET_EARLY_CLOSES[Utilities.formatDate(runTimestamp, 'America/New_York', 'yyyy-MM-dd')] ? 210 : 390;
+    const timeOk = sess.open && sess.minutesSinceOpen >= S.noEntryFirstMin && (closeMin - sess.minutesSinceOpen) >= S.noEntryLastMin;
+    const spy = intradayMap['SPY'] || null;
+    const spyHead = !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp);
+    const spyText = spy
+      ? ('SPY ' + (spy.vwapPct != null ? ((spy.vwapPct >= 0 ? '+' : '') + spy.vwapPct + '% vs VWAP') : 'VWAP n/a') + ', AUP ' + spy.aroonUp + ' / ADN ' + spy.aroonDown + (spyHead ? ' (headwind)' : ' (ok)'))
+      : 'SPY data missing (not blocking)';
+    const logRows = [];
+    const fmtNum_ = function (v, d) { return (v == null || isNaN(v)) ? '' : Math.round(v * Math.pow(10, d)) / Math.pow(10, d); };
+
+    Object.keys(ivRowState).forEach(function (key) {
+      const i = parseInt(key, 10);
+      const iv = ivRowState[key];
+      const meta = ivRowMeta[key] || {};
+      let color = '#ffffff', note = '', signal = null;
+      if (!iv) {
+        color = INTRADAY_STALE_COLOR;
+        note = 'Not refreshed this run (no data came back from TastyTrade or Yahoo).';
+      } else {
+        const barAgeMin = iv.lastBarEpoch != null ? Math.round((runTimestamp.getTime() - iv.lastBarEpoch * 1000) / 60000) : null;
+        const stale = sess.open && sess.minutesSinceOpen > INTRADAY_STALE_MIN && barAgeMin != null && barAgeMin > INTRADAY_STALE_MIN;
+        note = 'Aroon (5-min, 25), RSI (1-min, 14), VWAP and relative volume from ' + (iv.source || 'unknown') +
+          (barAgeMin != null ? ('; newest 1-minute bar ' + formatQuoteAge_(Math.max(0, barAgeMin)) + ' old') : '') + '. ' + spyText + '.';
+        if (stale) {
+          color = INTRADAY_STALE_COLOR;
+          note += ' STALE: older than ' + INTRADAY_STALE_MIN + 'm while the market is open.';
+        } else if (!sigSheet) {
+          note += ' Signals are off on this tab.';
+        } else if (sess.open && iv.aroonUp != null && iv.aroonDown != null && iv.rsi1m != null) {
+          const entryNum = map.entryPrice ? parseFloat(allValues[i][map.entryPrice - 1]) : NaN;
+          const held = isPlausible_(entryNum, 0.01, null);
+          if (!held) {
+            const riskVal = map.riskScore ? parseFloat(allValues[i][map.riskScore - 1]) : NaN;
+            const gateOk = !gateOn || (isFinite(riskVal) && riskVal <= gateCfg.gate);
+            const spreadOk = meta.spreadPct != null && isFinite(meta.spreadPct) && meta.spreadPct <= S.maxSpreadPct;
+            const trend = iv.aroonUp >= S.trendAupMin && iv.aroonDown <= S.trendAdnMax;
+            if (!timeOk) {
+              note += ' No entry signals in the first ' + S.noEntryFirstMin + ' / last ' + S.noEntryLastMin + ' minutes of the session.';
+            } else if (!gateOk) {
+              note += ' No entry: Risk is above the gate.';
+            } else if (!spreadOk) {
+              note += ' No entry: option spread ' + (meta.spreadPct != null && isFinite(meta.spreadPct) ? fmtNum_(meta.spreadPct, 2) + '%' : 'unknown') + ' is wider than ' + S.maxSpreadPct + '% (it eats the +3% target).';
+            } else if (trend) {
+              const rising = iv.rsiPrev != null && iv.rsi1m > iv.rsiPrev;
+              const dip = iv.rsiMin5 != null && iv.rsiMin5 <= S.dipRsi && rising && iv.rsi1m <= S.recoverRsiMax;
+              if (dip) {
+                const missing = [];
+                if (!(iv.vwapPct != null && iv.vwapPct >= S.vwapMinPct)) missing.push('price vs VWAP ' + (iv.vwapPct != null ? iv.vwapPct + '%' : 'n/a') + ' (needs ' + S.vwapMinPct + '% or better)');
+                if (!(iv.rvol != null && iv.rvol >= S.rvolMin)) missing.push('relative volume ' + (iv.rvol != null ? iv.rvol : 'n/a') + ' (needs ' + S.rvolMin + '+)');
+                if (spyHead) missing.push('SPY headwind');
+                if (!missing.length) {
+                  color = INTRADAY_ENTRY_COLOR; signal = 'ENTRY';
+                  note += ' ENTRY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI dipped to ' + iv.rsiMin5 + ' and is rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '), VWAP ' + iv.vwapPct + '%, volume ' + iv.rvol + 'x, spread ' + fmtNum_(meta.spreadPct, 2) + '%.';
+                } else {
+                  color = INTRADAY_ENTRY_LIGHT_COLOR;
+                  note += ' GET READY: dip and turn confirmed, waiting on: ' + missing.join('; ') + '.';
+                }
+              } else if (iv.rsi1m <= S.lightRsiMax) {
+                color = INTRADAY_ENTRY_LIGHT_COLOR;
+                note += ' GET READY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI ' + iv.rsi1m + ' is low' +
+                  (iv.rsiPrev == null ? ' (no recovery check: Cloud Function not updated).' : (iv.rsi1m <= S.dipRsi ? ', at the dip level, waiting for it to turn up.' : ', waiting for a dip to ' + S.dipRsi + ' and a turn up.'));
+              }
+            }
+          } else {
+            const price = map.optionPrice ? parseFloat(allValues[i][map.optionPrice - 1]) : NaN;
+            const profitPct = isFinite(price) ? (price / entryNum - 1) * 100 : null;
+            if (profitPct != null && profitPct >= S.exitMinProfitPct && iv.rsi1m >= S.exitRsiMin) {
+              const fading = iv.aroonUp < S.exitStrongAupBelow;
+              color = fading ? INTRADAY_EXIT_STRONG_COLOR : INTRADAY_EXIT_COLOR;
+              signal = fading ? 'EXIT (fading)' : 'EXIT';
+              note += ' EXIT' + (fading ? ' (momentum fading, AUP ' + iv.aroonUp + ')' : '') + ': option is up ' + (Math.round(profitPct * 10) / 10) + '% vs Entry and RSI is ' + iv.rsi1m + '.';
+            } else if (profitPct != null) {
+              note += ' Held: option ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry (exit signal needs +' + S.exitMinProfitPct + '% and RSI >= ' + S.exitRsiMin + ').';
+            }
+          }
+        }
+      }
+      ivCols.forEach(function (c) { allBackgrounds[i][c - 1] = color; allNotes[i][c - 1] = note; });
+
+      if (signal && !dryRun) {
+        logRows.push({
+          key: sheet.getName() + '|' + allValues[i][map.ticker - 1] + '|' + allValues[i][map.strike - 1] + '|' + signal.split(' ')[0],
+          row: [runTimestamp, sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], allValues[i][map.expiry - 1], signal,
+            iv.aroonUp, iv.aroonDown, iv.rsi1m, iv.rsiMin5, iv.vwapPct, iv.rvol, spyText, fmtNum_(meta.stockPrice, 2),
+            map.optionPrice ? allValues[i][map.optionPrice - 1] : '', fmtNum_(meta.spreadPct, 2), iv.source || '', '']
+        });
+      }
+    });
+
+    // One header note (first of these columns): SPY state right now.
+    sheet.getRange(HEADER_ROW, ivCols[0]).setNote('Market filter (strong green is blocked only when SPY is below its VWAP AND Aroon Down is above Aroon Up): ' + spyText + '.');
+    if (logRows.length) appendSignalLog_(logRows, runTimestamp);
   }
 
   // LastRun cell: strong fill + note listing why when any data in the row is stale;
