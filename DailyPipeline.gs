@@ -21,7 +21,7 @@
  *                  time-budget-exceeded case), this stage re-runs itself via
  *                  trigger rather than advancing, exactly like Research
  *                  already tells you to do manually — just automatic here.
- * 2. PROMOTE     — for each of Quick/Risky/Leap: reads that tab's current
+ * 2. PROMOTE     — for each of Quick/Leap: reads that tab's current
  *                  top-20 picks from the LAST Research run (the same
  *                  RESEARCH_LAST_<TAB> snapshot ResearchEngine.gs already
  *                  writes — no need to re-read/parse the Research sheet).
@@ -35,7 +35,7 @@
  *                  doesn't grow without bound. Any Research pick not
  *                  already present is added as a new row (ticker only —
  *                  Strike/Expiry filled in by the next stage).
- * 3. AUTOFILL    — for every row on Quick/Risky/Leap missing a Strike or
+ * 3. AUTOFILL    — for every row on Quick/Leap missing a Strike or
  *                  Expiry (newly-promoted rows always qualify, since
  *                  Promote only ever writes the ticker; any older row you
  *                  left incomplete qualifies too), scans its chain with
@@ -56,11 +56,11 @@
  * file ALSO still contains getInputConfigForSheet_(), which reads a
  * genuinely separate block PER TAB NAME from an "Input" sheet — this was
  * apparently an earlier design that the interactive scanner no longer uses,
- * but it's exactly the structure this pipeline needs (Quick, Risky, and
+ * but it's exactly the structure this pipeline needs (Quick, and
  * Leap each have real, different objectives, so auto-filling all three
  * with one shared setting would be wrong). This stage reuses that existing,
  * already-documented "Input" tab mechanism rather than inventing a new one.
- * If your "Input" sheet doesn't have current Quick/Risky/Leap blocks, this
+ * If your "Input" sheet doesn't have current Quick/Leap blocks, this
  * stage will fail for that tab with a clear reason in the log — nothing
  * silently guesses.
  * ============================================================================
@@ -259,7 +259,7 @@ function runDailyPipelinePromoteStage_(state) {
   state.newlyPromoted = {};
   const queue = [];
 
-  ['Quick', 'Risky', 'Leap'].forEach(function (tabName) {
+  ['Quick', 'Leap'].forEach(function (tabName) {
     const result = promoteResearchPicksForTab_(tabName);
     state.newlyPromoted[tabName] = result.addedTickers;
     state.log.push(tabName + ' promote: +' + result.added + ' added, \u2212' + result.deleted +
@@ -429,7 +429,7 @@ function promoteResearchPicksForTab_(tabName, dryRun) {
 // for every tab, but every delete/add is logged instead of actually
 // happening. Check ScriptLog after running this for one line per tab.
 function promoteResearchPicksForTabDryRun() {
-  ['Quick', 'Risky', 'Leap'].forEach(function (tabName) {
+  ['Quick', 'Leap'].forEach(function (tabName) {
     promoteResearchPicksForTab_(tabName, true);
   });
   const ui = tryGetUi_();
@@ -450,7 +450,7 @@ function runDailyPipelineAutofillStage_(state) {
   // passes — this is what lets the final summary report a true total
   // across the whole stage, not just whatever fit in the last pass.
   if (!state.autofillTotals) {
-    state.autofillTotals = { Quick: { filled: 0, skipped: 0 }, Risky: { filled: 0, skipped: 0 }, Leap: { filled: 0, skipped: 0 } };
+    state.autofillTotals = { Quick: { filled: 0, skipped: 0 }, Leap: { filled: 0, skipped: 0 } };
   }
 
   let passFilled = 0, passSkipped = 0;
@@ -558,7 +558,6 @@ function runDailyPipelineAutofillStage_(state) {
     // stage needed but didn't have before.
     const t = state.autofillTotals;
     state.log.push('Auto-fill (Best Open Interest) complete \u2014 Quick: ' + t.Quick.filled + ' filled, ' + t.Quick.skipped +
-      ' skipped | Risky: ' + t.Risky.filled + ' filled, ' + t.Risky.skipped +
       ' skipped | Leap: ' + t.Leap.filled + ' filled, ' + t.Leap.skipped + ' skipped.');
   }
   // else: stage stays 'AUTOFILL', dispatcher re-triggers to continue the queue

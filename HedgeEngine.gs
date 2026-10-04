@@ -2,7 +2,7 @@
  * ============================================================================
  * HEDGE ENGINE (HedgeEngine.gs)
  * ----------------------------------------------------------------------------
- * Scans every OPEN LONG-CALL position across the Quick / Risky / Leap tabs
+ * Scans every OPEN LONG-CALL position across the Quick / Leap tabs
  * (any row with a plausible Entry Price) and, for each one, answers: given
  * this LEAPS-style position, how much short-term downside risk am I actually
  * exposed to right now, how expensive is protection, and which protective put
@@ -50,7 +50,7 @@
  * ========================================================================== */
 
 const HEDGE_SHEET_NAME = 'Hedge';
-const HEDGE_SOURCE_SHEETS = ['Quick', 'Risky', 'Leap'];
+const HEDGE_SOURCE_SHEETS = ['Quick', 'Leap'];
 const HEDGE_EXECUTION_TIME_BUDGET_MS = 5 * 60 * 1000;
 
 // Target DTE buckets for candidate expiries. "mid" is the ideal DTE within
@@ -792,7 +792,7 @@ function writeHedgeRow_(sheet, row, position, needResult, costResult, decision, 
 
 
 /* ============================================================================
- * POSITION SCANNING — non-blank Entry Price across Quick/Risky/Leap, long
+ * POSITION SCANNING — non-blank Entry Price across Quick/Leap, long
  * calls only (v1 scope), same ticker+strike+expiry lots combined.
  * ========================================================================== */
 

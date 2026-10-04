@@ -26,12 +26,6 @@
  *   MaxExpiry   60
  *   MinStrike   70.00
  *
- *   Risky
- *   Type        C
- *   Delta       0.7
- *   MinExpiry   365
- *   MaxExpiry   60
- *   MinStrike   70.00
  *
  * The block header in column A must exactly match the sheet name you're
  * running the scan from (case-insensitive) — e.g. running the menu item

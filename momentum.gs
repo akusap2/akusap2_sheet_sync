@@ -9,7 +9,7 @@
  * "Input" tab instead of auto-creating/reading a separate "Momentum Scanner
  * Settings" sheet.
  *
- * The Input tab holds one labeled block per data sheet (Quick/Leap/Risky/
+ * The Input tab holds one labeled block per data sheet (Quick/Leap/
  * etc.), keyed by a subheading in column A that matches the sheet name:
  *
  *   Quick
@@ -103,7 +103,7 @@ const HEADER_MAP = {
   // NEW: Score — weighted blend of Filter, Target Probability, and
   // (100 - Risk). See SCORE_WEIGHTS_BY_SHEET / computeCombinedScore_
   // further down for the per-sheet weights and math. Add a header cell
-  // literally named "Score" on the Quick/Risky/Leap tabs to enable this.
+  // literally named "Score" on the Quick/Leap tabs to enable this.
   score: ['Score'],
   // Read-only lookup — this script never writes PtN, only uses it to know
   // which column to apply a standout background to. See
@@ -118,10 +118,18 @@ const HEADER_MAP = {
   // Price vs today's session VWAP (percent) and relative volume (today so far vs same time on prior days).
   vwapPct: ['VW', 'VWAP %', 'VWAP'],
   relVol: ['RV', 'RW', 'RVOL', 'Rel Vol'],
-  // Same-day feasibility (information only, Quick/Risky): stock move needed for the option to gain SAMEDAY_TARGET_PCT net of
+  // Same-day feasibility (information only, Quick): stock move needed for the option to gain SAMEDAY_TARGET_PCT net of
   // spread, and the estimated chance the stock touches that level before the close.
   needMove: ['MV', 'Need Move'],
-  pToday: ['P1D', 'P Today']
+  pToday: ['P1D', 'P Today'],
+  // Leap-tab indicators (daily bars from the Cloud Function). Rename the Quick columns on the Leap tab to these headers.
+  leapT200: ['T200'],          // price vs 200-day average, %
+  leapX50: ['X50'],            // 50-day vs 200-day average, % (positive = golden-cross state)
+  leapR14: ['R14D'],           // daily RSI(14)
+  leapOffHigh: ['OFFH'],       // % below the 52-week high
+  leapIvr: ['IVR'],            // IV Rank
+  leapCarry: ['CARRY'],        // time value as % of the stock price, annualized by days to expiry
+  leapSpread: ['SPRD']         // option bid/ask spread, % of option price
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -139,7 +147,7 @@ const TIMESTAMP_HEADER = 'LastRun';
  * limit) keeps its old LastRun instead of getting a new one, so the column shows
  * real data age.
  *
- * On Quick / Risky / Leap, a row that could NOT be refreshed this run has its Score
+ * On Quick / Leap, a row that could NOT be refreshed this run has its Score
  * and Risk cleared and its Status set to a STALE message, so an old number can't
  * be ranked, bordered or acted on next to fresh ones.
  *
@@ -175,9 +183,9 @@ const INTRADAY_SIGNAL = {
   dipRsi: 30,             // strong green: R30 was at or below this within the last 5 minutes...
   recoverRsiMax: 45,      // ...is rising now, and has not already run above this
   exitRsiMin: 65,         // red: R30 at or above this
-  exitMinProfitPct: 3,    // red only when the option (Price vs Entry) is up at least this % (your playbook minimum)
+  exitMinProfitPct: 1.5,  // red only when the option is up at least this % vs your Entry, counted after the selling spread (matches the +1.5% same-day target)
   exitStrongAupBelow: 50, // strong red: Aroon Up has dropped below this
-  maxSpreadPct: 1.5,      // no green when the option's bid/ask spread is wider than this % of its price (eats the +3% target)
+  maxSpreadPct: 1.5,      // no green when the option's bid/ask spread is wider than this % of its price (eats the same-day target)
   vwapMinPct: -0.5,       // strong green needs price at most this far below session VWAP (pulled back to VWAP, not collapsing)
   rvolMin: 1.0,           // strong green needs relative volume at or above this (volume at least normal for this time of day)
   noEntryFirstMin: 15,    // no green in the first N minutes after the open...
@@ -185,13 +193,34 @@ const INTRADAY_SIGNAL = {
   logCooldownMin: 30      // the same signal on the same contract is logged at most once per this many minutes
 };
 // Entry/exit colors and the signal log apply only to these tabs; Leap just shows the values.
-const INTRADAY_SIGNAL_SHEETS = ['Quick', 'Risky'];
+const INTRADAY_SIGNAL_SHEETS = ['Quick'];
 // Same-day target for the feasibility columns and the self-grading log (the existing +3% playbook/Score logic is untouched).
 const SAMEDAY_TARGET_PCT = 1.5;
+// Phone alerts: a signal that stays green is re-sent at most this often; a move from get-ready to ENTRY is sent right away.
+const ALERT_CFG = {
+  repeatMin: 120, alertLight: true,        // Quick
+  leapRepeatMin: 360, leapAlertLight: false,   // Leap: daily-timeframe signals repeat less often; get-ready stays on the sheet only
+  exitRepeatMin: 720,                      // Leap exit alerts (trend break / take profit) repeat at most twice a day
+  quickExitRepeatMin: 60                   // Quick exit alerts (held rows only) repeat at most hourly while the signal stays on
+};
+// Leap tab (holding deep in-the-money LEAPs). Starting thresholds, not backtested.
+const LEAP_SIGNAL = {
+  strongMaxOffHigh: 15,    // within this % of the 52-week high
+  lightMaxOffHigh: 25,
+  strongMaxRsi: 45,        // mild daily pullback
+  lightMaxRsi: 55,
+  maxIvr: 40,              // IV Rank at or below
+  maxSpreadPct: 2,         // option bid/ask spread
+  maxCarryPct: 8,          // time value per year as % of the stock price
+  takeProfitPct: 50        // "good profit" alert on held rows (option vs your Entry price)
+};
+// Leap Validate & Update runs a few times a day (minutes after the 9:30 ET open): 10:30, 12:30, 14:30.
+const LEAP_SCHEDULE = { tab: 'Leap', slotsAfterOpenMin: [60, 180, 300] };
+const WATCH_SNAPSHOT_MAX_AGE_MIN = 45;   // the 5-minute watch ignores a shortlist older than this
 const SIGNAL_LOG_SHEET = 'SignalLog';
 const SIGNAL_LOG_HEADERS = ['Time', 'Tab', 'Ticker', 'Strike', 'Expiry', 'Signal', 'AUP', 'ADN', 'RSI 1m', 'RSI low 5m', 'VW %', 'RV', 'SPY', 'Stock', 'Option', 'Spread %', 'Source', 'Outcome (fill later)',
   'P1D at signal', 'MV % at signal', 'Peak % net', 'Hit +' + SAMEDAY_TARGET_PCT + '%', 'Min to hit', 'Last % net', 'Last updated'];
-const STALE_ROW_SHEETS = ['Quick', 'Risky', 'Leap'];
+const STALE_ROW_SHEETS = ['Quick', 'Leap'];
 
 // NYSE full-day closures and 1:00 pm early closes (ET). Source: NYSE Group holiday
 // calendar; 2027 observed-holiday dates follow the exchange's weekend rule. Add
@@ -292,10 +321,10 @@ const COLOR_TOP_FILTER_BORDER = '#b45f06';
 
 const TOP_FILTER_COUNT = 5;
 // NEW: 'score' added so the top-5 highlight also frames the Score cell
-// itself whenever ranking is done by Score (Quick/Risky/Leap) instead of
+// itself whenever ranking is done by Score (Quick/Leap) instead of
 // Filter Score (any other sheet).
 const TOP_FILTER_HIGHLIGHT_COLS = ['filterScore', 'riskScore', 'score', 'sectorMomentum', 'changeNow', 'atrPercent', 'ivRank', 'daysToCatalyst'];
-// When rows are ranked by Score (Quick/Risky/Leap), the top-5 border goes on the
+// When rows are ranked by Score (Quick/Leap), the top-5 border goes on the
 // Score cell ONLY — the longer list above (used when ranking by Filter Score on
 // other sheets) looked too crowded. clearTopFilterHighlight_ still clears the
 // whole list above, so borders left over from earlier runs disappear.
@@ -310,9 +339,9 @@ const TOP_SCORE_HIGHLIGHT_COLS = ['score'];
  * BALANCE SCORE — DAY/SWING SCREENER WEIGHTS
  * ========================================================================== */
 
-// All three sheets (Quick, Leap, Risky) now use the same Filter/Risk/
+// All three sheets (Quick, Leap) now use the same Filter/Risk/
 // Target architecture, each with its own per-sheet weighted formula (see
-// "QUICK & RISKY — REVISED FORMULAS" and "LEAP — REVISED FORMULAS"
+// "QUICK — REVISED FORMULAS" and "LEAP — REVISED FORMULAS"
 // further down) — so nothing is skipped by sheet anymore. Kept as a
 // function (rather than inlining `true`) in case a future sheet needs a
 // real exception again.
@@ -563,6 +592,9 @@ const CHAIN_SCANNER_DEFAULT_TYPE = 'C';
 // it's a strike FLOOR (% of price), for puts it's a strike CEILING (%
 // above price).
 const CHAIN_SCANNER_DEFAULT_MIN_STRIKE_PERCENT = 0;
+// Tabs whose "MinStrike" Input cell is a PREMIUM CAP (max option price as a percent of the stock price) instead of a
+// strike floor/ceiling. On these tabs there is no strike floor or ceiling at all. Other tabs (Leap) keep the old meaning.
+const CHAIN_SCANNER_PREMIUM_CAP_SHEETS = ['Quick'];
 // How many of the nearest qualifying expirations to actually pull the full
 // chain for, per ticker. Each one is a network call, so this bounds how
 // long one scanOptionChainForBestOi() run takes — keeps a normal watchlist well
@@ -654,20 +686,65 @@ function readChainScannerSettings_(sheetName) {
   const minStrikePctRaw = parseFloat(String(config.minStrike == null ? '' : config.minStrike).replace('%', '').trim());
   const maxExpiryRaw = parseFloat(config.maxExpiry);
 
+  const minExpiryDays = isPlausible_(minExpiryRaw, 0, null) ? minExpiryRaw : CHAIN_SCANNER_DEFAULT_MIN_EXPIRY_DAYS;
+  // MaxExpiry applies to calls AND puts. Blank, zero or non-numeric means "no upper cap" (null).
+  const maxExpiryDays = (isPlausible_(maxExpiryRaw, 0, null) && maxExpiryRaw > 0) ? maxExpiryRaw : null;
+  if (maxExpiryDays != null && maxExpiryDays <= minExpiryDays) {
+    throw new Error('Max Expiry (' + maxExpiryDays + 'd) must be greater than Min Expiry (' + minExpiryDays + 'd) in the "' + sheetName +
+      '" block of the Input tab. Raise Max Expiry, or leave it blank for no upper limit.');
+  }
+
+  const premiumMode = CHAIN_SCANNER_PREMIUM_CAP_SHEETS.indexOf(sheetName) !== -1;
+  const minStrikeValue = isPlausible_(minStrikePctRaw, 0, null) ? minStrikePctRaw : CHAIN_SCANNER_DEFAULT_MIN_STRIKE_PERCENT;
+
   return {
     minDelta: isPlausible_(minDeltaRaw, 0, 1) ? minDeltaRaw : CHAIN_SCANNER_DEFAULT_MIN_DELTA,
-    minExpiryDays: isPlausible_(minExpiryRaw, 0, null) ? minExpiryRaw : CHAIN_SCANNER_DEFAULT_MIN_EXPIRY_DAYS,
-    // MaxExpiry only applies to puts — blank/invalid, or type=C, both
-    // mean "no ceiling" (null). See findBestOiFromTastyChain_ /
-    // ...Yahoo... for where this is applied.
-    maxExpiryDays: (type === 'P' && isPlausible_(maxExpiryRaw, 0, null)) ? maxExpiryRaw : null,
+    minExpiryDays: minExpiryDays,
+    maxExpiryDays: maxExpiryDays,
     type: type,
-    // For calls: a FLOOR, strike >= price * (minStrikePercent/100).
-    // For puts: a CEILING, strike <= price * (1 + minStrikePercent/100).
-    // Same field, different meaning depending on type — see the
-    // strike-filter logic in findBestOiFromTastyChain_ / ...Yahoo....
-    minStrikePercent: isPlausible_(minStrikePctRaw, 0, null) ? minStrikePctRaw : CHAIN_SCANNER_DEFAULT_MIN_STRIKE_PERCENT
+    premiumMode: premiumMode,
+    // Premium-cap tabs (Quick): the MinStrike cell is the most you will pay for the option, as a percent of the stock price
+    // (blank or 0 = no cap), and there is NO strike floor or ceiling.
+    premiumCapPercent: (premiumMode && minStrikeValue > 0) ? minStrikeValue : null,
+    // Other tabs (Leap) — for calls: a FLOOR, strike >= price * (minStrikePercent/100).
+    // For puts: a CEILING, strike <= price * (1 + minStrikePercent/100). Zero on premium-cap tabs, which switches both off.
+    minStrikePercent: premiumMode ? 0 : minStrikeValue
   };
+}
+
+// Describes the strike/premium limit for dialogs and logs.
+function scannerLimitLabel_(settings) {
+  if (settings.premiumMode) {
+    return settings.premiumCapPercent != null
+      ? ('Premium cap ' + settings.premiumCapPercent + '% of stock price (no strike floor or ceiling)')
+      : 'No premium cap, no strike floor or ceiling';
+  }
+  return settings.type === 'P'
+    ? ('Max Strike ' + settings.minStrikePercent + '% above price')
+    : ('Min Strike ' + settings.minStrikePercent + '% of price');
+}
+
+// True when the contract's price is within the premium cap. No cap, or no usable underlying price to compare against,
+// means "can't judge, don't block"; a capped scan with no price for the contract is rejected (it cannot be shown to fit).
+function scannerPremiumOk_(price, underlying, premiumCapPercent) {
+  if (premiumCapPercent == null || !(premiumCapPercent > 0)) return true;
+  if (!isPlausible_(underlying, 0.01, null)) return true;
+  if (!isPlausible_(price, 0, null)) return false;
+  return price <= underlying * premiumCapPercent / 100;
+}
+
+// Final safety net for ANY pick, wherever it came from (Cloud Function, TastyTrade, Yahoo): returns a short reason string
+// if the pick sits outside the min/max expiry window or over the premium cap, else null. This is what catches a backend
+// that answers outside the window (for example a January 2028 contract when Max Expiry is shorter).
+function scannerPickViolation_(pick, settings, now) {
+  if (!pick || !(pick.expiry instanceof Date) || isNaN(pick.expiry.getTime())) return 'no usable expiry date';
+  const dte = Math.round((pick.expiry.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+  if (dte < settings.minExpiryDays) return dte + 'd is below Min Expiry ' + settings.minExpiryDays + 'd';
+  if (settings.maxExpiryDays != null && dte > settings.maxExpiryDays) return dte + 'd is above Max Expiry ' + settings.maxExpiryDays + 'd';
+  if (settings.premiumCapPercent != null && pick.underlying != null && !scannerPremiumOk_(pick.price, pick.underlying, settings.premiumCapPercent)) {
+    return 'premium ' + (pick.price != null ? '$' + round2_(pick.price) : 'unknown') + ' is over the ' + settings.premiumCapPercent + '% cap';
+  }
+  return null;
 }
 
 
@@ -959,7 +1036,7 @@ const STATIC_SECTOR_MAP = {
   SNPS: { sector: 'Technology', industry: 'Software—Application' },
   ARM: { sector: 'Technology', industry: 'Semiconductors' },
 
-  // Additional mid-cap growth/momentum names (mainly for Risky)
+  // Additional mid-cap growth/momentum names
   CELH: { sector: 'Consumer Defensive', industry: 'Beverages—Non-Alcoholic' },
   SMCI: { sector: 'Technology', industry: 'Computer Hardware' },
   U: { sector: 'Technology', industry: 'Software—Application' },
@@ -1072,128 +1149,190 @@ const TRACKED_FIELDS = {
  * ========================================================================== */
 
 /* ============================================================================
- * SCHEDULED RUNS
+ * QUICK SCHEDULE (replaces the old multi-tab scheduler)
  * ----------------------------------------------------------------------------
- * Apps Script time-driven triggers don't support "every 2 hours, but only
- * between 9:05am and 4:30pm" directly — the closest native option is a
- * fixed everyHours(N)/everyMinutes(N) cadence with no window. So instead:
- * ONE lightweight trigger (scheduledDispatcher_) fires every 5 minutes,
- * all day, and does almost nothing on 99% of those firings — it just
- * checks the current America/New_York time against your exact target
- * time lists below, and only does real work (scan or validate) on an
- * exact match. This gives you precise 9:05/11:05/1:05/3:05 and
- * 10:00-4:00-every-30-min scheduling without needing separate triggers
- * per slot, and correctly handles EST/EDT since 'America/New_York' is a
- * real timezone, not a fixed UTC offset.
- *
- * Runs BOTH "Momentum" and "Play" tabs, one after another, in a single
- * trigger firing. To stay safely under Google's own ~6-minute ceiling on
- * one trigger execution, each tab gets a SHORTER time budget than a
- * manual run would (SCHEDULED_PER_TAB_BUDGET_MS below) — if a tab's
- * queue is too long to finish in that window, it stops cleanly (same
- * "resume next time" behavior as a manual run) rather than risking both
- * tabs together blowing the platform limit.
- *
- * Dedup: a slot is identified by "yyyy-MM-dd HH:mm" and only ever runs
- * once — if the checker fires more than once near the same target time
- * (jitter), the second firing sees it already ran and skips. Uses two
- * fixed Script Properties (not one per slot/day), so this never
- * accumulates unbounded storage over time.
- *
- * Summaries land in the "Log" tab (see logToSheet_) instead of a dialog,
- * since there's no one there to see a popup.
+ * ONE time trigger fires quickScheduleTick_ every 5 minutes, all day. Outside market hours it
+ * returns in milliseconds. During market hours each tick:
+ *   1. runs the signal watch (phone alerts; one small Cloud Function call), then
+ *   2. runs AT MOST ONE heavy job on the Quick tab:
+ *        - the one-per-day chain scan, if it is due, else
+ *        - Validate & Update, if QUICK_SCHEDULE.validateEveryMin minutes have passed since the last one.
+ * Why the old scheduler never ran: it only acted when the clock read exactly 10:00, 10:30, and so on, but
+ * Apps Script does not promise a trigger fires at any particular minute (it fires every ~5 minutes at its
+ * own offset). This version asks "is a run DUE?" instead, so the minute it fires does not matter.
+ * Safeguards: a script lock stops overlapping ticks, one heavy job per tick keeps each run under Google's
+ * 6-minute limit, and a daily runtime guard stops starting heavy jobs near the 90-minute daily trigger quota.
  * ========================================================================== */
+const QUICK_SCHEDULE = {
+  tab: 'Quick',
+  validateEveryMin: 15,          // full Validate & Update on Quick during market hours
+  firstRunAfterOpenMin: 15,      // first Validate at 9:45 ET (signals are blocked before then anyway)
+  stopBeforeCloseMin: 15,        // no new Validate in the last 15 minutes
+  scanAfterOpenMin: 10,          // one Scan Chain by Delta / OI per day, 10 minutes after the open (OI only updates overnight); null = never
+  heavyBudgetMs: 4 * 60 * 1000,  // time budget handed to Scan / Validate (stops cleanly and resumes next time)
+  dailyRuntimeCapMin: 75         // stop starting heavy jobs after this many trigger-minutes today (Google allows 90 on gmail.com accounts)
+};
+const QUICK_SCHEDULE_TICK_FN = 'quickScheduleTick_';
+// Handler names of every trigger this project has ever installed for scheduling; all are removed on Start / Stop.
+const OLD_SCHEDULE_HANDLERS = ['scheduledDispatcher_', 'signalWatchTick_', 'quickScheduleTick_'];
 
-const SCHEDULED_SCAN_TIMES = ['09:05', '11:05', '13:05', '15:05'];
-const SCHEDULED_VALIDATE_TIMES = [
-  '10:00', '10:30', '11:00', '11:30', '12:00', '12:30', '13:00',
-  '13:30', '14:00', '14:30', '15:00', '15:30', '16:00'
-];
-const SCHEDULED_TABS = ['Momentum', 'Play'];
-const SCHEDULED_PER_TAB_BUDGET_MS = 2.5 * 60 * 1000; // 2.5 min/tab — 2 tabs = 5 min, under the ~6-min trigger ceiling
-const SCHEDULED_DISPATCHER_FN = 'scheduledDispatcher_';
+function nyYmd_(d) { return Utilities.formatDate(d, 'America/New_York', 'yyyy-MM-dd'); }
 
-function scheduledDispatcher_() {
-  const now = new Date();
-
-  // Weekdays only — 'u' gives ISO day-of-week in America/New_York time
-  // (1=Monday...7=Sunday), so this is correct regardless of the script
-  // project's own timezone setting.
-  const nyIsoDayOfWeek = Utilities.formatDate(now, 'America/New_York', 'u');
-  if (nyIsoDayOfWeek === '6' || nyIsoDayOfWeek === '7') return;
-
-  const nyTime = Utilities.formatDate(now, 'America/New_York', 'HH:mm');
-  const slotId = Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd') + ' ' + nyTime;
-  const props = PropertiesService.getScriptProperties();
-
-  if (SCHEDULED_SCAN_TIMES.indexOf(nyTime) !== -1 && props.getProperty('LAST_SCHEDULED_SCAN_SLOT') !== slotId) {
-    props.setProperty('LAST_SCHEDULED_SCAN_SLOT', slotId);
-    runScheduledScanOnTabs_();
-  }
-
-  if (SCHEDULED_VALIDATE_TIMES.indexOf(nyTime) !== -1 && props.getProperty('LAST_SCHEDULED_VALIDATE_SLOT') !== slotId) {
-    props.setProperty('LAST_SCHEDULED_VALIDATE_SLOT', slotId);
-    runScheduledValidateOnTabs_();
-  }
+function addScheduledRuntime_(props, ms, now) {
+  try {
+    let r = {}; try { r = JSON.parse(props.getProperty('SCHED_RUNTIME') || '{}'); } catch (e) { r = {}; }
+    const day = nyYmd_(now);
+    if (r.d !== day) r = { d: day, ms: 0 };
+    r.ms += ms;
+    props.setProperty('SCHED_RUNTIME', JSON.stringify(r));
+  } catch (e) { /* accounting only */ }
+}
+function scheduledRuntimeTodayMs_(props, now) {
+  try { const r = JSON.parse(props.getProperty('SCHED_RUNTIME') || '{}'); return r.d === nyYmd_(now) ? (r.ms || 0) : 0; } catch (e) { return 0; }
 }
 
-function runScheduledScanOnTabs_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  SCHEDULED_TABS.forEach(function (name) {
-    const sheet = ss.getSheetByName(name);
-    if (!sheet) { logToSheet_('Scheduled Scan: tab "' + name + '" not found, skipped.'); return; }
-    try {
-      scanOptionChainForBestOi(sheet, SCHEDULED_PER_TAB_BUDGET_MS);
-    } catch (err) {
-      logToSheet_('Scheduled Scan on "' + name + '" failed: ' + err);
+function quickScheduleTick_() {
+  const t0 = Date.now();
+  let lock = null;
+  try {
+    const now = new Date();
+    const sess = marketSessionAt_(now);
+    if (!sess.open) return;                                   // closed: nothing to do, no network
+    lock = LockService.getScriptLock();
+    if (!lock.tryLock(1000)) return;                          // the previous tick is still running
+    const props = PropertiesService.getScriptProperties();
+    const Q = QUICK_SCHEDULE;
+    const closeMin = US_MARKET_EARLY_CLOSES[nyYmd_(now)] ? 210 : 390;
+
+    // 1) signal watch: phone alerts for light / strong green (fast; skips itself when alerts are off)
+    signalWatchTick_();
+
+    // 2) at most one heavy job
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(Q.tab);
+    if (!sheet) { logToSheet_('Quick schedule: tab "' + Q.tab + '" not found.'); return; }
+    if (scheduledRuntimeTodayMs_(props, now) >= Q.dailyRuntimeCapMin * 60000) {
+      if (props.getProperty('SCHED_CAP_LOGGED') !== nyYmd_(now)) { props.setProperty('SCHED_CAP_LOGGED', nyYmd_(now)); logToSheet_('Quick schedule: daily runtime guard reached (' + Q.dailyRuntimeCapMin + ' min); heavy runs paused until tomorrow, alerts continue.'); }
+      return;
     }
-  });
-}
-
-function runScheduledValidateOnTabs_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  SCHEDULED_TABS.forEach(function (name) {
-    const sheet = ss.getSheetByName(name);
-    if (!sheet) { logToSheet_('Scheduled Validate: tab "' + name + '" not found, skipped.'); return; }
-    try {
-      validateAndUpdate(sheet, SCHEDULED_PER_TAB_BUDGET_MS);
-    } catch (err) {
-      logToSheet_('Scheduled Validate on "' + name + '" failed: ' + err);
+    const today = nyYmd_(now);
+    const scanDue = Q.scanAfterOpenMin != null && sess.minutesSinceOpen >= Q.scanAfterOpenMin && props.getProperty('SCHED_LAST_SCAN_DAY') !== today;
+    if (scanDue) {
+      props.setProperty('SCHED_LAST_SCAN_DAY', today);        // mark first so an error never loops
+      const s0 = Date.now();
+      try { scanOptionChainForBestOi(sheet, Q.heavyBudgetMs); } catch (err) { logToSheet_('Quick schedule: scan failed: ' + err); }
+      logToSheet_('Quick schedule: chain scan finished in ' + Math.round((Date.now() - s0) / 1000) + 's.');
+      return;
     }
-  });
+    let ranHeavy = false;
+    const lastV = parseInt(props.getProperty('SCHED_LAST_VALIDATE_MS') || '0', 10);
+    const inWindow = sess.minutesSinceOpen >= Q.firstRunAfterOpenMin && (closeMin - sess.minutesSinceOpen) >= Q.stopBeforeCloseMin;
+    const validateDue = inWindow && (now.getTime() - lastV) >= (Q.validateEveryMin - 1) * 60000;   // 1-minute slack so a 15-minute cadence stays on the 5-minute ticks
+    if (validateDue) {
+      props.setProperty('SCHED_LAST_VALIDATE_MS', String(now.getTime()));
+      const v0 = Date.now();
+      ranHeavy = true;
+      try { validateAndUpdate(sheet, Q.heavyBudgetMs); } catch (err) { logToSheet_('Quick schedule: Validate & Update failed: ' + err); }
+      logToSheet_('Quick schedule: Validate & Update took ' + Math.round((Date.now() - v0) / 1000) + 's.');
+    }
+
+    // Leap: a few runs a day (never in the same tick as another heavy job; a due slot simply waits for the next tick).
+    if (!ranHeavy) {
+      const leapSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LEAP_SCHEDULE.tab);
+      if (leapSheet) {
+        let st = {}; try { st = JSON.parse(props.getProperty('SCHED_LEAP') || '{}'); } catch (e) { st = {}; }
+        if (st.d !== today) st = { d: today, n: 0 };
+        const passed = LEAP_SCHEDULE.slotsAfterOpenMin.filter(function (m) { return sess.minutesSinceOpen >= m; }).length;
+        if (passed > st.n && (closeMin - sess.minutesSinceOpen) >= Q.stopBeforeCloseMin) {
+          st.n = passed;
+          props.setProperty('SCHED_LEAP', JSON.stringify(st));     // mark first so an error never loops
+          const l0 = Date.now();
+          try { validateAndUpdate(leapSheet, Q.heavyBudgetMs); } catch (err) { logToSheet_('Leap schedule: Validate & Update failed: ' + err); }
+          logToSheet_('Leap schedule: Validate & Update took ' + Math.round((Date.now() - l0) / 1000) + 's (run ' + passed + ' of ' + LEAP_SCHEDULE.slotsAfterOpenMin.length + ' today).');
+        }
+      }
+    }
+  } catch (e) {
+    logToSheet_('Quick schedule tick failed: ' + e);
+  } finally {
+    try {
+      const sess2 = marketSessionAt_(new Date(t0));
+      if (sess2.open) addScheduledRuntime_(PropertiesService.getScriptProperties(), Date.now() - t0, new Date(t0));
+    } catch (e) { /* ignore */ }
+    if (lock) { try { lock.releaseLock(); } catch (e) { /* ignore */ } }
+  }
 }
 
-function installScheduledRuns_() {
-  removeScheduledRunsQuiet_();
-  ScriptApp.newTrigger(SCHEDULED_DISPATCHER_FN).timeBased().everyMinutes(5).create();
-  const ui = tryGetUi_();
-  const msg = 'Scheduled runs enabled (weekdays only):\n' +
-    'Scan Chain by Delta / OI — ' + SCHEDULED_SCAN_TIMES.join(', ') + ' ET on ' + SCHEDULED_TABS.join(' + ') + '\n' +
-    'Validate & Update — ' + SCHEDULED_VALIDATE_TIMES[0] + '-' + SCHEDULED_VALIDATE_TIMES[SCHEDULED_VALIDATE_TIMES.length - 1] +
-      ' ET every 30 min on ' + SCHEDULED_TABS.join(' + ') + '\n\n' +
-    'Summaries land in the "Log" tab. Use "Disable Scheduled Runs" to stop.';
-  if (ui) ui.alert('Scheduled Runs', msg, ui.ButtonSet.OK); else logToSheet_(msg);
-}
-
-function removeScheduledRunsQuiet_() {
+function removeScheduleTriggersQuiet_() {
+  let n = 0;
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === SCHEDULED_DISPATCHER_FN) ScriptApp.deleteTrigger(t);
+    if (OLD_SCHEDULE_HANDLERS.indexOf(t.getHandlerFunction()) !== -1) { ScriptApp.deleteTrigger(t); n++; }
   });
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('LAST_SCHEDULED_SCAN_SLOT');
+  props.deleteProperty('LAST_SCHEDULED_VALIDATE_SLOT');
+  props.deleteProperty('RESEARCH_LAST_RISKY');   // leftover from the removed Risky tab
+  return n;
 }
 
-function removeScheduledRuns_() {
-  removeScheduledRunsQuiet_();
+function startQuickSchedule_() {
   const ui = tryGetUi_();
-  const msg = 'Scheduled runs disabled. Manual menu use is unaffected.';
+  const Q = QUICK_SCHEDULE;
+  if (!SpreadsheetApp.getActiveSpreadsheet().getSheetByName(Q.tab)) {
+    const m = 'No tab named "' + Q.tab + '" found, so nothing was scheduled.';
+    if (ui) ui.alert(m); else logToSheet_(m);
+    return;
+  }
+  const removed = removeScheduleTriggersQuiet_();
+  ScriptApp.newTrigger(QUICK_SCHEDULE_TICK_FN).timeBased().everyMinutes(5).create();
+  const alertsReady = getAlertConfig_().ready;
+  const msg = 'Quick schedule is ON' + (removed ? ' (' + removed + ' old schedule trigger(s) removed)' : '') + '.\n\n' +
+    'Every 5 minutes during market hours (weekdays, holidays and early closes handled):\n' +
+    '- Phone alerts: re-check the Quick shortlist for light / strong green\n' +
+    '- Validate & Update on "' + Q.tab + '" about every ' + Q.validateEveryMin + ' minutes, from ' + Q.firstRunAfterOpenMin + ' minutes after the open until ' + Q.stopBeforeCloseMin + ' minutes before the close\n' +
+    (Q.scanAfterOpenMin != null ? '- One Scan Chain by Delta / OI per day, ' + Q.scanAfterOpenMin + ' minutes after the open\n' : '') +
+    '- Validate & Update on "' + LEAP_SCHEDULE.tab + '" ' + LEAP_SCHEDULE.slotsAfterOpenMin.length + ' times a day (' + LEAP_SCHEDULE.slotsAfterOpenMin.map(function (m) { return Utilities.formatDate(new Date(2026, 0, 5, 9, 30 + m), 'America/New_York', 'h:mm'); }).join(', ') + ' ET), with phone alerts for Leap entries and exits\n' +
+    '\nOutside market hours it does nothing.\n' +
+    (alertsReady ? '' : '\nNote: phone alerts are not set up or are off, so alerts will not send until you set up Telegram.\n') +
+    '\nUse "Schedule Status" to check on it, "Stop Quick Schedule" to turn it off.';
+  if (ui) ui.alert('Quick Schedule', msg, ui.ButtonSet.OK); else logToSheet_(msg);
+}
+
+function stopQuickSchedule_() {
+  const ui = tryGetUi_();
+  const n = removeScheduleTriggersQuiet_();
+  const msg = n ? 'Quick schedule stopped (' + n + ' trigger(s) removed). Manual menu use is unaffected.' : 'No schedule triggers were installed.';
   if (ui) ui.alert(msg); else logToSheet_(msg);
 }
 
+function quickScheduleStatus_() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const now = new Date();
+  const triggers = ScriptApp.getProjectTriggers().filter(function (t) { return OLD_SCHEDULE_HANDLERS.indexOf(t.getHandlerFunction()) !== -1; });
+  const lastV = parseInt(props.getProperty('SCHED_LAST_VALIDATE_MS') || '0', 10);
+  const cfg = getAlertConfig_();
+  const sess = marketSessionAt_(now);
+  const lines = [
+    'Schedule trigger: ' + (triggers.length ? 'ON (' + triggers.map(function (t) { return t.getHandlerFunction(); }).join(', ') + ')' : 'OFF'),
+    'Market right now: ' + (sess.open ? 'open' : 'closed'),
+    'Last scheduled Validate & Update: ' + (lastV ? Utilities.formatDate(new Date(lastV), 'America/New_York', 'EEE h:mm a') + ' ET' : 'never'),
+    'Last chain scan day: ' + (props.getProperty('SCHED_LAST_SCAN_DAY') || 'never'),
+    'Leap runs today: ' + (function () { try { const st = JSON.parse(props.getProperty('SCHED_LEAP') || '{}'); return (st.d === nyYmd_(now) ? st.n : 0) + ' of ' + LEAP_SCHEDULE.slotsAfterOpenMin.length; } catch (e) { return '0'; } })(),
+    'Trigger runtime used today: ' + Math.round(scheduledRuntimeTodayMs_(props, now) / 60000) + ' of about 90 min (guard stops heavy runs at ' + QUICK_SCHEDULE.dailyRuntimeCapMin + ')',
+    'Phone alerts: ' + (cfg.ready ? 'ON via ' + cfg.provider : (cfg.enabled ? 'on, but provider not fully set up' : 'OFF')),
+    '',
+    'To see every run, open Extensions > Apps Script > Executions.'
+  ];
+  if (triggers.length > 1 || triggers.some(function (t) { return t.getHandlerFunction() !== QUICK_SCHEDULE_TICK_FN; })) lines.push('Old schedule triggers are still installed: run Start Quick Schedule once to clean them up.');
+  ui.alert('Quick Schedule Status', lines.join('\n'), ui.ButtonSet.OK);
+}
 
-// STANDING RULE: every debug/diagnostic menu item goes in the "⚙ More
-// Tools" submenu below, never at a menu's top level — keeps the
-// top-level menus to the actions actually used day to day. Applies to
-// any new debug tool added to this project going forward, across any
-// of its menus (Options Validator, DeepDive, Hedge, Research).
+
+// STANDING RULE: every debug/diagnostic menu item goes in the "🔍 Debug"
+// submenu below (Options Validator menu), never at a menu's top level —
+// keeps the top-level menus to the actions actually used day to day.
+// Applies to any new debug tool added to this project going forward,
+// across any of its menus (Options Validator, DeepDive, Hedge, Research).
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Options Validator')
@@ -1201,35 +1340,38 @@ function onOpen() {
     .addItem('▶ Validate & Update All Rows', 'validateAndUpdate')
     .addItem('🚀 Place Trades (TastyTrade)', 'placeTradesFromSheet')
     .addSeparator()
-    .addSubMenu(SpreadsheetApp.getUi().createMenu('⚙ More Tools')
-      .addItem('🔑 Set TastyTrade Credentials', 'setTastyTradeCredentials')
-      .addItem('🔑 Set Finnhub API Key', 'setFinnhubApiKey')
-      .addItem('🔑 Set FMP API Key', 'setFmpApiKey')
-      .addItem('🔑 Set Alpha Vantage API Key (optional fallback)', 'setAlphaVantageApiKey')
+    // Everything else is grouped into one-level submenus (Apps Script custom menus nest reliably only one level deep).
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('📱 Phone Alerts')
+      .addItem('Set Up Telegram (free)', 'setupTelegramAlerts_')
+      .addItem('Send Test Alert', 'sendTestPhoneAlert_')
+      .addItem('Turn Alerts On / Off', 'togglePhoneAlerts_')
       .addSeparator()
-      .addItem('⚙ Set Trade Credentials', 'setTradeCredentials')
+      .addItem('▶ Start Quick Schedule (alerts + auto-run)', 'startQuickSchedule_')
+      .addItem('■ Stop Quick Schedule', 'stopQuickSchedule_')
+      .addItem('Schedule Status', 'quickScheduleStatus_'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔑 Keys & Credentials')
+      .addItem('Set TastyTrade Credentials', 'setTastyTradeCredentials')
+      .addItem('Set Finnhub API Key', 'setFinnhubApiKey')
+      .addItem('Set FMP API Key', 'setFmpApiKey')
+      .addItem('Set Alpha Vantage API Key (optional fallback)', 'setAlphaVantageApiKey')
       .addSeparator()
-      .addItem('🧹 Clear Today\'s API Quota Cache', 'clearTodayApiCache')
-      .addItem('🧹 Force-Refresh Slow-Changing Data (Analyst/Theme/Quality/Catalyst)', 'clearSlowCacheMenuAction_')
+      .addItem('Set Trade Credentials', 'setTradeCredentials'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🧹 Data & Cache')
+      .addItem('Clear Today\'s API Quota Cache', 'clearTodayApiCache')
+      .addItem('Force-Refresh Slow-Changing Data (Analyst/Theme/Quality/Catalyst)', 'clearSlowCacheMenuAction_')
+      .addItem('Clean Unused Google Finance Rows', 'cleanGfHelperSheetMenuAction_')
       .addSeparator()
-      .addItem('🏷 Set Sector/Industry Override', 'setSectorOverride_')
-      .addItem('🏷 Clear Sector/Industry Override', 'clearSectorOverride_')
-      .addSeparator()
-      .addItem('📈 Clean Unused Google Finance Rows', 'cleanGfHelperSheetMenuAction_')
-      .addSeparator()
-      .addItem('⏰ Enable Scheduled Runs (weekdays)', 'installScheduledRuns_')
-      .addItem('⏰ Disable Scheduled Runs', 'removeScheduledRuns_')
-      .addSeparator()
-      // All debug tools live here from now on — see note at onOpen's
-      // definition for the standing rule that any new debug tool added
-      // to this project goes in this submenu, not at the top level.
-      .addItem('🔍 Debug: Show Detected Columns', 'debugShowColumns')
-      .addItem('🔬 Debug: Fetch Raw Quote (one row)', 'debugFetchRawQuote')
-      .addItem('📅 Debug: Fetch Earnings (one ticker)', 'debugFetchEarnings')
-      .addItem('🔎 Debug: Scan One Ticker\'s Chain', 'debugScanTickerChain')
-      .addItem('🔬 Debug: Scan Chain Dry Run (no writes)', 'scanOptionChainForBestOiDryRun')
-      .addItem('🔬 Debug: Best-OI Raw Expiration Dates (one ticker)', 'debugBestOiExpirationDates')
-      .addItem('🔬 Debug: Validate & Update + Sort (stops before highlight)', 'validateAndUpdateDryRun'))
+      .addItem('Set Sector/Industry Override', 'setSectorOverride_')
+      .addItem('Clear Sector/Industry Override', 'clearSectorOverride_'))
+    // All debug tools live in this submenu — see the standing rule above onOpen's definition.
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Debug')
+      .addItem('Show Detected Columns', 'debugShowColumns')
+      .addItem('Fetch Raw Quote (one row)', 'debugFetchRawQuote')
+      .addItem('Fetch Earnings (one ticker)', 'debugFetchEarnings')
+      .addItem('Scan One Ticker\'s Chain', 'debugScanTickerChain')
+      .addItem('Scan Chain Dry Run (no writes)', 'scanOptionChainForBestOiDryRun')
+      .addItem('Best-OI Raw Expiration Dates (one ticker)', 'debugBestOiExpirationDates')
+      .addItem('Validate & Update + Sort (stops before highlight)', 'validateAndUpdateDryRun'))
     .addToUi();
 
   // Separate top-level menu for BestOpenInterest.gs's single-ticker,
@@ -1649,7 +1791,7 @@ function isCatalystPast_(value) {
  * automatically, same technique BestOpenInterest.gs's own
  * reconcileTrailingFormulas_ already uses for DeepDive's N:P columns —
  * this is the same idea, generalized to any column instead of a fixed
- * range, since Quick/Risky/Leap can each have formulas in different
+ * range, since Quick/Leap can each have formulas in different
  * places). A column with no formula anywhere is left alone entirely —
  * this never touches or invents a value in a column the script writes
  * directly (Ticker/Strike/Expiry/Score/etc.).
@@ -1828,9 +1970,7 @@ function debugScanTickerChain() {
   const type = typeInput === 'P' ? 'P' : (typeInput === 'C' ? 'C' : settings.type);
 
   const runTimestamp = new Date();
-  const strikeBoundNote = type === 'P'
-    ? ('Max Strike: ' + settings.minStrikePercent + '% above price')
-    : ('Min Strike: ' + settings.minStrikePercent + '% of price');
+  const strikeBoundNote = scannerLimitLabel_(Object.assign({}, settings, { type: type }));
   let output = 'Ticker: ' + ticker + ' (' + type + ')\n' +
     'Min Delta: ' + settings.minDelta + ' | Min Expiry: ' + settings.minExpiryDays + 'd' +
     (settings.maxExpiryDays != null ? (' | Max Expiry: ' + settings.maxExpiryDays + 'd') : '') +
@@ -1859,7 +1999,7 @@ function debugScanTickerChain() {
         ' | meeting expiry window: ' + tastyQualifying.length +
         ' (scanning nearest ' + Math.min(tastyQualifying.length, CHAIN_SCANNER_MAX_EXPIRIES_TO_SCAN) + ')\n';
 
-      const tastyBest = findBestOiFromTastyChain_(ticker, type, settings.minDelta, settings.minExpiryDays, settings.maxExpiryDays, settings.minStrikePercent, runTimestamp, accessToken);
+      const tastyBest = findBestOiFromTastyChain_(ticker, type, settings.minDelta, settings.minExpiryDays, settings.maxExpiryDays, settings.minStrikePercent, runTimestamp, accessToken, settings.premiumCapPercent);
       output += (tastyBest
         ? ('WOULD PICK (TastyTrade): $' + round2_(tastyBest.strike) + type + ' @ ' +
             Utilities.formatDate(tastyBest.expiry, Session.getScriptTimeZone(), 'yyyy-MM-dd') +
@@ -1908,7 +2048,7 @@ function debugScanTickerChain() {
 
     const underlying = chainInfo.underlying || expiryInfo.underlying;
     const strikeBounds = computeStrikeBounds_(type, settings.minStrikePercent, underlying);
-    let withOi = 0, withIv = 0, meetingDelta = 0, outsideStrikeBound = 0;
+    let withOi = 0, withIv = 0, meetingDelta = 0, outsideStrikeBound = 0, overPremiumCap = 0;
     let topByDelta = [];
 
     chainInfo.contracts.forEach(function (c) {
@@ -1924,6 +2064,9 @@ function debugScanTickerChain() {
 
       const estDelta = blackScholesDelta_(underlying, strike, dte, ivPct, type);
       if (estDelta == null) return;
+      const dbgBid = isPlausible_(c.bid, 0, null) ? parseFloat(c.bid) : null, dbgAsk = isPlausible_(c.ask, 0, null) ? parseFloat(c.ask) : null;
+      const dbgMark = (dbgBid != null && dbgAsk != null) ? (dbgBid + dbgAsk) / 2 : (isPlausible_(c.lastPrice, 0, null) ? c.lastPrice : null);
+      if (!scannerPremiumOk_(dbgMark, underlying, settings.premiumCapPercent)) { overPremiumCap++; return; }
       topByDelta.push({ strike: strike, oi: oi, delta: estDelta });
       if (Math.abs(estDelta) >= settings.minDelta) {
         meetingDelta++;
@@ -1934,7 +2077,8 @@ function debugScanTickerChain() {
     topByDelta.sort(function (a, b) { return Math.abs(b.delta) - Math.abs(a.delta); });
 
     output += dateLabel + ': ' + chainInfo.contracts.length + ' contracts, underlying=' + underlying +
-      ', withOI=' + withOi + ', withIV=' + withIv + ', outsideStrikeBound=' + outsideStrikeBound + ', meeting delta floor=' + meetingDelta + '\n';
+      ', withOI=' + withOi + ', withIV=' + withIv + ', outsideStrikeBound=' + outsideStrikeBound +
+      (settings.premiumCapPercent != null ? (', overPremiumCap=' + overPremiumCap) : '') + ', meeting delta floor=' + meetingDelta + '\n';
     if (topByDelta.length) {
       output += '  Highest-delta contracts seen: ' + topByDelta.slice(0, 3).map(function (t) {
         return '$' + round2_(t.strike) + ' Δ' + t.delta.toFixed(2) + ' OI' + t.oi;
@@ -2709,7 +2853,7 @@ function computeStrikeBounds_(type, minStrikePercent, underlying) {
 
 // Picks the highest-OI contract from a TastyTrade nested chain — real
 // delta and real OI throughout, no Black-Scholes estimate.
-function findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken) {
+function findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken, premiumCapPercent) {
   const expirations = fetchTastyOptionChainNested_(ticker, accessToken);
   if (!expirations) return null;
 
@@ -2751,8 +2895,9 @@ function findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExp
     const info = bySymbol[sym];
     if (!md || md.delta == null || md.oi == null || md.oi < 1) return;
     if (Math.abs(md.delta) < minDelta) return;
+    const mark = (md.bid != null && md.ask != null) ? (md.bid + md.ask) / 2 : null;
+    if (!scannerPremiumOk_(mark, underlying, premiumCapPercent)) return;
     if (!best || md.oi > best.oi) {
-      const mark = (md.bid != null && md.ask != null) ? (md.bid + md.ask) / 2 : null;
       best = {
         strike: info.strike, expiry: info.expiryDate, oi: md.oi, estDelta: md.delta, type: type,
         source: 'TastyTrade (real delta)', volume: md.volume, bid: md.bid, ask: md.ask,
@@ -2767,7 +2912,7 @@ function findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExp
 // Picks the highest-OI contract from Yahoo's chain — estimated delta via
 // Black-Scholes (Yahoo doesn't return real delta), used when TastyTrade
 // isn't configured or didn't have this ticker/chain.
-function findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp) {
+function findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, premiumCapPercent) {
   const expiryInfo = fetchYahooExpirationDatesForScanner_(ticker);
   Utilities.sleep(120);
   if (!expiryInfo || !expiryInfo.dates.length) return null;
@@ -2809,10 +2954,12 @@ function findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExp
       const estDelta = blackScholesDelta_(underlying, strike, dte, ivPct, type);
       if (estDelta == null || Math.abs(estDelta) < minDelta) return;
 
+      const bid = isPlausible_(c.bid, 0, null) ? parseFloat(c.bid) : null;
+      const ask = isPlausible_(c.ask, 0, null) ? parseFloat(c.ask) : null;
+      const mark = (bid != null && ask != null) ? (bid + ask) / 2 : (isPlausible_(c.lastPrice, 0, null) ? c.lastPrice : null);
+      if (!scannerPremiumOk_(mark, underlying, premiumCapPercent)) return;
+
       if (!best || oi > best.oi) {
-        const bid = isPlausible_(c.bid, 0, null) ? parseFloat(c.bid) : null;
-        const ask = isPlausible_(c.ask, 0, null) ? parseFloat(c.ask) : null;
-        const mark = (bid != null && ask != null) ? (bid + ask) / 2 : (isPlausible_(c.lastPrice, 0, null) ? c.lastPrice : null);
         best = {
           strike: strike, expiry: expiryDate, oi: oi, estDelta: estDelta, dte: dte, type: type,
           source: 'Yahoo (estimated delta)', volume: isPlausible_(c.volume, 0, null) ? c.volume : null,
@@ -2830,12 +2977,12 @@ function findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExp
 // (estimated delta) if TastyTrade isn't configured or comes back empty.
 // nothing qualifies anywhere in the scanned window.
 // ----------------------------------------------------------------------------
-function findHighestOiContractForScanner_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken) {
+function findHighestOiContractForScanner_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken, premiumCapPercent) {
   if (accessToken) {
-    const tastyResult = findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken);
+    const tastyResult = findBestOiFromTastyChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, accessToken, premiumCapPercent);
     if (tastyResult) return tastyResult;
   }
-  return findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp);
+  return findBestOiFromYahooChain_(ticker, type, minDelta, minExpiryDays, maxExpiryDays, minStrikePercent, runTimestamp, premiumCapPercent);
 }
 
 // ----------------------------------------------------------------------------
@@ -2894,7 +3041,7 @@ function debugBestOiExpirationDates() {
         bestOiScan: {
           tickers: [ticker], debug: true, type: settings.type, minDelta: settings.minDelta,
           minExpiryDays: settings.minExpiryDays, maxExpiryDays: settings.maxExpiryDays,
-          minStrikePercent: settings.minStrikePercent
+          minStrikePercent: settings.minStrikePercent, premiumCapPercent: settings.premiumCapPercent
         }
       }),
       muteHttpExceptions: true
@@ -2913,7 +3060,7 @@ function debugBestOiExpirationDates() {
   const info = json.debugInfo || {};
 
   let output = 'Ticker: ' + ticker + ' | Settings: ' + settings.type + ', delta>=' + settings.minDelta +
-    ', minExpiry=' + settings.minExpiryDays + 'd, maxExpiry=' + settings.maxExpiryDays + 'd, minStrike=' + settings.minStrikePercent + '%\n\n';
+    ', minExpiry=' + settings.minExpiryDays + 'd, maxExpiry=' + (settings.maxExpiryDays != null ? settings.maxExpiryDays + 'd' : 'none') + ', ' + scannerLimitLabel_(settings) + '\n\n';
 
   if (json.debugError) {
     output += 'ERROR: ' + json.debugError + '\n\n';
@@ -2947,7 +3094,7 @@ function debugBestOiExpirationDates() {
   ui.alert('Debug: Best-OI Raw Expiration Dates \u2014 ' + ticker, output.substring(0, 3500), ui.ButtonSet.OK);
 }
 
-function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings) {
+function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings, stats) {
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
   if (!cloudFunctionUrl || !sharedSecret) return {};
@@ -2984,7 +3131,7 @@ function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings) {
         bestOiScan: {
           tickers: tickers, type: settings.type, minDelta: settings.minDelta,
           minExpiryDays: settings.minExpiryDays, maxExpiryDays: settings.maxExpiryDays,
-          minStrikePercent: settings.minStrikePercent
+          minStrikePercent: settings.minStrikePercent, premiumCapPercent: settings.premiumCapPercent
         }
       }),
       muteHttpExceptions: true
@@ -3016,14 +3163,28 @@ function prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings) {
   // a real Date object — everything downstream (scanDte math, sheet
   // writes) expects a Date, same as findHighestOiContractForScanner_'s
   // own return shape.
+  // SAFETY NET: a backend pick is only accepted if it sits inside THIS scan's min/max expiry window (and premium cap).
+  // Anything else is discarded here, so that ticker falls through to the local per-row scan, which applies the same limits.
   const resultMap = {};
+  const discarded = [];
+  const nowForWindow = new Date();
   Object.keys(rawResults).forEach(function (ticker) {
     const r = rawResults[ticker];
-    resultMap[ticker] = {
+    const pick = {
       strike: r.strike, expiry: new Date(r.expiry), oi: r.oi, estDelta: r.estDelta, type: r.type,
       source: r.source, volume: r.volume, bid: r.bid, ask: r.ask, price: r.price, underlying: r.underlying
     };
+    const why = scannerPickViolation_(pick, settings, nowForWindow);
+    if (why) {
+      discarded.push(ticker + ' ' + (isNaN(pick.expiry.getTime()) ? '?' : Utilities.formatDate(pick.expiry, 'America/New_York', 'MMM d yyyy')) + ' (' + why + ')');
+      return;
+    }
+    resultMap[ticker] = pick;
   });
+  if (stats) stats.discarded = (stats.discarded || 0) + discarded.length;
+  if (discarded.length) {
+    logToSheet_('Cloud Function best-OI: discarded ' + discarded.length + ' pick(s) outside your limits, re-scanning those locally: ' + discarded.join('; '));
+  }
 
   logToSheet_('Cloud Function best-OI prefetch: ' + tickers.length + ' ticker(s) requested in ' + elapsedMs + 'ms \u2014 ' +
     Object.keys(resultMap).length + ' found a contract' +
@@ -3076,7 +3237,7 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
   const scriptStartTime = Date.now();
   const timeBudgetMs = timeBudgetMsOverride || EXECUTION_TIME_BUDGET_MS;
 
-  let updated = 0, noMatch = 0, skipped = 0, skippedActive = 0, fromTasty = 0, fromYahoo = 0;
+  let updated = 0, noMatch = 0, skipped = 0, skippedActive = 0, fromTasty = 0, fromYahoo = 0, rejectedByLimits = 0;
   let lastRowProcessed = DATA_START_ROW - 1;
   let timeBudgetExceeded = false;
 
@@ -3088,7 +3249,8 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
   // (which also tries Yahoo) for any ticker this didn't cover, so
   // nothing loses coverage if the Cloud Function is unavailable or
   // misses a specific ticker.
-  const bestOiMap = prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings);
+  const scanStats = { discarded: 0 };
+  const bestOiMap = prefetchBestOiViaCloudFunction_(sheet, map, lastRow, settings, scanStats);
 
   for (let row = DATA_START_ROW; row <= lastRow; row++) {
     if (Date.now() - scriptStartTime > timeBudgetMs) {
@@ -3113,9 +3275,17 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
     }
 
     const ticker = String(tickerVal).trim().toUpperCase();
-    const best = bestOiMap[ticker] || findHighestOiContractForScanner_(
-      ticker, settings.type, settings.minDelta, settings.minExpiryDays, settings.maxExpiryDays, settings.minStrikePercent, runTimestamp, accessToken
+    let best = bestOiMap[ticker] || findHighestOiContractForScanner_(
+      ticker, settings.type, settings.minDelta, settings.minExpiryDays, settings.maxExpiryDays, settings.minStrikePercent, runTimestamp, accessToken, settings.premiumCapPercent
     );
+
+    // Same safety net for whatever the local scan returned: never write a contract outside your expiry window / premium cap.
+    const limitViolation = best ? scannerPickViolation_(best, settings, runTimestamp) : null;
+    if (limitViolation) {
+      rejectedByLimits++;
+      logToSheet_('Scan Chain (' + sheet.getName() + ') row ' + row + ' ' + ticker + ': pick rejected - ' + limitViolation + '.');
+      best = null;
+    }
 
     if (!best) {
       noMatch++;
@@ -3182,9 +3352,7 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
     updated++;
   }
 
-  const strikeBoundLabel = settings.type === 'P'
-    ? ('Max Strike ' + settings.minStrikePercent + '% above price')
-    : ('Min Strike ' + settings.minStrikePercent + '% of price');
+  const strikeBoundLabel = scannerLimitLabel_(settings);
 
   notify_(ui, 'Chain scan complete (' + sheet.getName() + ')',
     (timeBudgetExceeded
@@ -3195,8 +3363,12 @@ function scanOptionChainForBestOi(sheetOverride, timeBudgetMsOverride, dryRun) {
       (settings.maxExpiryDays != null ? (' | Max Expiry ' + settings.maxExpiryDays + 'd') : '') +
       ' | ' + strikeBoundLabel + '\n\n' +
     'Updated: ' + updated + ' row(s) (' + fromTasty + ' from TastyTrade, ' + fromYahoo + ' from Yahoo)\n' +
-    'No contract met the floors within the nearest ' +
+    'No contract met the limits within the nearest ' +
       CHAIN_SCANNER_MAX_EXPIRIES_TO_SCAN + ' expirations: ' + noMatch + '\n' +
+    ((scanStats.discarded || rejectedByLimits)
+      ? ('Backend picks discarded for being outside your expiry window / premium cap: ' + scanStats.discarded +
+         (rejectedByLimits ? (' | local picks rejected: ' + rejectedByLimits) : '') + '\n')
+      : '') +
     'Skipped (no ticker): ' + skipped + '\n' +
     'Skipped (active position — Entry has a value): ' + skippedActive + '\n\n' +
     'Run Validate & Update next to pull fresh data for the new strikes/expiries.'
@@ -3430,11 +3602,11 @@ function computeRelativeStrengthPercent_(tickerBars, spyBars, lookbackDays) {
 }
 
 /* ============================================================================
- * QUICK/RISKY REVISED-FORMULA DATA HELPERS — all derived from the SAME
+ * QUICK REVISED-FORMULA DATA HELPERS — all derived from the SAME
  * daily bars already fetched for ATR%/RS above (ticker's own + SPY's),
  * so every function below costs zero extra network calls. Ticker-level
  * (not sheet-specific), computed once per ticker per run in
- * getCachedTickerData_ and shared by both Quick and Risky rows.
+ * getCachedTickerData_ and shared by both Quick rows.
  * ========================================================================== */
 
 // This ticker's OWN N-day return (not relative to SPY, unlike RS above) —
@@ -3442,11 +3614,6 @@ function computeRelativeStrengthPercent_(tickerBars, spyBars, lookbackDays) {
 // (see MOMENTUM_LOOKBACK_DAYS) since both sheets are day/swing-trade
 // horizons.
 const MOMENTUM_LOOKBACK_DAYS = 5;
-
-// Forward window for the Historical Hit Rate heuristic — matches both
-// Quick's and Risky's feasibilityMaxDays (5), so one computation serves
-// both sheets without needing a sheet-specific ticker cache.
-const HIT_RATE_FORWARD_DAYS = 5;
 
 function computeMomentumPercent_(tickerBars, lookbackDays) {
   if (!tickerBars || tickerBars.length <= lookbackDays) return null;
@@ -3492,7 +3659,7 @@ function computeRelativeVolumePercent_(tickerBars, avgPeriod) {
 }
 
 // Largest peak-to-trough decline over the bars window, as a % — feeds
-// Risky's "Drawdown Exposure" risk factor. A rolling-peak scan over
+// the Research / Hedge / Leap "least loss" factors. A rolling-peak scan over
 // ~2 months of daily bars; small-sample (this is a real number, but over
 // a short window, not a robust multi-year drawdown study).
 // Detects a sharp, short (<=3 day) drop confirmed by elevated volume
@@ -3548,30 +3715,6 @@ function computeMaxDrawdownPercent_(tickerBars) {
     }
   }
   return maxDrawdown;
-}
-
-// HEURISTIC "Historical Hit Rate" — % of rolling N-day windows in the
-// bars lookback where the stock moved at least one ATR%-sized move in the
-// favorable direction for optionType. This is a genuine calculation, but
-// over only ~2 months of daily bars it's a SHORT-WINDOW HEURISTIC, not a
-// statistically robust hit rate — small sample size per ticker. Surfaced
-// to the user as such in the Target cell note wherever it's used.
-function computeHistoricalHitRateHeuristic_(tickerBars, atrPercent, optionType, forwardDays) {
-  if (!tickerBars || tickerBars.length <= forwardDays + 1 || !isPlausible_(atrPercent, 0.01, null)) return null;
-
-  let hits = 0;
-  let total = 0;
-  for (let i = 0; i + forwardDays < tickerBars.length; i++) {
-    const startClose = tickerBars[i].close;
-    const endClose = tickerBars[i + forwardDays].close;
-    if (!isPlausible_(startClose, 0.01, null)) continue;
-    const movePercent = ((endClose - startClose) / startClose) * 100;
-    const directional = optionType === 'P' ? -movePercent : movePercent;
-    total++;
-    if (directional >= atrPercent) hits++;
-  }
-  if (total < 5) return null; // too few windows to say anything at all
-  return (hits / total) * 100;
 }
 
 function fetchYahooAssetProfile_(ticker) {
@@ -4381,7 +4524,6 @@ function atrOpportunityScore_(atrPercent) {
 // undervalues it just for being large, even a genuinely good candidate,
 // since large caps are structurally calmer. This narrower 1-3.5% scale
 // reflects what's actually normal within a large-cap-only pool instead.
-// Risky (uncapped) intentionally keeps using the original function above.
 function atrOpportunityScoreLargeCap_(atrPercent) {
   if (atrPercent == null || isNaN(atrPercent)) return 50;
   const clamped = clamp_(atrPercent, 1, 3.5);
@@ -4399,11 +4541,10 @@ function deltaExposureScore_(delta) {
 }
 
 /* ============================================================================
- * QUICK/RISKY REVISED-FORMULA SCORING HELPERS — normalize the raw bars-
+ * QUICK REVISED-FORMULA SCORING HELPERS — normalize the raw bars-
  * derived metrics above (and a few existing fields, reused in a new
  * direction) into 0-100 scores for the new Quick Score / Risk / Target
- * formulas. See computeQuickSheetScores_ / computeRiskySheetScores_
- * further down for how these combine.
+ * formulas. See the QUICK sections further down for how these combine.
  * ========================================================================== */
 
 // Trend factor: same directional shape as momentumAlignmentScore_, but
@@ -4445,7 +4586,7 @@ function ivRankRiskScore_(ivRank) {
   return clamp_(ivRank, 0, 100);
 }
 
-// Drawdown Exposure (Risky Risk factor): scores the ~2-month max
+// Drawdown exposure: scores the ~2-month max
 // drawdown — 5% or less is calm (low risk), 40%+ is scored as maximum
 // risk. Judgment-call clamp range, worth a sanity check against real
 // numbers once you see some.
@@ -4453,37 +4594,6 @@ function drawdownRiskScore_(maxDrawdownPercent) {
   if (maxDrawdownPercent == null || isNaN(maxDrawdownPercent)) return 50;
   const clamped = clamp_(maxDrawdownPercent, 5, 40);
   return ((clamped - 5) / 35) * 100;
-}
-
-// Option Risk (Risky Risk factor): blends execution risk (bid/ask
-// spread, reused from executionRiskScore_) with how much of the premium
-// is pure time value (higher extrinsic % = more decay exposure on a
-// position you might hold up to 2 weeks). Spread weighted heavier since
-// it's the more direct/reliable of the two signals.
-function optionRiskScore_(bidAskSpreadPct, extrinsicValue, optionPrice) {
-  const spreadComponent = executionRiskScore_(bidAskSpreadPct);
-  let extrinsicComponent = 50;
-  if (isPlausible_(extrinsicValue, 0, null) && isPlausible_(optionPrice, 0.01, null)) {
-    extrinsicComponent = clamp_((extrinsicValue / optionPrice) * 100, 0, 100);
-  }
-  return spreadComponent * 0.6 + extrinsicComponent * 0.4;
-}
-
-// Liquidity Risk (Risky Risk factor): the inverse of the existing
-// liquidityScore_ (which rewards high OI/Volume) — thin markets are the
-// risk here, not the opportunity.
-function liquidityRiskScore_(openInterest, volume) {
-  return 100 - liquidityScore_(openInterest, volume);
-}
-
-// Historical Hit Rate factor: the heuristic percentage from
-// computeHistoricalHitRateHeuristic_ IS already a 0-100 score (a hit
-// rate), so this just passes it through with the standard "unknown ->
-// neutral" fallback, kept as a named function so every factor in the
-// Target formulas has a matching *Score_ entry point.
-function historicalHitRateScore_(hitRatePercent) {
-  if (hitRatePercent == null || isNaN(hitRatePercent)) return 50;
-  return clamp_(hitRatePercent, 0, 100);
 }
 
 // Standard normal CDF via the Abramowitz-Stegun approximation (max error
@@ -4819,7 +4929,7 @@ function computeFilterScore_(inputs) {
 
 
 /* ============================================================================
- * PER-SHEET OBJECTIVE — RISK / FILTER / TARGET FOR "Quick" AND "Risky"
+ * PER-SHEET OBJECTIVE — RISK / FILTER / TARGET FOR "Quick"
  * ----------------------------------------------------------------------------
  * Both sheets share the same day/swing-trade shape, just with different
  * timing:
@@ -4835,7 +4945,6 @@ function computeFilterScore_(inputs) {
  *     hasn't shown up.
  *
  *   Quick:  minProfitPercent 3%, phaseShiftDays 30 (~1 month), maxHoldDays 60 (~2 months)
- *   Risky:  minProfitPercent 3%, phaseShiftDays 7  (~1 week),  maxHoldDays 14 (~2 weeks)
  *
  * Any OTHER sheet (or a sheet not in TRADE_OBJECTIVE_SHEETS below) keeps
  * the generic computeRiskScore_ / computeFilterScore_ above untouched, and
@@ -4869,17 +4978,9 @@ const TRADE_OBJECTIVE_SHEETS = {
     feasibilityIdealDays: 1,
     feasibilityMaxDays: 5
   },
-  'Risky': {
-    minProfitPercent: 3,
-    phaseShiftDays: 7,
-    maxHoldDays: 14,
-    lossConcernPercent: 15,
-    feasibilityIdealDays: 1,
-    feasibilityMaxDays: 5
-  },
   // Leap: long-term, stock-replacement hold — out at +50% or -10% on the
   // premium, held as long as it takes otherwise (no time-based phase
-  // shift or max-hold cutoff, unlike Quick/Risky). phaseShiftDays/
+  // shift or max-hold cutoff, unlike Quick). phaseShiftDays/
   // maxHoldDays set to Infinity so computeTargetForObjective_'s phase
   // never shifts to "breakeven" and the day-count maxHoldWarning below
   // never fires — the -10% loss check (lossThresholdWarning) is the
@@ -5023,7 +5124,7 @@ function computeTargetForObjective_(entryPrice, daysHeld, currentStockPrice, cur
 
 
 /* ============================================================================
- * QUICK & RISKY — REVISED FORMULAS (your custom weighting, replacing the
+ * QUICK — REVISED FORMULAS (your custom weighting, replacing the
  * generic objective-sheet Risk/Filter/Target above for these two sheets
  * specifically). Target's cell VALUE is now a PROBABILITY (%), not a
  * stock price — the underlying target stock price (from
@@ -5032,8 +5133,8 @@ function computeTargetForObjective_(entryPrice, daysHeld, currentStockPrice, cur
  * but no longer written to the cell itself.
  *
  * Order of computation per row (see validateAndUpdate): Target Score ->
- * Risk Score -> Quick Score, since Risky's Quick Score depends on its
- * own Target Score as an input.
+ * Risk Score -> Quick Score, since the Quick Score depends on the
+ * Target Score as an input.
  * ========================================================================== */
 
 // quality (15% in both filter and target) is the primary factor here —
@@ -5076,16 +5177,6 @@ const QUICK_SHEET_WEIGHTS = {
   target: { volProb: 27, momentum: 8, pullback: 8, rs: 11, sector: 8, trend: 8, volume: 3, marketRegime: 3, ivEvent: 3, trackRecord: 6, quality: 15 }
 };
 
-const RISKY_SHEET_WEIGHTS = {
-  quick: { rs: 25, requiredMove: 25, targetProb: 20, atr: 15, sector: 10, ivRank: 3, delta: 2 },
-  // Recovery Time's original 30% was folded into Drawdown Exposure (70%
-  // total) per your call — see the conversation this was built from.
-  risk: { drawdown: 70, optionRisk: 20, liquidityRisk: 10 },
-  // momentum's old weight (15) split evenly with pullback — same reason
-  // as Quick's target above.
-  target: { hitRate: 35, volProb: 20, momentum: 7.5, pullback: 7.5, rs: 10, sector: 7.5, marketRegime: 5, volume: 5, ivEvent: 2.5 }
-};
-
 // Horizon for the Volatility Probability factor: the sooner of days-to-
 // expiry or the sheet's own maxHoldDays, since you're out by then
 // regardless of whether the option's still alive.
@@ -5098,8 +5189,8 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
 }
 
 /* ============================================================================
- * QUICK & RISKY RISK — PREMIUM-LOSS MODEL (replaces the old volatility/
- * velocity Quick Risk and the drawdown-based Risky Risk).
+ * QUICK RISK — PREMIUM-LOSS MODEL (replaces the old volatility/
+ * velocity Quick Risk).
  *
  * What Risk means here (your definition): the fear of LOSING THE PREMIUM
  * you paid. Not "how much does this swing" — a volatile stock that
@@ -5133,9 +5224,6 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
  * and an extra gap move on the catalyst day. Volatility is backed out of
  * the option's own mark (calibrateVolToMark_, shared with Leap) so the
  * model doesn't start you "underwater" because of a stale IV quote.
- * Risky additionally blends in thin-liquidity risk (it trades thinner
- * chains; 10%).
- *
  * Daily moves are Student-t (4 degrees of freedom, scaled to the same
  * volatility) rather than bell-curve, so a sudden 10-20% drop is plausible —
  * that is the real danger of a deep in-the-money call, which falls almost
@@ -5156,11 +5244,10 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
  * premium-loss block above).
  * ========================================================================== */
 
-const QR_RISK_USE_PREMIUM_LOSS_MODEL = true; // false = previous formulas (computeQuickSheetRiskScoreVelocity_ / computeRiskySheetRiskScoreDrawdown_)
+const QR_RISK_USE_PREMIUM_LOSS_MODEL = true; // false = previous formula (computeQuickSheetRiskScoreVelocity_)
 
 const QR_RISK_MODEL = {
-  Quick: { winPercent: 3, winDays: 5, recoverDays: 60, lossTiers: [0.10, 0.25, 0.50], liquidityWeight: 0 },
-  Risky: { winPercent: 3, winDays: 5, recoverDays: 60, lossTiers: [0.10, 0.25, 0.50], liquidityWeight: 0.10 }
+  Quick: { winPercent: 3, winDays: 5, recoverDays: 60, lossTiers: [0.10, 0.25, 0.50] }
 };
 
 const QR_RISK_SIM = {
@@ -5229,7 +5316,7 @@ function qrNormals_() {
   return QR_NORMALS_CACHE_;
 }
 
-// Data-quality guard shared by the Quick/Risky/Leap models. An option can't sell
+// Data-quality guard shared by the Quick/Leap models. An option can't sell
 // for meaningfully less than its intrinsic value, and a call can't be worth more
 // than the stock (a put, more than the strike). When the inputs say otherwise, one
 // of them is stale or one-sided — typically a last-trade price from earlier in the
@@ -5374,9 +5461,7 @@ function computeQuickRiskyPremiumLoss_(sheetName, inputs) {
 // Risk (0-100) from a prepared context + sim result; null if not computable.
 function quickRiskyRiskFromSim_(ctx, r, inputs) {
   if (!ctx || !r) return null;
-  const lw = ctx.cfg.liquidityWeight;
-  const risk = lw > 0 ? (r.risk * (1 - lw) + liquidityRiskScore_(inputs.oi, inputs.volume) * lw) : r.risk;
-  return Math.round(risk * 10) / 10;
+  return Math.round(r.risk * 10) / 10;
 }
 
 function computeQuickRiskyRisk_(sheetName, inputs, holder) {
@@ -5395,13 +5480,8 @@ function computeQuickSheetRiskScore_(inputs, holder) {
   return computeQuickRiskyRisk_('Quick', inputs, holder);
 }
 
-function computeRiskySheetRiskScore_(inputs, holder) {
-  if (!QR_RISK_USE_PREMIUM_LOSS_MODEL) return computeRiskySheetRiskScoreDrawdown_(inputs);
-  return computeQuickRiskyRisk_('Risky', inputs, holder);
-}
-
 /* ----------------------------------------------------------------------------
- * QUICK & RISKY SCORE — "CAN THIS CONTRACT BANK +3% FAST?"
+ * QUICK SCORE — "CAN THIS CONTRACT BANK +3% FAST?"
  *
  * Score = the simulated chance (0-100) that THIS contract can be sold for at
  * least +3% over what you paid, after paying the bid/ask spread, within 5
@@ -5516,74 +5596,19 @@ function computeQuickSheetQuickScore_(inputs, config) {
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
-function computeRiskySheetRiskScoreDrawdown_(inputs) {
-  const w = RISKY_SHEET_WEIGHTS.risk;
-  const drawdown = drawdownRiskScore_(inputs.maxDrawdownPercent);
-  const optionRisk = optionRiskScore_(inputs.bidAskSpreadPct, inputs.extrinsicValue, inputs.optionPrice);
-  const liquidityRisk = liquidityRiskScore_(inputs.oi, inputs.volume);
-
-  const totalWeight = w.drawdown + w.optionRisk + w.liquidityRisk;
-  const weightedSum = drawdown * w.drawdown + optionRisk * w.optionRisk + liquidityRisk * w.liquidityRisk;
-  return Math.round((weightedSum / totalWeight) * 10) / 10;
-}
-
-function computeRiskySheetTargetScore_(inputs, config) {
-  const w = RISKY_SHEET_WEIGHTS.target;
-  const hitRatePercent = inputs.optionType === 'P' ? inputs.hitRatePutPercent : inputs.hitRateCallPercent;
-  const hitRate = historicalHitRateScore_(hitRatePercent);
-
-  const horizonDays = volatilityProbabilityHorizonDays_(inputs.daysToExpiry, config);
-  const volProbRaw = volatilityProbabilityScore_(
-    inputs.stockPrice, inputs.targetStockPrice, inputs.iv != null ? inputs.iv / 100 : null, horizonDays, inputs.optionType
-  );
-  const volProb = volProbRaw != null ? volProbRaw : 50;
-  const momentum = momentumAlignmentScore_(inputs.momentumPercent, inputs.optionType);
-  const pullback = pullbackOpportunityScore_(inputs.momentumPercent, inputs.optionType);
-  const rs = relativeStrengthScore_(inputs.rsPercent, inputs.optionType);
-  const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
-  const regime = marketRegimeScore_(inputs.marketRegimePercent, inputs.optionType);
-  const volume = relativeVolumeScore_(inputs.relativeVolumePercent);
-  const ivEvent = catalystRiskScore_(inputs.daysToCatalyst, SWING_WINDOW_DAYS);
-
-  const totalWeight = w.hitRate + w.volProb + w.momentum + w.pullback + w.rs + w.sector + w.marketRegime + w.volume + w.ivEvent;
-  const weightedSum = hitRate * w.hitRate + volProb * w.volProb + momentum * w.momentum + pullback * w.pullback + rs * w.rs +
-    sector * w.sector + regime * w.marketRegime + volume * w.volume + ivEvent * w.ivEvent;
-  return Math.round((weightedSum / totalWeight) * 10) / 10;
-}
-
-function computeRiskySheetQuickScore_(inputs, config) {
-  const w = RISKY_SHEET_WEIGHTS.quick;
-  const rs = relativeStrengthScore_(inputs.rsPercent, inputs.optionType);
-
-  const omega = computeOmega_(inputs.delta, inputs.stockPrice, inputs.optionPrice);
-  const daysToTarget = (omega != null) ? estimatedDaysForPremiumMove_(inputs.atrPercent, omega, config.minProfitPercent) : null;
-  const requiredMove = targetFeasibilityScoreForObjective_(daysToTarget, config);
-
-  const targetProb = isPlausible_(inputs.targetScoreValue, 0, 100) ? inputs.targetScoreValue : 50;
-  const atr = atrOpportunityScore_(inputs.atrPercent);
-  const sector = sectorAlignmentScore_(inputs.sectorPercent, inputs.optionType);
-  const ivRank = ivRankSuitabilityScore_(inputs.ivRank);
-  const delta = deltaExposureScore_(inputs.delta);
-
-  const totalWeight = w.rs + w.requiredMove + w.targetProb + w.atr + w.sector + w.ivRank + w.delta;
-  const weightedSum = rs * w.rs + requiredMove * w.requiredMove + targetProb * w.targetProb + atr * w.atr +
-    sector * w.sector + ivRank * w.ivRank + delta * w.delta;
-  return Math.round((weightedSum / totalWeight) * 10) / 10;
-}
-
 
 /* ============================================================================
  * LEAP — REVISED FORMULAS (long-term stock-replacement hold: out at +50%
  * profit or -10% loss; long-dated, high-delta to mimic stock; capital
- * efficiency matters here in a way it deliberately doesn't on Quick/
- * Risky). Same Filter/Risk/Target architecture as Quick & Risky above —
+ * efficiency matters here in a way it deliberately doesn't on Quick).
+ * Same Filter/Risk/Target architecture as Quick above —
  * Target is a PROBABILITY (%), same convention: the underlying target
  * stock price is still computed (anchors Volatility Probability) and
  * shown in the cell's note, not written to the cell itself.
  * ========================================================================== */
 
 // filter's and target's momentum weights each split evenly with a new
-// pullback weight — same reasoning as Quick/Risky's target above.
+// pullback weight — same reasoning as Quick's target above.
 const LEAP_SHEET_WEIGHTS = {
   filter: { quality: 25, upside: 20, delta: 20, capitalEfficiency: 20, liquidity: 10, momentum: 2.5, pullback: 2.5 },
   risk: { velocity: 60, catalystRisk: 20, execution: 20 },
@@ -5609,7 +5634,7 @@ function computeLeapSheetFilterScore_(inputs) {
 
 // Reuses velocityRiskScoreLeap_ (5-90 day scale) and LEAP_LOSS_TOLERANCE_
 // PERCENT (10%) — same underlying "how many days to swing against your
-// actual loss threshold" idea as Quick/Risky's Risk, just calibrated to
+// actual loss threshold" idea as Quick's Risk, just calibrated to
 // a multi-month hold instead of days.
 /* ============================================================================
  * LEAP RISK — ONE-MONTH PREMIUM-LOSS MODEL (replaces the old velocity-based
@@ -5618,7 +5643,7 @@ function computeLeapSheetFilterScore_(inputs) {
  * Your Leap objective: a stock proxy held as long as you can, so Risk asks
  * one thing — "if I buy this TODAY, what's the chance the premium is down
  * 10% / 20% / 30% a month from now?" There is no profit-target/firefight
- * phase here like Quick/Risky, so no path simulation is needed: it is the
+ * phase here like Quick, so no path simulation is needed: it is the
  * probability that the stock lands (at the 30-day mark) below the price at
  * which the option would be worth that much less — a closed-form lognormal
  * calculation, zero drift, volatility = this contract's own IV.
@@ -5831,7 +5856,38 @@ function computeLeapSheetRiskScore_(inputs, holder) {
  * year-end snapshot, not "touched +50% at any point", so it understates a bit.
  * ------------------------------------------------------------------------- */
 const LEAP_SCORE_USE_UPSIDE_PROBABILITY = true; // false = previous Leap Score (Filter/Target/Risk blend, SCORE_WEIGHTS_BY_SHEET)
-const LEAP_SCORE_MODEL = { horizonDays: 365, minDaysLeft: 60, tiltMaxSd: 0.25 };
+// tiltSource: 'stock' (default) tilts the 12-month expected move using STOCK-level factors only (trend vs the 200-day
+// average, nearness to the 52-week high, quality, analyst upside). 'filter' restores the previous tilt from the Leap
+// Filter, half of which (delta, capital efficiency, liquidity) describes the CONTRACT and is already priced inside the
+// probability itself, so it counted twice.
+const LEAP_SCORE_MODEL = { horizonDays: 365, minDaysLeft: 60, tiltMaxSd: 0.25, tiltSource: 'stock' };
+const LEAP_STOCK_TILT_WEIGHTS = { trend: 30, nearHigh: 25, quality: 25, upside: 20 };   // starting weights, not backtested
+
+// Shared by the Leap Score tilt and the Leap Research score. d = { t200, x50, offHigh } or null; returns 0-100, or null when missing.
+function leapTrendComponent_(d) {
+  if (!d || d.t200 == null || !isFinite(d.t200)) return null;
+  const c01 = function (x) { return Math.max(0, Math.min(1, x)); };
+  const t200c = c01((d.t200 + 10) / 35);                                       // -10% -> 0, 0 -> 0.29, +10% -> 0.57, +25% -> 1
+  const x50c = (d.x50 != null && isFinite(d.x50)) ? c01((d.x50 + 5) / 15) : t200c;   // -5% -> 0, +10% -> 1
+  return (0.6 * t200c + 0.4 * x50c) * 100;
+}
+function leapNearHighComponent_(d) {
+  if (!d || d.offHigh == null || !isFinite(d.offHigh)) return null;
+  return Math.max(0, Math.min(1, 1 - d.offHigh / 40)) * 100;                   // at the high -> 100, 20% off -> 50, 40%+ off -> 0
+}
+
+// 0-100 stock-setup score for the Leap Score tilt. inputs: { daily: {t200,x50,offHigh}|null, ratingScore, upsidePercent, optionType }.
+// Missing daily data makes trend and near-high neutral (50) and sets dailyMissing so the note can say so.
+function computeLeapStockTilt_(inputs) {
+  const W = LEAP_STOCK_TILT_WEIGHTS;
+  const t = leapTrendComponent_(inputs.daily), h = leapNearHighComponent_(inputs.daily);
+  const trendComp = t == null ? 50 : t, nearComp = h == null ? 50 : h;
+  const quality = qualityScore_(inputs.ratingScore);
+  const upside = upsideAlignmentScore_(inputs.upsidePercent, inputs.optionType);
+  const total = W.trend + W.nearHigh + W.quality + W.upside;
+  const score = (trendComp * W.trend + nearComp * W.nearHigh + quality * W.quality + upside * W.upside) / total;
+  return { score: Math.round(score * 10) / 10, trend: Math.round(trendComp), nearHigh: Math.round(nearComp), quality: Math.round(quality), upside: Math.round(upside), dailyMissing: (t == null || h == null) };
+}
 
 // Color bands for the new scales (green = good for Score, green = low for Risk).
 // Both sets of cut-offs are guesses fitted to a handful of sample rows (Score ran ~14-25,
@@ -5869,7 +5925,7 @@ function computeLeapUpsideScore_(inputs, filterScoreValue) {
 }
 
 /* ----------------------------------------------------------------------------
- * RANKING — RISK GATE FIRST, THEN SCORE (Quick, Risky and Leap tabs)
+ * RANKING — RISK GATE FIRST, THEN SCORE (Quick and Leap tabs)
  *
  * Your rule: look at Risk first; if it is low enough, look at Score and pick.
  * So each of these tabs is ordered like that:
@@ -5887,7 +5943,7 @@ function computeLeapUpsideScore_(inputs, filterScoreValue) {
  * #5; if only two pass, only two are marked, and if none pass, none are.
  *
  * Gates are set to the top of each tab's yellow Risk band (anything red fails):
- * Leap 30 (chance of a 20% premium drop in a month), Quick/Risky 25 (chance of
+ * Leap 30 (chance of a 20% premium drop in a month), Quick 25 (chance of
  * ending stuck and down at the 60-day limit). They are starting points — adjust
  * once you've seen real values. Set a tab's `enabled` to false to put it back
  * to a plain Score sort with the brown top-5 border.
@@ -5895,8 +5951,9 @@ function computeLeapUpsideScore_(inputs, filterScoreValue) {
 const LEAP_RISK_GATE = 30;
 const GATE_RANKING_BY_SHEET = {
   'Quick': { enabled: true, gate: 25 },
-  'Risky': { enabled: true, gate: 25 },
-  'Leap':  { enabled: true, gate: LEAP_RISK_GATE }
+  // requireUptrend: on the Leap tab, rows whose T200 is at or below 0 (price under its 200-day average) sort behind rows that pass,
+  // and never get the green top-5 border. Needs the T200 column; set false to rank on Risk and Score alone.
+  'Leap':  { enabled: true, gate: LEAP_RISK_GATE, requireUptrend: true }
 };
 const GATE_SORT_KEY_HEADER = 'SortKey';
 const GATE_TOP_BORDER_COLORS = ['#00a843', '#2fbd5f', '#5fce80', '#8fdea1', '#b9ecc3']; // best -> fifth
@@ -5913,15 +5970,19 @@ function gateConfigForSheet_(sheetName, map) {
 }
 
 // Higher key = higher on the sheet (sheet is sorted by this column, descending).
-function gateSortKey_(risk, score, gate) {
+function gateSortKey_(risk, score, gate, t200) {
   if (!gateIsNum_(risk)) return -1;                       // no Risk -> bottom
   const r = Number(risk);
-  if (r <= gate) return 1000 + (gateIsNum_(score) ? Number(score) : -1); // passes: by Score
+  const downtrend = gateIsNum_(t200) && Number(t200) <= 0;   // only when the caller supplies T200 (Leap, requireUptrend)
+  if (r <= gate) {
+    const sc = gateIsNum_(score) ? Number(score) : -1;
+    return downtrend ? 750 + sc : 1000 + sc;              // passes Risk: by Score; a downtrend sorts behind rows that pass both
+  }
   return 500 - r;                                         // over the gate: lowest Risk first
 }
 
 // Fills the helper column and sorts the whole data range by it. Returns true if it sorted.
-function gateSort_(sheet, map, lastRow, gate) {
+function gateSort_(sheet, map, lastRow, gate, trendCol) {
   if (!map.score || !map.riskScore) return false;
   const numRows = lastRow - DATA_START_ROW + 1;
   if (numRows <= 1) return false;
@@ -5939,8 +6000,9 @@ function gateSort_(sheet, map, lastRow, gate) {
 
   const scores = sheet.getRange(DATA_START_ROW, map.score, numRows, 1).getValues();
   const risks = sheet.getRange(DATA_START_ROW, map.riskScore, numRows, 1).getValues();
+  const trends = trendCol ? sheet.getRange(DATA_START_ROW, trendCol, numRows, 1).getValues() : null;
   const keys = [];
-  for (let i = 0; i < numRows; i++) keys.push([gateSortKey_(risks[i][0], scores[i][0], gate)]);
+  for (let i = 0; i < numRows; i++) keys.push([gateSortKey_(risks[i][0], scores[i][0], gate, trends ? trends[i][0] : null)]);
   sheet.getRange(DATA_START_ROW, keyCol, numRows, 1).setValues(keys);
 
   sheet.getRange(DATA_START_ROW, 1, numRows, sheet.getLastColumn()).sort({ column: keyCol, ascending: false });
@@ -5950,15 +6012,17 @@ function gateSort_(sheet, map, lastRow, gate) {
 // After the sort: marks the top rows that pass the gate with a graded-green
 // border on the Score cell. Borders don't travel with a sort, so this reads the
 // FINAL positions. Returns [{ row, score }] like applyTopFilterHighlight_.
-function applyGateHighlight_(sheet, map, lastRow, gate) {
+function applyGateHighlight_(sheet, map, lastRow, gate, trendCol) {
   const numRows = lastRow - DATA_START_ROW + 1;
   if (!map.score || !map.riskScore || numRows <= 0) return [];
   const scores = sheet.getRange(DATA_START_ROW, map.score, numRows, 1).getValues();
   const risks = sheet.getRange(DATA_START_ROW, map.riskScore, numRows, 1).getValues();
+  const trends = trendCol ? sheet.getRange(DATA_START_ROW, trendCol, numRows, 1).getValues() : null;
 
   const passing = [];
   for (let i = 0; i < numRows; i++) {
-    if (gateIsNum_(risks[i][0]) && gateIsNum_(scores[i][0]) && Number(risks[i][0]) <= gate) {
+    const inDowntrend = trends && gateIsNum_(trends[i][0]) && Number(trends[i][0]) <= 0;
+    if (gateIsNum_(risks[i][0]) && gateIsNum_(scores[i][0]) && Number(risks[i][0]) <= gate && !inDowntrend) {
       passing.push({ row: DATA_START_ROW + i, score: Number(scores[i][0]), risk: Number(risks[i][0]) });
     }
   }
@@ -6015,23 +6079,22 @@ function computeLeapSheetTargetScore_(inputs, config) {
 
 
 /* ============================================================================
- * COMBINED SCORE — the single ranking metric for Quick/Risky/Leap: a
+ * COMBINED SCORE — the single ranking metric for Quick/Leap: a
  * weighted blend of Filter, Target Probability, and (100 - Risk). Just a
  * final roll-up of numbers already computed above elsewhere in this file —
  * not a new data source, no extra network calls. Written to a "Score"
- * column (add that header on the Quick/Risky/Leap tabs to enable it) and
+ * column (add that header on the Quick/Leap tabs to enable it) and
  * used as the new ranking/sort/top-5-border key on those three sheets.
  * ========================================================================== */
 
-// Quick and Risky: Score no longer includes Risk at all (risk: 0). Risk is a
-// separate premium-loss readout (see QUICK & RISKY RISK above), kept out of
+// Quick: Score no longer includes Risk at all (risk: 0). Risk is a
+// separate premium-loss readout (see QUICK RISK above), kept out of
 // the ranking on purpose. The old Filter:Target proportions are preserved
-// (Quick 50:30 -> 62.5:37.5, Risky 45:25 -> 64.3:35.7) so the two weights
+// (Quick 50:30 -> 62.5:37.5) so the two weights
 // still sum to 1. Leap is unchanged. To put Risk back, set risk > 0 and
 // reduce filter/targetProb so the three sum to 1.
 const SCORE_WEIGHTS_BY_SHEET = {
   'Quick': { filter: 0.50 / 0.80, targetProb: 0.30 / 0.80, risk: 0 },
-  'Risky': { filter: 0.45 / 0.70, targetProb: 0.25 / 0.70, risk: 0 },
   'Leap':  { filter: 0.50, targetProb: 0.20, risk: 0.30 }
 };
 
@@ -6058,7 +6121,7 @@ function computeCombinedScore_(sheetName, filterScoreValue, targetProbabilityVal
  * run — everything else on the sheet (Risk/Filter bands, sign-based font
  * colors) is left completely alone.
  *
- * On Quick/Risky/Leap (once a "Score" column exists), the ranking key is
+ * On Quick/Leap (once a "Score" column exists), the ranking key is
  * Score instead of Filter Score — see rankKey/rankLabel below and the two
  * call sites near the end of validateAndUpdate.
  *
@@ -6133,7 +6196,7 @@ function applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel) {
   return ranked;
 }
 
-// BEST SCORE ROW LOOKUP (Quick/Risky/Leap only) — read-only, no longer
+// BEST SCORE ROW LOOKUP (Quick/Leap only) — read-only, no longer
 // paints a special highlight on the winning row (removed per request: the
 // top row should look like any other, banded the same way via its own
 // Filter/Risk/Target/Score values via higherIsBetterBandColor_, with
@@ -6166,7 +6229,7 @@ function findBestScoreRow_(sheet, map, lastRow) {
 // Sorts the entire data range (every column, not just the tracked ones —
 // this includes your own PtC/PtN/Invested formulas, so their same-row
 // relative references move correctly with their row, same as a native
-// manual sort) by the given sortKey descending (Score on Quick/Risky/Leap
+// manual sort) by the given sortKey descending (Score on Quick/Leap
 // once that column exists, Filter Score everywhere else — see the two
 // call sites near the end of validateAndUpdate). Called BEFORE both top-5
 // highlights now (not after) — see the doc comment above
@@ -6460,6 +6523,377 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
   return results;
 }
 
+// Quick exit decision for a HELD row (one with an Entry price). profitPct is the gain vs Entry counted at the sell price
+// (after the spread). Used by both the sheet run and the 5-minute watch so the two always agree.
+function evaluateQuickExit_(iv, profitPct, S) {
+  if (!iv || iv.rsi1m == null || profitPct == null || !isFinite(profitPct)) return { exit: false, fading: false };
+  if (profitPct >= S.exitMinProfitPct && iv.rsi1m >= S.exitRsiMin) return { exit: true, fading: iv.aroonUp != null && iv.aroonUp < S.exitStrongAupBelow };
+  return { exit: false, fading: false };
+}
+
+function alertLineExit_(ticker, strike, expiryText, iv, profitPct, fading, optionPrice) {
+  const parts = ['EXIT ' + ticker + ' ' + strike + ' ' + expiryText];
+  if (optionPrice != null && isFinite(optionPrice)) parts.push('opt $' + (Math.round(optionPrice * 100) / 100));
+  parts.push('up ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry after spread');
+  parts.push('R30 ' + iv.rsi1m + ' | AUP ' + iv.aroonUp + (fading ? ' (momentum fading)' : ''));
+  return parts.join(' | ');
+}
+
+// Leap decision for one row from daily indicators d = { t200, x50, rsi14d, offHigh } and
+// x = { ivr, sprd, carry, riskOk, held, profitPct }. Returns { kind, missing, why }:
+//   kind 'strong' | 'light' | 'exit-trend' | 'exit-profit' | 'none'
+function evaluateLeapState_(d, x, L) {
+  const num = function (v) { return v != null && isFinite(v); };
+  if (!d || !num(d.t200)) return { kind: 'none', missing: [], why: 'no daily data' };
+  if (x.held) {
+    if (d.t200 < 0) return { kind: 'exit-trend', missing: [], why: 'price is below its 200-day average' };
+    if (num(x.profitPct) && x.profitPct >= L.takeProfitPct) return { kind: 'exit-profit', missing: [], why: 'option is up ' + (Math.round(x.profitPct * 10) / 10) + '% vs Entry' };
+    return { kind: 'none', missing: [], why: 'held, trend intact' };
+  }
+  if (!(d.t200 > 0 && num(d.x50) && d.x50 > 0)) return { kind: 'none', missing: [], why: d.t200 <= 0 ? 'below the 200-day average' : 'no golden-cross state (50-day not above 200-day)' };
+  if (!x.riskOk) return { kind: 'none', missing: [], why: 'Risk above the Leap gate' };
+  const missing = [];
+  if (!(num(d.offHigh) && d.offHigh <= L.strongMaxOffHigh)) missing.push('off the high ' + (num(d.offHigh) ? d.offHigh + '%' : 'n/a') + ' (needs ' + L.strongMaxOffHigh + '% or less)');
+  if (!(num(d.rsi14d) && d.rsi14d <= L.strongMaxRsi)) missing.push('daily RSI ' + (num(d.rsi14d) ? d.rsi14d : 'n/a') + ' (needs ' + L.strongMaxRsi + ' or lower: wait for a pullback)');
+  if (!(num(x.ivr) && x.ivr <= L.maxIvr)) missing.push('IV Rank ' + (num(x.ivr) ? Math.round(x.ivr) : 'n/a') + ' (needs ' + L.maxIvr + ' or lower)');
+  if (!(num(x.sprd) && x.sprd <= L.maxSpreadPct)) missing.push('spread ' + (num(x.sprd) ? (Math.round(x.sprd * 100) / 100) + '%' : 'n/a') + ' (needs ' + L.maxSpreadPct + '% or less)');
+  if (!(num(x.carry) && x.carry <= L.maxCarryPct)) missing.push('carry ' + (num(x.carry) ? (Math.round(x.carry * 10) / 10) + '%/yr' : 'n/a') + ' (needs ' + L.maxCarryPct + '% or less)');
+  if (!missing.length) return { kind: 'strong', missing: [], why: '' };
+  if (num(d.offHigh) && d.offHigh <= L.lightMaxOffHigh && num(d.rsi14d) && d.rsi14d <= L.lightMaxRsi) return { kind: 'light', missing: missing, why: 'waiting: ' + missing.join('; ') };
+  return { kind: 'none', missing: missing, why: 'trend fine, no pullback yet' };
+}
+
+function alertLineLeap_(kind, ticker, strike, expiryText, d, x) {
+  const head = kind === 'strong' ? 'ENTRY' : (kind === 'light' ? 'READY' : (kind === 'exit-trend' ? 'EXIT (below 200-day)' : 'PROFIT'));
+  const sg = function (v) { return (v >= 0 ? '+' : '') + v; };
+  const parts = [head + ' ' + ticker + ' ' + strike + ' ' + expiryText];
+  if (x.optionPrice != null && isFinite(x.optionPrice)) parts.push('opt $' + (Math.round(x.optionPrice * 100) / 100));
+  parts.push('T200 ' + sg(d.t200) + '% | OFFH ' + d.offHigh + '% | R14D ' + d.rsi14d);
+  if (x.ivr != null && isFinite(x.ivr)) parts.push('IVR ' + Math.round(x.ivr));
+  if (x.carry != null && isFinite(x.carry)) parts.push('carry ' + (Math.round(x.carry * 10) / 10) + '%/yr');
+  if (x.sprd != null && isFinite(x.sprd)) parts.push('sprd ' + (Math.round(x.sprd * 100) / 100) + '%');
+  if (kind.indexOf('exit') === 0 && x.profitPct != null && isFinite(x.profitPct)) parts.push('P&L ' + sg(Math.round(x.profitPct * 10) / 10) + '%');
+  if (kind === 'light' && x.why) parts.push(x.why);
+  return parts.join(' | ');
+}
+
+// The shared entry decision (used by the sheet run and the 5-minute signal watch): given fresh intraday values for a
+// contract that already passed the Risk / spread / time gates, is it a strong ENTRY, a light "get ready", or nothing?
+function evaluateEntryLevel_(iv, S, spyHead) {
+  const trend = iv.aroonUp >= S.trendAupMin && iv.aroonDown <= S.trendAdnMax;
+  if (!trend) return { level: null, dip: false, missing: [] };
+  const rising = iv.rsiPrev != null && iv.rsi1m > iv.rsiPrev;
+  const dip = iv.rsiMin5 != null && iv.rsiMin5 <= S.dipRsi && rising && iv.rsi1m <= S.recoverRsiMax;
+  if (dip) {
+    const missing = [];
+    if (!(iv.vwapPct != null && iv.vwapPct >= S.vwapMinPct)) missing.push('price vs VWAP ' + (iv.vwapPct != null ? iv.vwapPct + '%' : 'n/a') + ' (needs ' + S.vwapMinPct + '% or better)');
+    if (!(iv.rvol != null && iv.rvol >= S.rvolMin)) missing.push('relative volume ' + (iv.rvol != null ? iv.rvol : 'n/a') + ' (needs ' + S.rvolMin + '+)');
+    if (spyHead) missing.push('SPY headwind');
+    return { level: missing.length ? 'light' : 'strong', dip: true, missing: missing };
+  }
+  if (iv.rsi1m <= S.lightRsiMax) return { level: 'light', dip: false, missing: [] };
+  return { level: null, dip: false, missing: [] };
+}
+
+/* ============================================================================
+ * PHONE ALERTS — push a notification when a Quick row turns light or strong green.
+ * Provider settings live in Script Properties (set via the menu, never in the sheet):
+ *   ALERT_ENABLED 'true'/'false', ALERT_PROVIDER 'pushover' | 'ntfy',
+ *   ALERT_PROVIDER 'telegram' also accepted (TELEGRAM_TOKEN + TELEGRAM_CHAT_ID).
+ *   PUSHOVER_USER + PUSHOVER_TOKEN, or NTFY_TOPIC (+ optional NTFY_SERVER, NTFY_TOKEN).
+ * One notification per run per tab (all new signals batched), deduped in ALERT_STATE.
+ * ========================================================================== */
+function getAlertConfig_() {
+  const p = PropertiesService.getScriptProperties().getProperties();
+  const provider = p.ALERT_PROVIDER || '';
+  const ready = p.ALERT_ENABLED === 'true' && ((provider === 'pushover' && !!p.PUSHOVER_USER && !!p.PUSHOVER_TOKEN) || (provider === 'ntfy' && !!p.NTFY_TOPIC) || (provider === 'telegram' && !!p.TELEGRAM_TOKEN && !!p.TELEGRAM_CHAT_ID));
+  return { ready: ready, enabled: p.ALERT_ENABLED === 'true', provider: provider, pushoverUser: p.PUSHOVER_USER, pushoverToken: p.PUSHOVER_TOKEN,
+    ntfyTopic: p.NTFY_TOPIC, ntfyServer: p.NTFY_SERVER || 'https://ntfy.sh', ntfyToken: p.NTFY_TOKEN,
+    telegramToken: p.TELEGRAM_TOKEN, telegramChatId: p.TELEGRAM_CHAT_ID };
+}
+
+// Sends one push. Returns { ok, detail }; never throws.
+function sendPhoneAlert_(cfg, title, body, high) {
+  try {
+    if (cfg.provider === 'pushover') {
+      const resp = UrlFetchApp.fetch('https://api.pushover.net/1/messages.json', {
+        method: 'post', muteHttpExceptions: true,
+        payload: { token: cfg.pushoverToken, user: cfg.pushoverUser, title: String(title).slice(0, 240), message: String(body).slice(0, 1000), priority: high ? '1' : '0' }
+      });
+      let status = null;
+      try { status = JSON.parse(resp.getContentText()).status; } catch (e) { /* ignore */ }
+      return { ok: resp.getResponseCode() === 200 && status === 1, detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+    }
+    if (cfg.provider === 'telegram') {
+      // Telegram's limits are per bot (about 1 message/second per chat), not per sending IP, so Apps Script's shared servers are fine.
+      const resp = UrlFetchApp.fetch('https://api.telegram.org/bot' + cfg.telegramToken + '/sendMessage', {
+        method: 'post', muteHttpExceptions: true,
+        payload: { chat_id: String(cfg.telegramChatId), text: (String(title) + '\n' + String(body)).slice(0, 4000) }
+      });
+      let okFlag = false;
+      try { okFlag = JSON.parse(resp.getContentText()).ok === true; } catch (e) { /* ignore */ }
+      return { ok: resp.getResponseCode() === 200 && okFlag, detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+    }
+    if (cfg.provider === 'ntfy') {
+      const headers = { Title: String(title).replace(/[^\x20-\x7e]/g, '?'), Priority: high ? '4' : '3', Tags: high ? 'chart_with_upwards_trend' : 'eyes' };
+      if (cfg.ntfyToken) headers.Authorization = 'Bearer ' + cfg.ntfyToken;
+      const resp = UrlFetchApp.fetch(cfg.ntfyServer.replace(/\/$/, '') + '/' + encodeURIComponent(cfg.ntfyTopic), {
+        method: 'post', muteHttpExceptions: true, contentType: 'text/plain; charset=utf-8', payload: String(body), headers: headers
+      });
+      return { ok: resp.getResponseCode() === 200, detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+    }
+    return { ok: false, detail: 'No alert provider configured.' };
+  } catch (e) {
+    return { ok: false, detail: String(e) };
+  }
+}
+
+function alertLine_(level, ticker, strike, expiryText, iv, meta, fz, why) {
+  const parts = [(level === 'strong' ? 'ENTRY ' : 'READY ') + ticker + ' ' + strike + ' ' + expiryText];
+  if (meta && meta.optionPrice != null && isFinite(meta.optionPrice)) parts.push('opt $' + (Math.round(meta.optionPrice * 100) / 100));
+  parts.push('AUP ' + iv.aroonUp + ' ADN ' + iv.aroonDown + ' R30 ' + iv.rsi1m);
+  if (iv.vwapPct != null) parts.push('VW ' + (iv.vwapPct >= 0 ? '+' : '') + iv.vwapPct + '%');
+  if (iv.rvol != null) parts.push('RV ' + iv.rvol + 'x');
+  if (fz) parts.push('P1D ' + fz.prob + '%');
+  if (level === 'light' && why) parts.push(why);
+  return parts.join(' | ');
+}
+
+// Batches this run's green rows into ONE push. A row is sent when it is new, when it rises from get-ready to ENTRY,
+// or again after ALERT_CFG.repeatMin minutes. State is only updated if the push actually went out.
+function dispatchEntryAlerts_(tab, items, now) {
+  try {
+    if (!items || !items.length) return;
+    const cfg = getAlertConfig_();
+    if (!cfg.ready) return;
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(3000)) return;
+    try {
+      const props = PropertiesService.getScriptProperties();
+      let state = {};
+      try { state = JSON.parse(props.getProperty('ALERT_STATE') || '{}'); } catch (e) { state = {}; }
+      const nowMs = now.getTime();
+      const rank = { light: 1, strong: 2, exit: 3 };
+      const isLeap = tab === 'Leap';
+      const repeatFor = function (it) { return it.level === 'exit' ? (isLeap ? ALERT_CFG.exitRepeatMin : ALERT_CFG.quickExitRepeatMin) : (isLeap ? ALERT_CFG.leapRepeatMin : ALERT_CFG.repeatMin); };
+      const fresh = items.filter(function (it) {
+        if (it.level === 'light' && !(isLeap ? ALERT_CFG.leapAlertLight : ALERT_CFG.alertLight)) return false;
+        const prev = state[it.key];
+        if (!prev) return true;
+        if (rank[it.level] > prev.l) return true;
+        return nowMs - prev.t >= repeatFor(it) * 60000;
+      });
+      if (!fresh.length) return;
+      fresh.sort(function (a, b) { return rank[b.level] - rank[a.level]; });
+      const nStrong = fresh.filter(function (it) { return it.level === 'strong'; }).length;
+      const nExit = fresh.filter(function (it) { return it.level === 'exit'; }).length;
+      const nLight = fresh.length - nStrong - nExit;
+      const title = tab + ': ' + [nExit ? nExit + ' EXIT' : '', nStrong ? nStrong + ' ENTRY' : '', nLight ? nLight + ' get ready' : ''].filter(Boolean).join(', ');
+      const lines = fresh.slice(0, 6).map(function (it) { return it.line; });
+      if (fresh.length > 6) lines.push('+' + (fresh.length - 6) + ' more on the sheet');
+      const res = sendPhoneAlert_(cfg, title, lines.join('\n'), nStrong > 0 || nExit > 0);
+      if (res.ok) {
+        fresh.forEach(function (it) { state[it.key] = { l: rank[it.level], t: nowMs }; });
+        Object.keys(state).forEach(function (k) { if (nowMs - state[k].t > 12 * 3600000) delete state[k]; });
+        props.setProperty('ALERT_STATE', JSON.stringify(state));
+        logToSheet_('Phone alert sent: ' + title);
+      } else {
+        logToSheet_('Phone alert FAILED (' + cfg.provider + '): ' + res.detail);
+      }
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (e) {
+    logToSheet_('Phone alert error (run continues): ' + e);
+  }
+}
+
+// Shortlist of contracts that passed Risk + spread on the last sheet run; the 5-minute watch re-checks only these.
+function saveWatchSnapshot_(tab, rows, runTimestamp, held) {
+  try {
+    CacheService.getScriptCache().put('WATCH_SNAPSHOT_' + tab, JSON.stringify({ ts: runTimestamp.getTime(), rows: rows.slice(0, 40), held: (held || []).slice(0, 30) }), 21600);
+  } catch (e) { /* the watch simply has nothing to check */ }
+}
+
+function fetchIntradayMap_(tickers) {
+  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+  if (!url || !secret) return {};
+  try {
+    const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      payload: JSON.stringify({ apiKey: secret, intraday: { tickers: tickers } }) });
+    if (resp.getResponseCode() !== 200) { logToSheet_('Signal watch: Cloud Function HTTP ' + resp.getResponseCode()); return {}; }
+    return JSON.parse(resp.getContentText()).intradayResults || {};
+  } catch (e) {
+    logToSheet_('Signal watch: Cloud Function call failed: ' + e);
+    return {};
+  }
+}
+
+// Called by quickScheduleTick_ every 5 minutes. Outside market hours, or with alerts off, it returns
+// immediately without any network call. Otherwise: ONE Cloud Function request for the shortlisted tickers + SPY.
+function fetchOptionQuotesMap_(occSymbols) {
+  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+  if (!url || !secret || !occSymbols.length) return {};
+  try {
+    const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      payload: JSON.stringify({ apiKey: secret, occSymbols: occSymbols }) });
+    if (resp.getResponseCode() !== 200) { logToSheet_('Signal watch: option quote request HTTP ' + resp.getResponseCode()); return {}; }
+    return JSON.parse(resp.getContentText()).tastyResults || {};
+  } catch (e) {
+    logToSheet_('Signal watch: option quote request failed: ' + e);
+    return {};
+  }
+}
+
+function signalWatchTick_() {
+  try {
+    const now = new Date();
+    const sess = marketSessionAt_(now);
+    if (!sess.open) return;
+    const cfg = getAlertConfig_();
+    if (!cfg.ready) return;
+    const S = INTRADAY_SIGNAL;
+    const closeMin = US_MARKET_EARLY_CLOSES[Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd')] ? 210 : 390;
+    // Entry alerts keep the first/last-15-minute blackout; exit alerts on rows you hold do not.
+    const entryTimeOk = sess.minutesSinceOpen >= S.noEntryFirstMin && (closeMin - sess.minutesSinceOpen) >= S.noEntryLastMin;
+
+    const cache = CacheService.getScriptCache();
+    const snaps = [];
+    INTRADAY_SIGNAL_SHEETS.forEach(function (tab) {
+      let sn = null;
+      try { sn = JSON.parse(cache.get('WATCH_SNAPSHOT_' + tab) || 'null'); } catch (e) { sn = null; }
+      if (!sn || now.getTime() - sn.ts > WATCH_SNAPSHOT_MAX_AGE_MIN * 60000) return;
+      const rows = entryTimeOk ? (sn.rows || []) : [];
+      const held = sn.held || [];
+      if (rows.length || held.length) snaps.push({ tab: tab, rows: rows, held: held });
+    });
+    if (!snaps.length) return;
+
+    const seen = { SPY: true }, tickers = ['SPY'], occList = [];
+    snaps.forEach(function (sn) {
+      sn.rows.forEach(function (r) { if (!seen[r.t]) { seen[r.t] = true; tickers.push(r.t); } });
+      sn.held.forEach(function (h) { if (!seen[h.t]) { seen[h.t] = true; tickers.push(h.t); } if (h.occ && occList.indexOf(h.occ) === -1) occList.push(h.occ); });
+    });
+    const ivMap = fetchIntradayMap_(tickers);
+    if (!Object.keys(ivMap).length) return;
+    const quoteMap = occList.length ? fetchOptionQuotesMap_(occList) : {};
+
+    const spy = ivMap['SPY'] || null;
+    const spyHead = !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp);
+    const freshIv = function (t) {
+      const iv = ivMap[t];
+      if (!iv || iv.aroonUp == null || iv.aroonDown == null || iv.rsi1m == null) return null;
+      const barAgeMin = iv.lastBarEpoch != null ? Math.round((now.getTime() - iv.lastBarEpoch * 1000) / 60000) : null;
+      if (sess.minutesSinceOpen > INTRADAY_STALE_MIN && barAgeMin != null && barAgeMin > INTRADAY_STALE_MIN) return null;   // stale data never alerts
+      return iv;
+    };
+    snaps.forEach(function (sn) {
+      const items = [];
+      sn.rows.forEach(function (r) {
+        const iv = freshIv(r.t);
+        if (!iv) return;
+        const ev = evaluateEntryLevel_(iv, S, spyHead);
+        if (!ev.level) return;
+        const meta = { optionPrice: r.p, spreadPct: r.sp, delta: r.d, stockPrice: r.s };
+        const fz = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
+        items.push({ key: sn.tab + '|' + r.t + '|' + r.k + '|' + r.e, level: ev.level,
+          line: alertLine_(ev.level, r.t, r.k, r.x, iv, meta, fz, ev.dip ? ('waiting: ' + ev.missing.join('; ')) : 'RSI low, no dip/turn yet') });
+      });
+      // Exit check for rows you hold: fresh option quote (sell price = the bid) vs your Entry price.
+      sn.held.forEach(function (h) {
+        const iv = freshIv(h.t);
+        const q = quoteMap[h.occ];
+        if (!iv || !q || !(h.en > 0)) return;
+        const sell = (q.bid != null && q.bid > 0) ? q.bid : null;
+        if (sell == null) return;
+        const profitPct = (sell / h.en - 1) * 100;
+        const ex = evaluateQuickExit_(iv, profitPct, S);
+        if (!ex.exit) return;
+        items.push({ key: sn.tab + '|' + h.t + '|' + h.k + '|' + h.e, level: 'exit',
+          line: alertLineExit_(h.t, h.k, h.x, iv, profitPct, ex.fading, q.mark != null ? q.mark : sell) });
+      });
+      dispatchEntryAlerts_(sn.tab, items, now);
+    });
+  } catch (e) {
+    logToSheet_('Signal watch failed: ' + e);
+  }
+}
+
+function setupPushoverAlerts_() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Pushover setup (1 of 2)', 'Paste your Pushover USER KEY (shown on the pushover.net dashboard after you log in):', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK || !r1.getResponseText().trim()) return;
+  const r2 = ui.prompt('Pushover setup (2 of 2)', 'Paste your Pushover APPLICATION API TOKEN (create one at pushover.net/apps/build):', ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK || !r2.getResponseText().trim()) return;
+  PropertiesService.getScriptProperties().setProperties({ ALERT_PROVIDER: 'pushover', PUSHOVER_USER: r1.getResponseText().trim(), PUSHOVER_TOKEN: r2.getResponseText().trim(), ALERT_ENABLED: 'true' });
+  const res = sendPhoneAlert_(getAlertConfig_(), 'Options Validator test', 'Phone alerts are working.', false);
+  ui.alert(res.ok ? 'Test alert sent. Check your phone.' : 'The test alert failed: ' + res.detail);
+}
+
+// After you message your new bot, getUpdates lists that message; its chat id is where alerts will be sent.
+function findTelegramChatId_(token) {
+  try {
+    const resp = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/getUpdates', { muteHttpExceptions: true });
+    const json = JSON.parse(resp.getContentText());
+    if (!json.ok || !json.result) return { id: null, detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+    for (let i = json.result.length - 1; i >= 0; i--) {
+      const u = json.result[i], m = u.message || u.edited_message || null;
+      if (m && m.chat && m.chat.id != null) return { id: String(m.chat.id), detail: '' };
+    }
+    return { id: null, detail: 'no messages found' };
+  } catch (e) {
+    return { id: null, detail: String(e) };
+  }
+}
+
+function setupTelegramAlerts_() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Telegram setup (1 of 2)',
+    'In Telegram: search for @BotFather, send /newbot, pick a name and a username ending in "bot", then paste the token BotFather gives you (looks like 123456789:ABC...):', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK || !r1.getResponseText().trim()) return;
+  const token = r1.getResponseText().trim();
+  ui.alert('Telegram setup (2 of 2)', 'Now open your new bot in Telegram (tap the link BotFather gave you), press Start, and send it any message such as "hi". Then click OK here.', ui.ButtonSet.OK);
+  const found = findTelegramChatId_(token);
+  if (!found.id) { ui.alert('Could not find your chat yet (' + found.detail + '). Check the token, send your bot a message, and run this setup again.'); return; }
+  PropertiesService.getScriptProperties().setProperties({ ALERT_PROVIDER: 'telegram', TELEGRAM_TOKEN: token, TELEGRAM_CHAT_ID: found.id, ALERT_ENABLED: 'true' });
+  const res = sendPhoneAlert_(getAlertConfig_(), 'Options Validator test', 'Phone alerts are working.', false);
+  ui.alert(res.ok ? 'Test alert sent. Check Telegram on your phone.' : 'The test alert failed: ' + res.detail);
+}
+
+function setupNtfyAlerts_() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  let topic = props.getProperty('NTFY_TOPIC');
+  if (!topic) topic = 'opts-' + Utilities.getUuid().replace(/-/g, '').slice(0, 20);
+  props.setProperties({ ALERT_PROVIDER: 'ntfy', NTFY_TOPIC: topic, ALERT_ENABLED: 'true' });
+  // Anonymous publishing from Apps Script can hit ntfy.sh's shared per-IP daily quota (HTTP 429 on the first message).
+  // An access token from a free ntfy.sh account makes requests count against your own account instead.
+  const rt = ui.prompt('ntfy access token (recommended)', 'Create a free account at ntfy.sh, open Account > Access tokens, create a token and paste it here (starts with tk_). Leave blank to try anonymously, which often fails from Apps Script with a 429 daily-quota error.', ui.ButtonSet.OK_CANCEL);
+  if (rt.getSelectedButton() !== ui.Button.OK) return;
+  const tok = rt.getResponseText().trim();
+  if (tok) props.setProperty('NTFY_TOKEN', tok); else props.deleteProperty('NTFY_TOKEN');
+  ui.alert('ntfy setup', 'On your phone: install the ntfy app, tap +, and subscribe to this topic exactly:\n\n' + topic +
+    '\n\nThe topic name is effectively a password, so keep it private. Click OK and a test alert will be sent.', ui.ButtonSet.OK);
+  const res = sendPhoneAlert_(getAlertConfig_(), 'Options Validator test', 'Phone alerts are working.', false);
+  ui.alert(res.ok ? 'Test alert sent. Check your phone.' : 'The test alert failed: ' + res.detail);
+}
+
+function sendTestPhoneAlert_() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getAlertConfig_();
+  if (!cfg.ready) { ui.alert('Phone alerts are not set up or are turned off. Use the Set Up menu items first.'); return; }
+  const res = sendPhoneAlert_(cfg, 'Options Validator test', 'ENTRY APP $220C 3/19/27 | sample alert', true);
+  ui.alert(res.ok ? 'Test alert sent. Check your phone.' : 'The test alert failed: ' + res.detail);
+}
+
+function togglePhoneAlerts_() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const on = props.getProperty('ALERT_ENABLED') === 'true';
+  props.setProperty('ALERT_ENABLED', on ? 'false' : 'true');
+  ui.alert(on ? 'Phone alerts turned OFF.' : 'Phone alerts turned ON' + (getAlertConfig_().ready ? '.' : ', but no provider is set up yet, so nothing will send.'));
+}
+
 // Same-day feasibility. Option move needed = target% of price + the full bid/ask spread; stock move = that / delta.
 // Chance the stock touches the needed level before the close (driftless random walk, barrier-hit formula
 // 2*(1 - N(b / (sigma*sqrt(T))))). Returns null when an input is missing.
@@ -6649,6 +7083,38 @@ function prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow) {
   return out;
 }
 
+// Leap indicators: ONE Cloud Function request for every unique ticker on the tab (daily bars). Returns {} on any failure.
+function prefetchDailyViaCloudFunction_(sheet, map, lastRow) {
+  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+  if (!url || !secret) return {};
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 0) return {};
+  const vals = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
+  const seen = {}, tickers = [];
+  for (let i = 0; i < numRows; i++) {
+    if (!vals[i][0]) continue;
+    const t = String(vals[i][0]).trim().toUpperCase();
+    if (!seen[t]) { seen[t] = true; tickers.push(t); }
+  }
+  if (!tickers.length) return {};
+  const t0 = Date.now();
+  try {
+    const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      payload: JSON.stringify({ apiKey: secret, daily: { tickers: tickers } }) });
+    if (resp.getResponseCode() !== 200) { logToSheet_('Cloud Function daily prefetch FAILED (HTTP ' + resp.getResponseCode() + ') - is the Cloud Function redeployed? ' + resp.getContentText().substring(0, 160)); return {}; }
+    const json = JSON.parse(resp.getContentText());
+    const results = json.dailyResults || {};
+    const diag = json.dailyDiagnostics || {};
+    logToSheet_('Cloud Function daily prefetch: ' + tickers.length + ' ticker(s), ' + (Date.now() - t0) + 'ms - ' + Object.keys(results).length + ' ok' +
+      (Object.keys(json.dailyErrors || {}).length ? (', ' + Object.keys(json.dailyErrors).length + ' failed') : '') +
+      (diag.dailyTasty ? (' Tasty daily candles unavailable (Yahoo used): ' + diag.dailyTasty) : ''));
+    return results;
+  } catch (e) {
+    logToSheet_('Cloud Function daily prefetch FAILED: ' + e);
+    return {};
+  }
+}
+
 // "$270P 10/9 @ $3.45" (a weekday is added when the expiry is not a Friday, e.g. "10/8 Thu").
 function formatAtmPutText_(ap) {
   const strike = Math.round(ap.strike * 100) / 100;
@@ -6736,11 +7202,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // sheet not in TRADE_OBJECTIVE_SHEETS (e.g. Leap).
   const objectiveConfig = TRADE_OBJECTIVE_SHEETS[sheet.getName()] || null;
   const hasObjectiveConfig = objectiveConfig != null;
-  // Quick and Risky get your custom-weighted Risk/Quick/Target formulas
-  // instead of the generic objective-sheet ones above — see the "QUICK &
-  // RISKY — REVISED FORMULAS" section. Any other sheet (or a future
-  // objective sheet not named Quick/Risky) keeps the generic path.
-  const revisedFormulaSheetName = (sheet.getName() === 'Quick' || sheet.getName() === 'Risky' || sheet.getName() === 'Leap') ? sheet.getName() : null;
+  // Quick and Leap get your custom-weighted Risk/Score/Target formulas
+  // instead of the generic objective-sheet ones above — see the "QUICK"
+  // and "LEAP" sections. Any other sheet keeps the generic path.
+  const revisedFormulaSheetName = (sheet.getName() === 'Quick' || sheet.getName() === 'Leap') ? sheet.getName() : null;
   // Moved up from right before its original use (near the sort call,
   // further down) so the dry-run diagnostic block can also use it — both
   // revisedFormulaSheetName and map.score are already available this
@@ -6819,7 +7284,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // border forever. Cheap: a handful of whole-column range calls, not a
   // per-row loop.
   clearTopFilterHighlight_(sheet, map, lastRow);
-  const revisedFormulaSheetForHighlight = (sheet.getName() === 'Quick' || sheet.getName() === 'Risky' || sheet.getName() === 'Leap') ? sheet.getName() : null;
+  const revisedFormulaSheetForHighlight = (sheet.getName() === 'Quick' || sheet.getName() === 'Leap') ? sheet.getName() : null;
   // Clears any leftover bright-green best-row background from before this
   // highlight was removed (see findBestScoreRow_ further down) — never
   // reapplied, just a one-time cleanup so old runs' highlight doesn't
@@ -6865,6 +7330,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const extraCols = prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow);
   const atmPutMap = extraCols.atmPut;
   const intradayMap = extraCols.intraday;
+  const leapWanted = !!(map.leapT200 || map.leapX50 || map.leapR14 || map.leapOffHigh || map.leapIvr || map.leapCarry || map.leapSpread);
+  const leapTiltNeedsDaily = sheet.getName() === 'Leap' && LEAP_SCORE_MODEL.tiltSource === 'stock';
+  const dailyMap = (leapWanted || leapTiltNeedsDaily) ? prefetchDailyViaCloudFunction_(sheet, map, lastRow) : {};
 
   // Personal track record — Quick only, by explicit request. Pure local
   // sheet read (no network call), so computed once here regardless of
@@ -6932,13 +7400,14 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     }
   }
 
-  // Quick/Risky/Leap: wipe the decision cells (Score, Risk) on a row whose data
+  // Quick/Leap: wipe the decision cells (Score, Risk) on a row whose data
   // could not be refreshed, so a stale number can't rank or earn a border.
   const clearsStaleRows = STALE_ROW_SHEETS.indexOf(sheet.getName()) !== -1 && !!map.score && !!map.riskScore;
   // Rows whose data is stale this run -> reasons (drives the LastRun cell color/note at the end).
   const staleReasons = {};
   const ivRowState = {};   // rowIdx -> intraday result (or null) for rows where the intraday values were written
-  const ivRowMeta = {};    // rowIdx -> { spreadPct, stockPrice } captured once the row's quote data is merged
+  const ivRowMeta = {};    // rowIdx -> { spreadPct, stockPrice, ... } captured once the row's quote data is merged
+  const leapRowState = {}; // rowIdx -> daily indicators (or null) for Leap rows
   function markStale_(rowIdx, reason) {
     (staleReasons[rowIdx] = staleReasons[rowIdx] || []).push(reason);
   }
@@ -7155,7 +7624,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       sourceByField.relativeStrength = tickerData.rsInfo.source;
     }
 
-    // QUICK/RISKY REVISED-FORMULA FIELDS — see getCachedTickerData_ for
+    // QUICK REVISED-FORMULA FIELDS — see getCachedTickerData_ for
     // how each is derived. Only used on sheets with an entry in
     // TRADE_OBJECTIVE_SHEETS; harmless (just unused) elsewhere.
     if (tickerData.momentumInfo) {
@@ -7165,10 +7634,6 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     if (tickerData.trendInfo) merged.trendPercent = tickerData.trendInfo.trendPercent;
     if (tickerData.volumeTrendInfo) merged.relativeVolumePercent = tickerData.volumeTrendInfo.relativeVolumePercent;
     if (tickerData.drawdownInfo) merged.maxDrawdownPercent = tickerData.drawdownInfo.maxDrawdownPercent;
-    if (tickerData.hitRateInfo) {
-      merged.hitRateCallPercent = tickerData.hitRateInfo.callPercent;
-      merged.hitRatePutPercent = tickerData.hitRateInfo.putPercent;
-    }
     merged.marketRegimePercent = getMarketRegimePercent_();
 
     // OPEN INTEREST — TastyTrade first (real broker data, not subject to
@@ -7416,7 +7881,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       );
     }
 
-    // Time-based cutoff — Quick/Risky only (Leap's maxHoldDays is
+    // Time-based cutoff — Quick only (Leap's maxHoldDays is
     // Infinity, so this never fires there; Leap uses lossThresholdWarning
     // below instead, since it's a %-based exit, not a day-count one).
     const maxHoldWarning = (isActivePosition && daysHeld != null && objectiveConfig && isFinite(objectiveConfig.maxHoldDays) &&
@@ -7434,9 +7899,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       ? ('Down ' + objectiveConfig.lossConcernPercent + '%+ from your Entry Price — objective says close now regardless of target.')
       : null;
 
-    // TARGET SCORE (Quick/Risky/Leap) — a probability (0-100%), computed
-    // BEFORE Risk/Quick below since Risky's Quick formula uses this as an
-    // input. Anchored on quickTargetResult's target stock price above
+    // TARGET SCORE (Quick/Leap) — a probability (0-100%), computed
+    // BEFORE Risk/Quick below (the Quick formula uses this as an
+    // input). Anchored on quickTargetResult's target stock price above
     // (itself already anchored on Entry Price if active, else current
     // Price — same branching as before, just feeding a probability calc
     // now instead of only a display price).
@@ -7450,24 +7915,20 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         sectorPercent: sectorMomentumNumeric, trendPercent: merged.trendPercent,
         relativeVolumePercent: merged.relativeVolumePercent, marketRegimePercent: merged.marketRegimePercent,
         daysToCatalyst: daysToCatalystNumeric,
-        hitRateCallPercent: merged.hitRateCallPercent, hitRatePutPercent: merged.hitRatePutPercent,
         trackRecordAvgReturn: tickerTrackRecord ? tickerTrackRecord.avgReturnPercent : null,
         trackRecordTradeCount: tickerTrackRecord ? tickerTrackRecord.tradeCount : 0,
         ratingScore: tickerData.qualityInfo ? tickerData.qualityInfo.ratingScore : null
       };
       targetScoreValue = revisedFormulaSheetName === 'Quick'
         ? computeQuickSheetTargetScore_(targetInputs, objectiveConfig)
-        : revisedFormulaSheetName === 'Risky'
-        ? computeRiskySheetTargetScore_(targetInputs, objectiveConfig)
         : computeLeapSheetTargetScore_(targetInputs, objectiveConfig);
     }
 
     // RISK — needs Delta, Stock Price, Option Price, ATR%, spread, and
-    // catalyst timing (or, for Risky, Drawdown/liquidity fields instead)
-    // — all already computed above, so this is free. All three revised-
-    // formula sheets (Quick/Risky/Leap) now compute this the same way.
-    let riskUnavailable = false; // Quick/Risky: model couldn't run this pass -> clear the old Risk value
-    const qrHolder = {};         // Quick/Risky: this row's prepared simulation, shared by Risk, Score and the cell notes
+    // catalyst timing — all already computed above, so this is free.
+    // Both revised-formula sheets (Quick/Leap) compute this the same way.
+    let riskUnavailable = false; // Quick: model couldn't run this pass -> clear the old Risk value
+    const qrHolder = {};         // Quick: this row's prepared simulation, shared by Risk, Score and the cell notes
     if (scoreRelevance.needsRiskScore) {
       const riskScoreValue = revisedFormulaSheetName === 'Quick'
         ? computeQuickSheetRiskScore_({
@@ -7477,16 +7938,6 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent,
             optionType: parsedStrike.type, strike: parsedStrike.strike, daysToExpiry: daysToExpiry,
             ivPercent: merged.iv, bidAskSpreadPct: merged.bidAskSpreadPct, changeNowPercent: changeNowNumeric
-          }, qrHolder)
-        : revisedFormulaSheetName === 'Risky'
-        ? computeRiskySheetRiskScore_({
-            maxDrawdownPercent: merged.maxDrawdownPercent, bidAskSpreadPct: merged.bidAskSpreadPct,
-            extrinsicValue: merged.extrinsicValue, optionPrice: merged.optionPrice,
-            oi: merged.oi, volume: merged.volume,
-            stockPrice: merged.stockPrice, optionType: parsedStrike.type, strike: parsedStrike.strike,
-            daysToExpiry: daysToExpiry, ivPercent: merged.iv, ivRank: merged.ivRank,
-            daysToCatalyst: daysToCatalystNumeric, atrPercent: merged.atrPercent,
-            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent, changeNowPercent: changeNowNumeric
           }, qrHolder)
         : revisedFormulaSheetName === 'Leap'
         ? computeLeapSheetRiskScore_({
@@ -7521,7 +7972,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         merged.riskScore = riskScoreValue;
         sourceByField.riskScore = revisedFormulaSheetName ? ('Computed (' + sheet.getName() + ' revised formula)')
           : hasObjectiveConfig ? ('Computed (' + sheet.getName() + ' objective)') : 'Computed';
-      } else if (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky' ||
+      } else if (revisedFormulaSheetName === 'Quick' ||
                  (revisedFormulaSheetName === 'Leap' && LEAP_RISK_USE_PREMIUM_LOSS_MODEL)) {
         riskUnavailable = true;
       }
@@ -7568,12 +8019,6 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent,
             snapbackRecoveryPercent: merged.snapbackRecoveryPercent,
             hasNegativeNews: newsHasBlock
-          }, objectiveConfig)
-        : revisedFormulaSheetName === 'Risky'
-        ? computeRiskySheetQuickScore_({
-            rsPercent: merged.relativeStrength, optionType: parsedStrike.type, atrPercent: merged.atrPercent,
-            delta: merged.greekDelta, stockPrice: merged.stockPrice, optionPrice: merged.optionPrice,
-            targetScoreValue: targetScoreValue, sectorPercent: sectorMomentumNumeric, ivRank: merged.ivRank
           }, objectiveConfig)
         : revisedFormulaSheetName === 'Leap'
         ? computeLeapSheetFilterScore_({
@@ -7682,7 +8127,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     });
 
     // A null Risk is normally skipped (the cell keeps its old value). For
-    // Quick/Risky that would leave a STALE number sitting next to a row the
+    // Quick that would leave a STALE number sitting next to a row the
     // model couldn't evaluate, so clear it instead.
     if (riskUnavailable && map.riskScore) {
       const oldRisk = rowOut[map.riskScore - 1];
@@ -7707,8 +8152,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       const targetCol = map.target - 1;
 
       if (revisedFormulaSheetName && targetScoreValue != null && quickTargetResult != null) {
-        // Quick/Risky: Target is now a PROBABILITY (%), not a stock price —
-        // see the "QUICK & RISKY — REVISED FORMULAS" section. The
+        // Quick: Target is now a PROBABILITY (%), not a stock price —
+        // see the "QUICK — REVISED FORMULAS" section. The
         // underlying target stock price is still computed (it anchors the
         // Volatility Probability factor) and shown in the note, just not
         // written to the cell.
@@ -7731,9 +8176,6 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             : ('hypothetical minimum-profit target (+' + objectiveConfig.minProfitPercent +
                 '% from the CURRENT option price — not an active position)')) +
           ' — implied stock target ≈ $' + round2_(quickTargetResult.targetStockPrice) + '.' +
-          (sheet.getName() === 'Risky'
-            ? ' Includes a Historical Hit Rate component that is a short (~2mo) window heuristic, not a statistically robust hit rate.'
-            : '') +
           ' Recomputed each run — a moving estimate, not a guarantee.';
       } else if (hasObjectiveConfig && quickTargetResult != null) {
         const roundedTarget = round2_(quickTargetResult.targetStockPrice);
@@ -7766,17 +8208,17 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
     }
 
-    // SCORE — Quick/Risky/Leap only, weighted blend of Filter, Target
+    // SCORE — Quick/Leap only, weighted blend of Filter, Target
     // Probability, and (100 - Risk) via computeCombinedScore_/
     // SCORE_WEIGHTS_BY_SHEET above. Cleared if any input is missing this
     // run, or on any other sheet — same convention Target uses. Requires
     // a header cell literally named "Score" on this sheet (see HEADER_MAP).
     if (map.score) {
       const scoreCol = map.score - 1;
-      // Quick/Risky: Score = simulated chance of banking +3% within 5 days
-      // (see QUICK & RISKY SCORE). Reuses the simulation Risk already
+      // Quick: Score = simulated chance of banking +3% within 5 days
+      // (see QUICK SCORE). Reuses the simulation Risk already
       // prepared for this row; prepares one itself if Risk didn't run.
-      const useWinScore = QR_SCORE_USE_WIN_PROBABILITY && (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky');
+      const useWinScore = QR_SCORE_USE_WIN_PROBABILITY && revisedFormulaSheetName === 'Quick';
       let winScore = null;
       if (useWinScore) {
         if (qrHolder.ctx === undefined) {
@@ -7791,11 +8233,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
       // Leap: Score = chance of +50% a year out (see LEAP SCORE).
       const useLeapScore = LEAP_SCORE_USE_UPSIDE_PROBABILITY && revisedFormulaSheetName === 'Leap';
+      let leapStockTilt = null;
+      if (useLeapScore && LEAP_SCORE_MODEL.tiltSource === 'stock') {
+        leapStockTilt = computeLeapStockTilt_({
+          daily: dailyMap[String(ticker).trim().toUpperCase()] || null,
+          ratingScore: tickerData.qualityInfo ? tickerData.qualityInfo.ratingScore : null,
+          upsidePercent: upsidePercent, optionType: parsedStrike.type
+        });
+      }
       const leapScore = useLeapScore ? computeLeapUpsideScore_({
         stockPrice: merged.stockPrice, strike: parsedStrike.strike, optionPrice: merged.optionPrice,
         daysToExpiry: daysToExpiry, optionType: parsedStrike.type, ivPercent: merged.iv, atrPercent: merged.atrPercent,
         bidAskSpreadPct: merged.bidAskSpreadPct, ivRank: merged.ivRank
-      }, merged.filterScore) : null;
+      }, leapStockTilt ? leapStockTilt.score : merged.filterScore) : null;
       const scoreValue = useLeapScore
         ? (leapScore ? leapScore.score : null)
         : (useWinScore
@@ -7819,7 +8269,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             Math.round(leapScore.spreadPct * 10) / 10 + '% bid/ask spread) about ' + leapScore.horizonDays + ' days from now' +
             (leapScore.requiredStock != null ? ' — needs the stock near $' + round2_(leapScore.requiredStock) +
               ' (' + (leapScore.requiredMovePct >= 0 ? '+' : '') + Math.round(leapScore.requiredMovePct * 10) / 10 + '%) by then' : '') +
-            '. Stock-setup tilt from Filter: ' + (leapScore.tiltSd >= 0 ? '+' : '') + Math.round(leapScore.tiltSd * 100) / 100 +
+            (leapStockTilt
+              ? ('. Stock-setup tilt (trend vs 200-day ' + leapStockTilt.trend + ', near 52-week high ' + leapStockTilt.nearHigh + ', quality ' + leapStockTilt.quality + ', analyst upside ' + leapStockTilt.upside + ' = ' + leapStockTilt.score + '/100' + (leapStockTilt.dailyMissing ? '; daily data missing, trend/near-high treated as neutral' : '') + '): ')
+              : '. Stock-setup tilt from Filter: ') +
+            (leapScore.tiltSd >= 0 ? '+' : '') + Math.round(leapScore.tiltSd * 100) / 100 +
             ' sd (max ±' + LEAP_SCORE_MODEL.tiltMaxSd + '). Independent of Risk: read Risk first, then Score. Rows with Risk <= ' + GATE_RANKING_BY_SHEET.Leap.gate +
             ' are listed first, best Score on top; the green border marks the best of those. Recomputed each run.';
         } else if (useWinScore) {
@@ -7849,7 +8302,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           rowOut[scoreCol] = '';
           noteOut[scoreCol] = '';
           bgOut[scoreCol] = null;
-          rowChanges.push('Score cleared (missing inputs this run — price/strike/expiry/volatility, or Filter/Target on other sheets — or not a Quick/Risky/Leap sheet)');
+          rowChanges.push('Score cleared (missing inputs this run — price/strike/expiry/volatility, or Filter/Target on other sheets — or not a Quick/Leap sheet)');
           changedCells++;
         }
       }
@@ -7884,7 +8337,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // RISK CELL BACKGROUND — low/moderate/high band, same idea as the
     // Days to Catalyst proximity flag below.
     if (map.riskScore && merged.riskScore != null) {
-      const qrRiskBands = (QR_RISK_USE_PREMIUM_LOSS_MODEL && (revisedFormulaSheetName === 'Quick' || revisedFormulaSheetName === 'Risky'))
+      const qrRiskBands = (QR_RISK_USE_PREMIUM_LOSS_MODEL && revisedFormulaSheetName === 'Quick')
         ? QR_RISK_BANDS
         : ((LEAP_RISK_USE_PREMIUM_LOSS_MODEL && revisedFormulaSheetName === 'Leap') ? LEAP_RISK_BANDS : { green: 33, yellow: 66 });
       const riskColor = merged.riskScore <= qrRiskBands.green ? COLOR_RISK_LOW : (merged.riskScore <= qrRiskBands.yellow ? COLOR_RISK_MED : COLOR_RISK_HIGH);
@@ -7901,7 +8354,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           (lr.extension > 0.05 ? ' Stock looks extended after a run-up (pullback tilt applied).' : '') +
           ' High = consider waiting for the dip. Recomputed each run.';
       }
-      // Quick/Risky: show the outcome split behind the number.
+      // Quick: show the outcome split behind the number.
       if (QR_RISK_USE_PREMIUM_LOSS_MODEL && qrHolder.risk) {
         const rr = qrHolder.risk, tp = rr.tierProbabilities;
         noteOut[map.riskScore - 1] =
@@ -7952,7 +8405,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning, quoteAgeWarning].filter(function (w) { return w != null; });
     const statusText = warnings.length ? (baseStatusText + ' | ⚠️ ' + warnings.join(' ⚠️ ')) : baseStatusText;
 
-    ivRowMeta[rowIdx] = { spreadPct: merged.bidAskSpreadPct, stockPrice: merged.stockPrice, delta: merged.greekDelta, optionPrice: merged.optionPrice };
+    ivRowMeta[rowIdx] = { spreadPct: merged.bidAskSpreadPct, stockPrice: merged.stockPrice, delta: merged.greekDelta, optionPrice: merged.optionPrice,
+      extrinsic: merged.extrinsicValue, dte: merged.daysToExpiry, ivRank: merged.ivRank, occ: occSymbol };
+    if (leapWanted) leapRowState[rowIdx] = dailyMap[String(ticker).trim().toUpperCase()] || null;
     writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'), true);
 
     // This delay exists to protect TastyTrade/Yahoo from rapid-fire
@@ -8005,13 +8460,16 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       : 'SPY data missing (not blocking)';
     const logRows = [];
     const outSnap = {};   // contract key -> { opt, spread } for grading earlier signals
+    const alertItems = [];   // new light/strong green rows for the phone alert
+    const snapRows = [];     // shortlist handed to the 5-minute signal watch
+    const heldSnap = [];     // held rows (Entry price filled) handed to the 5-minute watch for exit alerts
     const fmtNum_ = function (v, d) { return (v == null || isNaN(v)) ? '' : Math.round(v * Math.pow(10, d)) / Math.pow(10, d); };
 
     Object.keys(ivRowState).forEach(function (key) {
       const i = parseInt(key, 10);
       const iv = ivRowState[key];
       const meta = ivRowMeta[key] || {};
-      let color = '#ffffff', note = '', signal = null, ivStaleFlag = false;
+      let color = '#ffffff', note = '', signal = null, ivStaleFlag = false, alertLevel = null, alertWhy = '', alertExit = null;
       if (!iv) {
         color = INTRADAY_STALE_COLOR;
         note = 'Not refreshed this run (no data came back from TastyTrade or Yahoo).';
@@ -8033,44 +8491,58 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             const riskVal = map.riskScore ? parseFloat(allValues[i][map.riskScore - 1]) : NaN;
             const gateOk = !gateOn || (isFinite(riskVal) && riskVal <= gateCfg.gate);
             const spreadOk = meta.spreadPct != null && isFinite(meta.spreadPct) && meta.spreadPct <= S.maxSpreadPct;
-            const trend = iv.aroonUp >= S.trendAupMin && iv.aroonDown <= S.trendAdnMax;
+            // Phone-alert shortlist: contracts that already pass Risk and spread (the watcher re-checks the intraday part every 5 min).
+            if (gateOk && spreadOk && map.strike && map.expiry) {
+              const exV = allValues[i][map.expiry - 1];
+              snapRows.push({
+                t: allValues[i][map.ticker - 1], k: String(allValues[i][map.strike - 1]),
+                e: (exV instanceof Date) ? Utilities.formatDate(exV, 'America/New_York', 'yyyyMMdd') : String(exV),
+                x: (exV instanceof Date) ? Utilities.formatDate(exV, 'America/New_York', 'M/d/yy') : String(exV),
+                p: meta.optionPrice, sp: meta.spreadPct, d: meta.delta, s: meta.stockPrice
+              });
+            }
             if (!timeOk) {
               note += ' No entry signals in the first ' + S.noEntryFirstMin + ' / last ' + S.noEntryLastMin + ' minutes of the session.';
             } else if (!gateOk) {
               note += ' No entry: Risk is above the gate.';
             } else if (!spreadOk) {
-              note += ' No entry: option spread ' + (meta.spreadPct != null && isFinite(meta.spreadPct) ? fmtNum_(meta.spreadPct, 2) + '%' : 'unknown') + ' is wider than ' + S.maxSpreadPct + '% (it eats the +3% target).';
-            } else if (trend) {
-              const rising = iv.rsiPrev != null && iv.rsi1m > iv.rsiPrev;
-              const dip = iv.rsiMin5 != null && iv.rsiMin5 <= S.dipRsi && rising && iv.rsi1m <= S.recoverRsiMax;
-              if (dip) {
-                const missing = [];
-                if (!(iv.vwapPct != null && iv.vwapPct >= S.vwapMinPct)) missing.push('price vs VWAP ' + (iv.vwapPct != null ? iv.vwapPct + '%' : 'n/a') + ' (needs ' + S.vwapMinPct + '% or better)');
-                if (!(iv.rvol != null && iv.rvol >= S.rvolMin)) missing.push('relative volume ' + (iv.rvol != null ? iv.rvol : 'n/a') + ' (needs ' + S.rvolMin + '+)');
-                if (spyHead) missing.push('SPY headwind');
-                if (!missing.length) {
-                  color = INTRADAY_ENTRY_COLOR; signal = 'ENTRY';
-                  note += ' ENTRY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI dipped to ' + iv.rsiMin5 + ' and is rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '), VWAP ' + iv.vwapPct + '%, volume ' + iv.rvol + 'x, spread ' + fmtNum_(meta.spreadPct, 2) + '%.';
-                } else {
-                  color = INTRADAY_ENTRY_LIGHT_COLOR;
-                  note += ' GET READY: dip and turn confirmed, waiting on: ' + missing.join('; ') + '.';
-                }
-              } else if (iv.rsi1m <= S.lightRsiMax) {
+              note += ' No entry: option spread ' + (meta.spreadPct != null && isFinite(meta.spreadPct) ? fmtNum_(meta.spreadPct, 2) + '%' : 'unknown') + ' is wider than ' + S.maxSpreadPct + '% (it eats most of a +' + SAMEDAY_TARGET_PCT + '% target).';
+            } else {
+              const ev = evaluateEntryLevel_(iv, S, spyHead);
+              if (ev.level === 'strong') {
+                color = INTRADAY_ENTRY_COLOR; signal = 'ENTRY';
+                note += ' ENTRY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI dipped to ' + iv.rsiMin5 + ' and is rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '), VWAP ' + iv.vwapPct + '%, volume ' + iv.rvol + 'x, spread ' + fmtNum_(meta.spreadPct, 2) + '%.';
+              } else if (ev.level === 'light') {
                 color = INTRADAY_ENTRY_LIGHT_COLOR;
-                note += ' GET READY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI ' + iv.rsi1m + ' is low' +
-                  (iv.rsiPrev == null ? ' (no recovery check: Cloud Function not updated).' : (iv.rsi1m <= S.dipRsi ? ', at the dip level, waiting for it to turn up.' : ', waiting for a dip to ' + S.dipRsi + ' and a turn up.'));
+                if (ev.dip) {
+                  note += ' GET READY: dip and turn confirmed, waiting on: ' + ev.missing.join('; ') + '.';
+                } else {
+                  note += ' GET READY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI ' + iv.rsi1m + ' is low' +
+                    (iv.rsiPrev == null ? ' (no recovery check: Cloud Function not updated).' : (iv.rsi1m <= S.dipRsi ? ', at the dip level, waiting for it to turn up.' : ', waiting for a dip to ' + S.dipRsi + ' and a turn up.'));
+                }
               }
+              if (ev.level) { alertLevel = ev.level; alertWhy = ev.dip ? ('waiting: ' + ev.missing.join('; ')) : 'RSI low, no dip/turn yet'; }
             }
           } else {
             const price = map.optionPrice ? parseFloat(allValues[i][map.optionPrice - 1]) : NaN;
-            const profitPct = isFinite(price) ? (price / entryNum - 1) * 100 : null;
-            if (profitPct != null && profitPct >= S.exitMinProfitPct && iv.rsi1m >= S.exitRsiMin) {
-              const fading = iv.aroonUp < S.exitStrongAupBelow;
+            // Counted the way you would actually sell: at the bid, i.e. half the spread below the displayed price.
+            const halfSpread = (meta.spreadPct != null && isFinite(meta.spreadPct)) ? meta.spreadPct / 200 : 0;
+            const profitPct = isFinite(price) ? (price * (1 - halfSpread) / entryNum - 1) * 100 : null;
+            const exitEv = evaluateQuickExit_(iv, profitPct, S);
+            // Held rows feed the 5-minute watch so a red exit can alert between sheet runs.
+            if (meta.occ && map.strike && map.expiry) {
+              const exH = allValues[i][map.expiry - 1];
+              heldSnap.push({ t: allValues[i][map.ticker - 1], k: String(allValues[i][map.strike - 1]), e: (exH instanceof Date) ? Utilities.formatDate(exH, 'America/New_York', 'yyyyMMdd') : String(exH),
+                x: (exH instanceof Date) ? Utilities.formatDate(exH, 'America/New_York', 'M/d/yy') : String(exH), occ: meta.occ, en: entryNum });
+            }
+            if (exitEv.exit) {
+              const fading = exitEv.fading;
+              alertLevel = 'exit'; alertExit = { profitPct: profitPct, fading: fading };
               color = fading ? INTRADAY_EXIT_STRONG_COLOR : INTRADAY_EXIT_COLOR;
               signal = fading ? 'EXIT (fading)' : 'EXIT';
-              note += ' EXIT' + (fading ? ' (momentum fading, AUP ' + iv.aroonUp + ')' : '') + ': option is up ' + (Math.round(profitPct * 10) / 10) + '% vs Entry and RSI is ' + iv.rsi1m + '.';
+              note += ' EXIT' + (fading ? ' (momentum fading, AUP ' + iv.aroonUp + ')' : '') + ': option is up about ' + (Math.round(profitPct * 10) / 10) + '% vs Entry after the selling spread, and RSI is ' + iv.rsi1m + '.';
             } else if (profitPct != null) {
-              note += ' Held: option ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry (exit signal needs +' + S.exitMinProfitPct + '% and RSI >= ' + S.exitRsiMin + ').';
+              note += ' Held: option ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry after the selling spread (exit signal needs +' + S.exitMinProfitPct + '% and RSI >= ' + S.exitRsiMin + ').';
             }
           }
         }
@@ -8082,6 +8554,16 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (sigSheet && iv && !ivStaleFlag && sess.open) fz = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
       if (map.needMove) { allValues[i][map.needMove - 1] = fz ? fz.movePct : ''; allNumberFormats[i][map.needMove - 1] = '0.00'; allNotes[i][map.needMove - 1] = fz ? fz.note : ''; }
       if (map.pToday) { allValues[i][map.pToday - 1] = fz ? fz.prob : ''; allNumberFormats[i][map.pToday - 1] = '0'; allNotes[i][map.pToday - 1] = fz ? fz.note : ''; }
+      if (alertLevel && map.strike && map.expiry) {
+        const exA = allValues[i][map.expiry - 1];
+        alertItems.push({
+          key: signalRowKey_(sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], exA),
+          level: alertLevel,
+          line: (alertLevel === 'exit' && alertExit)
+            ? alertLineExit_(allValues[i][map.ticker - 1], allValues[i][map.strike - 1], (exA instanceof Date) ? Utilities.formatDate(exA, 'America/New_York', 'M/d/yy') : String(exA), iv, alertExit.profitPct, alertExit.fading, meta.optionPrice)
+            : alertLine_(alertLevel, allValues[i][map.ticker - 1], allValues[i][map.strike - 1], (exA instanceof Date) ? Utilities.formatDate(exA, 'America/New_York', 'M/d/yy') : String(exA), iv, meta, fz, alertWhy)
+        });
+      }
       if (sigSheet && iv && map.strike && map.expiry && meta.optionPrice != null && isFinite(meta.optionPrice)) {
         outSnap[signalRowKey_(sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], allValues[i][map.expiry - 1])] =
           { opt: meta.optionPrice, spread: (meta.spreadPct != null && isFinite(meta.spreadPct)) ? meta.spreadPct : 0 };
@@ -8102,6 +8584,68 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     sheet.getRange(HEADER_ROW, ivCols[0]).setNote('Market filter (strong green is blocked only when SPY is below its VWAP AND Aroon Down is above Aroon Up): ' + spyText + '.');
     if (logRows.length) appendSignalLog_(logRows, runTimestamp);
     if (sigSheet && !dryRun) updateSignalOutcomes_(sheet.getName(), outSnap, runTimestamp, sess.open);
+    if (sigSheet && !dryRun) {
+      saveWatchSnapshot_(sheet.getName(), snapRows, runTimestamp, heldSnap);
+      dispatchEntryAlerts_(sheet.getName(), alertItems, runTimestamp);
+    }
+  }
+
+  // ===== LEAP INDICATORS: T200 / X50 / R14D / OFFH / IVR / CARRY / SPRD (colors, notes, alerts) =====
+  if (leapWanted) {
+    const L = LEAP_SIGNAL;
+    const lcols = [map.leapT200, map.leapX50, map.leapR14, map.leapOffHigh, map.leapIvr, map.leapCarry, map.leapSpread].filter(function (c) { return !!c; });
+    const lsess = marketSessionAt_(runTimestamp);
+    const lGate = GATE_RANKING_BY_SHEET[sheet.getName()];
+    const lGateOn = !!(lGate && lGate.enabled && map.riskScore);
+    const leapAlerts = [];
+    Object.keys(leapRowState).forEach(function (key) {
+      const i = parseInt(key, 10);
+      const d = leapRowState[key];
+      const meta = ivRowMeta[key] || {};
+      const put = function (col, val, fmt) { if (col) { allValues[i][col - 1] = (val != null && isFinite(val)) ? Math.round(val * 100) / 100 : ''; if (val != null && isFinite(val)) allNumberFormats[i][col - 1] = fmt; } };
+      if (!d) {
+        lcols.forEach(function (c) { allValues[i][c - 1] = ''; allBackgrounds[i][c - 1] = INTRADAY_STALE_COLOR; allNotes[i][c - 1] = 'Not refreshed this run (no daily data from TastyTrade or Yahoo, or fewer than 200 daily bars).'; });
+        return;
+      }
+      const stockPx = (meta.stockPrice != null && isFinite(meta.stockPrice)) ? meta.stockPrice : d.price;
+      const carry = (meta.extrinsic != null && isFinite(meta.extrinsic) && stockPx > 0 && meta.dte > 30) ? (Math.max(0, meta.extrinsic) / stockPx) / (meta.dte / 365) * 100 : null;
+      const ivr = (meta.ivRank != null && isFinite(meta.ivRank)) ? meta.ivRank : null;
+      const sprd = (meta.spreadPct != null && isFinite(meta.spreadPct)) ? meta.spreadPct : null;
+      put(map.leapT200, d.t200, '+0.0;-0.0;0.0');
+      put(map.leapX50, d.x50, '+0.0;-0.0;0.0');
+      put(map.leapR14, d.rsi14d, '0.0');
+      put(map.leapOffHigh, d.offHigh, '0.0');
+      put(map.leapIvr, ivr, '0');
+      put(map.leapCarry, carry, '0.0');
+      put(map.leapSpread, sprd, '0.0');
+
+      const entryNum = map.entryPrice ? parseFloat(allValues[i][map.entryPrice - 1]) : NaN;
+      const held = isPlausible_(entryNum, 0.01, null);
+      const price = map.optionPrice ? parseFloat(allValues[i][map.optionPrice - 1]) : NaN;
+      const profitPct = (held && isFinite(price)) ? (price / entryNum - 1) * 100 : null;
+      const riskVal = map.riskScore ? parseFloat(allValues[i][map.riskScore - 1]) : NaN;
+      const riskOk = !lGateOn || (isFinite(riskVal) && riskVal <= lGate.gate);
+      const ev = evaluateLeapState_(d, { ivr: ivr, sprd: sprd, carry: carry, riskOk: riskOk, held: held, profitPct: profitPct }, L);
+      const colorByKind = { strong: INTRADAY_ENTRY_COLOR, light: INTRADAY_ENTRY_LIGHT_COLOR, 'exit-trend': INTRADAY_EXIT_STRONG_COLOR, 'exit-profit': INTRADAY_EXIT_COLOR };
+      const color = colorByKind[ev.kind] || '#ffffff';
+      const head = { strong: 'ENTRY: trend up, near the high, mild pullback, IV and carry reasonable.', light: 'GET READY, ' + ev.why + '.',
+        'exit-trend': 'EXIT: ' + ev.why + ' (your trend-based exit).', 'exit-profit': 'TAKE PROFIT? ' + ev.why + '.', none: ev.why ? ('No signal: ' + ev.why + '.') : '' }[ev.kind];
+      const note = 'Daily indicators from ' + (d.source || 'unknown') + ' (price ' + d.price + ', 200-day ' + d.sma200 + ', 50-day ' + d.sma50 + ', 52-week high ' + d.high52 + '). ' + head +
+        (held && profitPct != null && ev.kind === 'none' ? (' P&L ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry.') : '');
+      lcols.forEach(function (c) { allBackgrounds[i][c - 1] = color; allNotes[i][c - 1] = note; });
+
+      const alertKind = ev.kind;
+      if ((alertKind === 'strong' || alertKind === 'light' || alertKind === 'exit-trend' || alertKind === 'exit-profit') && map.strike && map.expiry) {
+        const exA = allValues[i][map.expiry - 1];
+        leapAlerts.push({
+          key: signalRowKey_(sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], exA),
+          level: alertKind === 'strong' ? 'strong' : (alertKind === 'light' ? 'light' : 'exit'),
+          line: alertLineLeap_(alertKind, allValues[i][map.ticker - 1], allValues[i][map.strike - 1], (exA instanceof Date) ? Utilities.formatDate(exA, 'America/New_York', 'M/d/yy') : String(exA),
+            d, { optionPrice: meta.optionPrice, ivr: ivr, carry: carry, sprd: sprd, profitPct: profitPct, why: ev.why })
+        });
+      }
+    });
+    if (!dryRun && lsess.open && leapAlerts.length) dispatchEntryAlerts_(sheet.getName(), leapAlerts, runTimestamp);
   }
 
   // LastRun cell: strong fill + note listing why when any data in the row is stale;
@@ -8185,18 +8729,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     return;
   }
 
-  // Reorders every row by the ranking key (Score on Quick/Risky/Leap once
+  // Reorders every row by the ranking key (Score on Quick/Leap once
   // that column exists, Filter Score otherwise), descending — done BEFORE
   // the highlights below, not after: Range.sort() carries values/
   // backgrounds/fonts with a row, but NOT borders (a Sheets quirk —
   // borders behave as an edge property, not a per-cell one), so
   // highlighting has to target the FINAL sorted positions or it ends up
   // on the wrong rows.
-  // Quick / Risky / Leap: Risk gate first, then Score (see RANKING above).
+  // Quick / Leap: Risk gate first, then Score (see RANKING above).
   // Any other sheet (or a tab with its gate switched off) keeps the plain Score sort.
   const gateCfg = gateConfigForSheet_(sheet.getName(), map);
   const useGate = !!gateCfg;
-  if (!(useGate && gateSort_(sheet, map, lastRow, gateCfg.gate))) {
+  const gateTrendCol = (useGate && gateCfg.requireUptrend && map.leapT200) ? map.leapT200 : null;
+  if (!(useGate && gateSort_(sheet, map, lastRow, gateCfg.gate, gateTrendCol))) {
     sortRowsByQuickScoreDescending_(sheet, map, lastRow, sortKey);
   }
 
@@ -8207,9 +8752,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // other. Reads directly from the sheet's current state rather than
   // positions captured mid-loop, for the same reason.
   const rankKey = (revisedFormulaSheetForHighlight && map.score) ? 'score' : 'filterScore';
-  const rankLabel = useGate ? ('Score among Risk <= ' + gateCfg.gate) : (rankKey === 'score' ? 'Score' : 'Filter Score');
+  const rankLabel = useGate ? ('Score among Risk <= ' + gateCfg.gate + (gateTrendCol ? ' and above the 200-day average' : '')) : (rankKey === 'score' ? 'Score' : 'Filter Score');
   const topFilterRanked = useGate
-    ? applyGateHighlight_(sheet, map, lastRow, gateCfg.gate)
+    ? applyGateHighlight_(sheet, map, lastRow, gateCfg.gate, gateTrendCol)
     : applyTopFilterHighlight_(sheet, map, lastRow, rankKey, rankLabel);
   const bestCombination = useGate
     ? (topFilterRanked.length ? { row: topFilterRanked[0].row, combinedScore: topFilterRanked[0].score } : null)
@@ -8444,7 +8989,7 @@ function getCachedTickerData_(
     : null;
 
   // ---------------------------------------------------------------
-  // QUICK/RISKY REVISED-FORMULA FIELDS — Momentum, Trend, Volume,
+  // QUICK REVISED-FORMULA FIELDS — Momentum, Trend, Volume,
   // Drawdown Exposure, and the Historical Hit Rate heuristic. All reuse
   // barsResult.value from the ATR%/RS fetch above — zero extra network
   // calls. Historical Hit Rate needs a direction (optionType), which
@@ -8476,15 +9021,6 @@ function getCachedTickerData_(
     ? { maxDrawdownPercent: maxDrawdownPercentValue, source: 'Yahoo Finance (unofficial, ~2mo max drawdown)' }
     : null;
 
-  const hitRateCallPercent = computeHistoricalHitRateHeuristic_(barsResult.value, atrPercentValue, 'C', HIT_RATE_FORWARD_DAYS);
-  const hitRatePutPercent = computeHistoricalHitRateHeuristic_(barsResult.value, atrPercentValue, 'P', HIT_RATE_FORWARD_DAYS);
-  const hitRateInfo = (hitRateCallPercent != null || hitRatePutPercent != null)
-    ? {
-        callPercent: hitRateCallPercent, putPercent: hitRatePutPercent,
-        source: 'Yahoo Finance (unofficial, ~2mo short-window heuristic — NOT a statistically robust hit rate)'
-      }
-    : null;
-
   Utilities.sleep(150);
 
   const data = {
@@ -8492,7 +9028,7 @@ function getCachedTickerData_(
     sectorMomentum: sectorMomentum, qualityInfo: qualityInfo, themeCluster: themeCluster,
     atrInfo: atrInfo, rsInfo: rsInfo,
     momentumInfo: momentumInfo, trendInfo: trendInfo, volumeTrendInfo: volumeTrendInfo,
-    drawdownInfo: drawdownInfo, hitRateInfo: hitRateInfo
+    drawdownInfo: drawdownInfo
   };
   cache[ticker] = data;
   return data;

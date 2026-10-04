@@ -49,10 +49,8 @@ const MOBILE_REMOTE_VERSION = 'v9';
 
 const MOBILE_REMOTE_ACTIONS = {
   'validate-quick': { label: 'Validate & Update — Quick', run: function () { return runValidateForSheet_('Quick'); } },
-  'validate-risky': { label: 'Validate & Update — Risky', run: function () { return runValidateForSheet_('Risky'); } },
   'validate-leap': { label: 'Validate & Update — Leap', run: function () { return runValidateForSheet_('Leap'); } },
   'scan-quick': { label: 'Scan Chain by Delta/OI — Quick', run: function () { return runScanForSheet_('Quick'); } },
-  'scan-risky': { label: 'Scan Chain by Delta/OI — Risky', run: function () { return runScanForSheet_('Risky'); } },
   'scan-leap': { label: 'Scan Chain by Delta/OI — Leap', run: function () { return runScanForSheet_('Leap'); } },
   'hedge': { label: 'Run Hedge Analysis', run: function () { return runHedgeForRemote_(); } },
   'research': { label: 'Run Daily Research', run: function () { return runResearchForRemote_(); } },
@@ -255,8 +253,8 @@ function escapeHtml_(text) {
 
 function renderHomePage_(baseUrl) {
   const groups = [
-    { title: 'Validate & Update', keys: ['validate-quick', 'validate-risky', 'validate-leap'] },
-    { title: 'Scan Chain by Delta / OI', keys: ['scan-quick', 'scan-risky', 'scan-leap'] },
+    { title: 'Validate & Update', keys: ['validate-quick', 'validate-leap'] },
+    { title: 'Scan Chain by Delta / OI', keys: ['scan-quick', 'scan-leap'] },
     { title: 'Hedge', keys: ['hedge'] },
     { title: 'Research', keys: ['research'] },
     { title: 'Full Pipeline', keys: ['pipeline'] },

@@ -3,7 +3,7 @@
  * DAILY RESEARCH ENGINE (ResearchEngine.gs)
  * ----------------------------------------------------------------------------
  * Scans a broad, curated candidate universe (RESEARCH_UNIVERSE below, plus
- * whatever's currently on Quick/Risky/Leap) and, for each of your three
+ * whatever's currently on Quick/Leap) and, for each of your two
  * trading objectives, surfaces the top 20 tickers that best fit it TODAY —
  * with a plain-language reason per pick, and explicit +added/-removed
  * tracking against whatever the LAST research run picked (not "yesterday"
@@ -33,7 +33,7 @@
  * relativeStrengthScore_, qualityScore_, upsideAlignmentScore_) rather
  * than redefining them — same math the rest of this project already
  * trusts, just aimed at candidate SELECTION instead of contract scoring.
- * Quick/Risky lean on momentum+ATR+trend+RS (fast movers); Leap leans on
+ * Quick leans on momentum+ATR+trend+RS (fast movers); Leap leans on
  * quality+analyst upside+trend+RS (steady conviction picks) — see
  * RESEARCH_WEIGHTS below for the exact per-tab weighting.
  * ============================================================================
@@ -49,26 +49,22 @@ const RESEARCH_EXECUTION_TIME_BUDGET_MS = 5 * 60 * 1000;
 const RESEARCH_MIN_SPOT_PRICE = 5; // filters out penny-adjacent names from the universe
 
 // Per-objective weights — starting points, not backtested (same honesty
-// standard as Hedge's Need/Cost weights). Quick and Risky share the same
-// factor shape, just weighted differently: Risky leans harder into raw
-// momentum/ATR (wants faster movers for its much shorter hold window),
-// Quick leans a bit more on trend-following. Leap is a different shape
+// standard as Hedge's Need/Cost weights). Quick leans on short-term
+// momentum, ATR and trend-following. Leap is a different shape
 // entirely — quality and analyst upside matter, short-term ATR doesn't.
-// 'drawdown' rewards a SMALLER recent max drawdown (least-loss framing) —
-// weighted lower for Risky on purpose, since that bucket is explicitly
-// the higher-risk-tolerance one; weighted meaningfully for Quick and Leap.
+// 'drawdown' rewards a SMALLER recent max drawdown (least-loss framing).
 // 'priceFit' is the soft $300 preference — same modest weight everywhere.
 // 'pullback' is the mirror image of 'momentum' (see
 // pullbackOpportunityScore_ in Options_Validator.gs) — a "buy the dip on
 // an otherwise solid name" signal, rewarding a recent short-window
 // DECLINE instead of a recent rally. Added at the user's request after
 // noticing recommendations skewed toward names that had already popped
-// that day. Quick/Risky: momentum's old weight is split roughly in half
+// that day. Quick: momentum's old weight is split roughly in half
 // with pullback, so both a breakout and a pullback can still surface a
 // candidate, rather than one fully replacing the other. Leap never had
 // a momentum weight to split — a smaller amount is trimmed from trend
 // instead, since Leap's longer hold period makes a 5-day wiggle less
-// central than it is for Quick/Risky.
+// central than it is for Quick.
 // meanReversion (Quick only, 14%) — a quality company with a recent
 // pullback WHILE its longer-term trend is still intact (see
 // meanReversionSetupScore_ in Options_Validator.gs). This is a
@@ -84,7 +80,7 @@ const RESEARCH_MIN_SPOT_PRICE = 5; // filters out penny-adjacent names from the 
 // the same two inputs as momentum/trend, so those two are trimmed
 // specifically harder here too, same reasoning as pullback above.
 //
-// inPlay (Quick and Risky, 6 each) — "stocks in play": the last 3 completed
+// inPlay (Quick, 6 each) — "stocks in play": the last 3 completed
 // sessions' average volume vs the prior 20 sessions' (see computeInPlayRatio_).
 // Small on purpose: an unusually active name is more likely to make a
 // same-day move, but it is not backtested here. If a ticker's cached bars
@@ -92,19 +88,17 @@ const RESEARCH_MIN_SPOT_PRICE = 5; // filters out penny-adjacent names from the 
 // missing input.
 const RESEARCH_WEIGHTS = {
   Quick: { momentum: 5, pullback: 4, trend: 6, atr: 11, rs: 13, drawdown: 11, priceFit: 6, trackRecord: 5, quality: 13, meanReversion: 14, overextension: 12, inPlay: 6 },
-  Risky: { momentum: 14, pullback: 13, atr: 27, trend: 9, rs: 13, drawdown: 14, priceFit: 10, inPlay: 6 },
   Leap: { quality: 22, trend: 12, pullback: 6, rs: 14, upside: 18, drawdown: 18, priceFit: 10 }
 };
 
-// Same-day ATR ramps for Quick and Risky (Research only — the ATR scorers in
+// Same-day ATR ramps for Quick (Research only — the ATR scorers in
 // Momentum.gs that rate actual contracts are untouched). The same-day target is
 // +1.5% on the option; for a deep in-the-money call (delta ~0.85, ~1% spread)
 // that needs roughly a 1.1% stock move, so names whose normal daily range is
 // below ~1.8% earn no ATR credit. Judgment-based calibration, not backtested:
 // the SignalLog hit rates are what should eventually tune it.
 const RESEARCH_SAMEDAY_ATR = {
-  Quick: { low: 1.8, high: 4.0 },
-  Risky: { low: 1.8, high: 6.0 }
+  Quick: { low: 1.8, high: 4.0 }
 };
 
 // "In play" ratio thresholds: 0.8x the 20-session average volume = no credit, 1.8x or more = full credit.
@@ -143,6 +137,117 @@ function inPlayScore_(ratio) {
   if (ratio == null || isNaN(ratio)) return 50;
   const cfg = RESEARCH_IN_PLAY;
   return ((clamp_(ratio, cfg.lowRatio, cfg.highRatio) - cfg.lowRatio) / (cfg.highRatio - cfg.lowRatio)) * 100;
+}
+
+/* ============================================================================
+ * LEAP RESEARCH — TREND-AWARE SECOND STAGE
+ * ----------------------------------------------------------------------------
+ * The Leap tab only signals an entry when the stock is above its 200-day average with the 50-day above
+ * the 200-day (see LEAP_SIGNAL in Momentum.gs), but Research used to rank Leap candidates on a ~2-month
+ * window, so it could promote names the tab would never signal. Stage 2 fixes that without touching
+ * Quick and without 200 daily bars for every ticker:
+ *   1. Every large/mega-cap is scored the existing way; the top RESEARCH_LEAP_DAILY.poolSize go on.
+ *   2. For just those, ONE Cloud Function request fetches a year of daily bars' worth of indicators
+ *      (T200, X50, distance from the 52-week high), cached for the day's runs.
+ *   3. Names at or below their 200-day average, or without a golden-cross state, are dropped; the rest are
+ *      re-scored with trend and 52-week-high factors in the mix (weights below, not backtested).
+ * If the Cloud Function is not configured or returns nothing, Leap falls back to the previous scoring
+ * for the whole list and says so in ScriptLog.
+ * ========================================================================== */
+const RESEARCH_LEAP_DAILY = {
+  enabled: true,
+  poolSize: 60,
+  cacheMinutes: 120,
+  requireUptrend: true,   // drop names with T200 <= 0 or X50 <= 0 (when daily data exists)
+  weights: { quality: 20, upside: 15, rs: 14, trend200: 20, nearHigh: 15, drawdown: 6, pullback: 5, priceFit: 5 }
+};
+
+// Daily indicators for a list of tickers, one Cloud Function request for the ones not already cached today.
+// Returns { TICKER: {t200, x50, offHigh, rsi14d, source} | null }.
+function fetchLeapDailyIndicators_(tickers) {
+  const out = {};
+  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+  const cache = CacheService.getScriptCache();
+  const nowMs = Date.now();
+  const today = Utilities.formatDate(new Date(nowMs), 'America/New_York', 'yyyy-MM-dd');
+  let stored = null;
+  try { stored = JSON.parse(cache.get('RESEARCH_LEAP_DAILY') || 'null'); } catch (e) { stored = null; }
+  if (!stored || stored.day !== today || nowMs - stored.ts > RESEARCH_LEAP_DAILY.cacheMinutes * 60000) stored = { day: today, ts: nowMs, map: {} };
+  const need = tickers.filter(function (t) { return stored.map[t] === undefined; });
+  if (need.length && url && secret) {
+    try {
+      const t0 = Date.now();
+      const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+        payload: JSON.stringify({ apiKey: secret, daily: { tickers: need } }) });
+      if (resp.getResponseCode() === 200) {
+        const results = JSON.parse(resp.getContentText()).dailyResults || {};
+        need.forEach(function (t) {
+          const r = results[t];
+          stored.map[t] = r ? { t200: r.t200, x50: r.x50, offHigh: r.offHigh, rsi14d: r.rsi14d, source: r.source } : 0;   // 0 = tried, no data
+        });
+        logToSheet_('Research Leap: daily indicators for ' + need.length + ' ticker(s) in ' + (Date.now() - t0) + 'ms - ' + Object.keys(results).length + ' ok.');
+      } else {
+        logToSheet_('Research Leap: Cloud Function daily request FAILED (HTTP ' + resp.getResponseCode() + ') - is it redeployed? ' + resp.getContentText().substring(0, 160));
+      }
+    } catch (e) {
+      logToSheet_('Research Leap: Cloud Function daily request FAILED: ' + e);
+    }
+    try { cache.put('RESEARCH_LEAP_DAILY', JSON.stringify(stored), 7200); } catch (e) { /* cache is best-effort */ }
+  }
+  tickers.forEach(function (t) { out[t] = stored.map[t] ? stored.map[t] : null; });
+  return out;
+}
+
+// Marks the top-pool large/mega-caps (by the existing Leap score) as stage-2 candidates and attaches their daily indicators.
+// Returns true if stage 2 is active (at least one ticker got data), false to keep the previous Leap scoring.
+function applyLeapStage2_(scored) {
+  if (!RESEARCH_LEAP_DAILY.enabled) return false;
+  try {
+    const prelim = scored.filter(function (inputs) { return inputs.isLargeOrMegaCap; })
+      .map(function (inputs) { return { inputs: inputs, score: computeResearchScoreForTab_('Leap', inputs) }; })
+      .sort(function (a, b) { return b.score - a.score; })
+      .slice(0, RESEARCH_LEAP_DAILY.poolSize);
+    const daily = fetchLeapDailyIndicators_(prelim.map(function (p) { return p.inputs.ticker; }));
+    const got = prelim.filter(function (p) { return daily[p.inputs.ticker]; }).length;
+    if (got === 0) { logToSheet_('Research Leap: no daily trend data available this run, so Leap picks use the previous scoring.'); return false; }
+    prelim.forEach(function (p) { p.inputs.leapDaily = daily[p.inputs.ticker] || null; p.inputs.leapStage2 = true; });
+    return true;
+  } catch (e) {
+    logToSheet_('Research Leap stage 2 failed (previous scoring used): ' + e);
+    return false;
+  }
+}
+
+// Only stage-2 names; drops downtrends (daily data present and T200 or X50 at or below 0). Names with no daily data stay (flagged).
+function filterLeapStage2Eligible_(eligible) {
+  let dropped = 0;
+  const kept = eligible.filter(function (inputs) {
+    if (!inputs.leapStage2) return false;
+    const d = inputs.leapDaily;
+    if (RESEARCH_LEAP_DAILY.requireUptrend && d && d.t200 != null && d.x50 != null && !(d.t200 > 0 && d.x50 > 0)) { dropped++; return false; }
+    return true;
+  });
+  return { kept: kept, dropped: dropped };
+}
+
+// Re-score for a Leap candidate that went through stage 2 (inputs.leapStage2). Missing daily data = neutral for those two factors.
+function computeLeapDailyResearchScore_(inputs) {
+  const w = RESEARCH_LEAP_DAILY.weights;
+  const d = inputs.leapDaily;
+  const t = leapTrendComponent_(d), h = leapNearHighComponent_(d);
+  const parts = {
+    quality: qualityScore_(inputs.qualityScore),
+    upside: upsideAlignmentScore_(inputs.upsidePercent, 'C'),
+    rs: relativeStrengthScore_(inputs.rsPercent, 'C'),
+    trend200: t == null ? 50 : t,
+    nearHigh: h == null ? 50 : h,
+    drawdown: 100 - drawdownRiskScore_(inputs.maxDrawdownPercent),
+    pullback: pullbackOpportunityScore_(inputs.momentumPercent, 'C'),
+    priceFit: priceFitScore_(inputs.spot)
+  };
+  let sum = 0, tot = 0;
+  Object.keys(w).forEach(function (k) { sum += parts[k] * w[k]; tot += w[k]; });
+  return Math.round((sum / tot) * 10) / 10;
 }
 
 // Curated candidate universe — liquid, optionable, large/mid-cap US
@@ -190,19 +295,19 @@ const RESEARCH_UNIVERSE = [
   // Additional large-cap coverage gaps (Consumer Defensive, Consumer
   // Cyclical, Healthcare, Technology)
   'PM', 'MO', 'TGT', 'TJX', 'CMG', 'YUM', 'CI', 'ADI', 'CDNS', 'SNPS', 'ARM',
-  // Additional mid-cap growth/momentum names, mainly to give Risky (the
-  // uncapped tab) more genuinely volatile candidates to choose from
+  // Additional mid-cap growth/momentum names. Both remaining tabs are large/mega-cap
+  // only, so these are skipped when candidates are built (see runDailyResearch).
   'CELH', 'SMCI', 'U', 'PATH', 'IOT',
   // Names you trade that discovery was missing (added Oct 2026). Market caps checked
   // against public sources: FN, ASTS, CRDO and IONQ are above the $10B large-cap line
   // (IONQ only modestly); MP has hovered right around it (roughly $7-11B depending on
-  // the date), so it is classed as mid-cap below, i.e. Risky-only.
+  // the date), so it is classed as mid-cap below, which keeps it off the Quick and Leap picks.
   'FN', 'ASTS', 'IONQ', 'CRDO', 'MP'
 ];
 
 /* ============================================================================
  * MARKET CAP TIER — Quick and Leap are restricted to large/mega-cap names
- * only (Risky is deliberately unrestricted). RESEARCH_UNIVERSE was already
+ * only. RESEARCH_UNIVERSE was already
  * curated toward well-known, liquid large/mid-caps, so rather than tag
  * all ~200+ tickers individually, this lists only the ones that are NOT
  * large/mega-cap — anything in RESEARCH_UNIVERSE but not in this list is
@@ -223,7 +328,7 @@ const RESEARCH_KNOWN_MID_OR_SMALLER_CAP = [
 
 // Standard-ish large-cap floor. Used only as a live fallback for tickers
 // NOT in RESEARCH_UNIVERSE (i.e. pulled dynamically from your actual
-// Quick/Risky/Leap tabs) — those aren't covered by the hand-classification
+// Quick/Leap tabs) — those aren't covered by the hand-classification
 // above, so their tier is resolved from a real (cached) market cap lookup
 // instead of guessed.
 const RESEARCH_LARGE_CAP_MIN_MARKET_CAP = 10e9; // $10B
@@ -313,7 +418,7 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
   // Same bars again — feeds Quick's meanReversionSetupScore_ snapback
   // bonus (see computeSnapbackRecoveryPercent_ in Options_Validator.gs).
   const snapbackRecoveryPercent = computeSnapbackRecoveryPercent_(bars);
-  // Same bars again — Quick/Risky "in play" volume factor (null if the cached bars carry no volume).
+  // Same bars again — Quick "in play" volume factor (null if the cached bars carry no volume).
   const inPlayRatio = computeInPlayRatio_(bars);
 
   const analystResult = getSlowCached_(slowCache, pendingWrites, 'ANALYST', ticker, SLOW_REFRESH_DAYS.ANALYST, function () {
@@ -359,7 +464,7 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
 
 
 /* ============================================================================
- * SCORING — one function per objective shape (Quick/Risky share a shape,
+ * SCORING — one function per objective shape (Quick share a shape,
  * Leap is different), built entirely from Momentum.gs's existing 0-100
  * sub-scorers. 'C' is passed as optionType throughout, matching this whole
  * project's long-call-only convention.
@@ -368,6 +473,8 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
 function computeResearchScoreForTab_(tabName, inputs) {
   const w = RESEARCH_WEIGHTS[tabName];
   const priceFit = priceFitScore_(inputs.spot);
+
+  if (tabName === 'Leap' && inputs.leapStage2) return computeLeapDailyResearchScore_(inputs);
 
   if (tabName === 'Leap') {
     const quality = qualityScore_(inputs.qualityScore);
@@ -385,14 +492,12 @@ function computeResearchScoreForTab_(tabName, inputs) {
   const pullback = pullbackOpportunityScore_(inputs.momentumPercent, 'C');
   const trend = trendAlignmentScore_(inputs.trendPercent, 'C');
   // Quick is large/mega-cap only — use the scale calibrated for that
-  // pool (see atrOpportunityScoreLargeCap_'s doc comment). Risky is
-  // uncapped and keeps the original broad-universe scale.
+  // pool (see researchSameDayAtrScore_).
   const atr = researchSameDayAtrScore_(tabName, inputs.atrPercent);
   const rs = relativeStrengthScore_(inputs.rsPercent, 'C');
   const lowDrawdown = 100 - drawdownRiskScore_(inputs.maxDrawdownPercent);
-  // trackRecord and quality only exist in Quick's weights (undefined for
-  // Risky) — ||0 means neither contributes anything for Risky, leaving
-  // that formula completely unchanged.
+  // trackRecord and quality only exist in Quick's weights; ||0 keeps the
+  // formula safe if a weight is ever left out.
   const trackRecordWeight = w.trackRecord || 0;
   const trackRecord = trackRecordWeight ? personalTrackRecordScore_(inputs.trackRecordAvgReturn, inputs.trackRecordTradeCount) : 0;
   const qualityWeight = w.quality || 0;
@@ -426,7 +531,16 @@ function computeMissingWeightShare_(tabName, inputs) {
   let missingWeight = 0;
   let totalWeight;
 
-  if (tabName === 'Leap') {
+  if (tabName === 'Leap' && inputs.leapStage2) {
+    const lw = RESEARCH_LEAP_DAILY.weights;
+    totalWeight = lw.quality + lw.upside + lw.rs + lw.trend200 + lw.nearHigh + lw.drawdown + lw.pullback + lw.priceFit;
+    if (inputs.qualityScore == null) missingWeight += lw.quality;
+    if (inputs.upsidePercent == null) missingWeight += lw.upside;
+    if (inputs.rsPercent == null) missingWeight += lw.rs;
+    if (!inputs.leapDaily) missingWeight += lw.trend200 + lw.nearHigh;
+    if (inputs.maxDrawdownPercent == null) missingWeight += lw.drawdown;
+    if (inputs.momentumPercent == null) missingWeight += lw.pullback;
+  } else if (tabName === 'Leap') {
     totalWeight = w.quality + w.trend + w.pullback + w.rs + w.upside + w.drawdown + w.priceFit;
     if (inputs.qualityScore == null) missingWeight += w.quality;
     if (inputs.trendPercent == null) missingWeight += w.trend;
@@ -438,8 +552,7 @@ function computeMissingWeightShare_(tabName, inputs) {
     // trackRecord deliberately excluded here — a ticker with no trades
     // yet isn't "missing data," it's a normal, expected state, already
     // handled by personalTrackRecordScore_'s own neutral default.
-    // quality (Quick-only; w.quality is undefined for Risky) follows
-    // the same null-check pattern as everywhere else.
+    // quality follows the same null-check pattern as everywhere else.
     const qualityWeight = w.quality || 0;
     const meanReversionWeight = w.meanReversion || 0;
     const overextensionWeight = w.overextension || 0;
@@ -467,8 +580,18 @@ function buildResearchReason_(tabName, inputs) {
   const priceText = 'Price $' + round2_(inputs.spot) +
     (inputs.spot > RESEARCH_PRICE_PREFERENCE_THRESHOLD ? ' (over your $' + RESEARCH_PRICE_PREFERENCE_THRESHOLD + ' preference, included anyway on merit)' : '') +
     '. ';
-  const capTierText = (tabName !== 'Risky') ? 'Large/mega-cap. ' : '';
+  const capTierText = 'Large/mega-cap. ';
 
+  if (tabName === 'Leap' && inputs.leapStage2) {
+    const dd = inputs.leapDaily;
+    const dailyText = dd
+      ? ('T200 ' + pctText_(dd.t200) + ' (price vs 200-day), X50 ' + pctText_(dd.x50) + ' (50-day vs 200-day), ' + round2_(dd.offHigh) + '% below the 52-week high, daily RSI ' + (dd.rsi14d != null ? dd.rsi14d : 'n/a'))
+      : 'no daily trend data (trend and 52-week-high treated as neutral)';
+    return capTierText + priceText + 'Quality ' + (inputs.qualityScore != null ? inputs.qualityScore.toFixed(1) + '/5' : 'n/a') +
+      ', analyst upside ' + pctText_(inputs.upsidePercent) + ', ' + dailyText +
+      ', RS ' + pctText_(inputs.rsPercent) + ' vs SPY, ~2mo max drawdown ' + drawdownText +
+      ' \u2014 above its 200-day average, steady long-term conviction pick.' + confidenceNote;
+  }
   if (tabName === 'Leap') {
     const leapMomentumLabel = inputs.momentumPercent == null ? ''
       : inputs.momentumPercent < 0 ? ' (pullback)' : inputs.momentumPercent > 0 ? ' (momentum)' : '';
@@ -504,7 +627,7 @@ function buildResearchReason_(tabName, inputs) {
     ', ATR ' + (inputs.atrPercent != null ? round2_(inputs.atrPercent) + '%' : 'n/a') +
     ', trend ' + pctText_(inputs.trendPercent) + ' vs 20DMA' + inPlayText +
     ', ~2mo max drawdown ' + drawdownText + qualityText + trackRecordText + meanReversionText + overextensionText +
-    (tabName === 'Risky' ? ' \u2014 fast mover suited to a short hold.' : ' \u2014 solid short-term setup.') + confidenceNote;
+    ' \u2014 solid short-term setup.' + confidenceNote;
 }
 
 
@@ -523,16 +646,15 @@ function getOrCreateResearchSheet_() {
 
 function writeResearchSheet_(picks, nearMisses, changes, timeBudgetExceeded, processed, totalCandidates) {
   const sheet = getOrCreateResearchSheet_();
-  const headers = ['Quick Ticker', 'Quick Score', 'Quick Reason', '', 'Risky Ticker', 'Risky Score', 'Risky Reason', '', 'Leap Ticker', 'Leap Score', 'Leap Reason'];
+  const headers = ['Quick Ticker', 'Quick Score', 'Quick Reason', '', 'Leap Ticker', 'Leap Score', 'Leap Reason'];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
   sheet.setFrozenRows(1);
 
   const rows = [];
   for (let i = 0; i < RESEARCH_TOP_N; i++) {
-    const q = picks.Quick[i], r = picks.Risky[i], l = picks.Leap[i];
+    const q = picks.Quick[i], l = picks.Leap[i];
     rows.push([
       q ? q.ticker : '', q ? q.score : '', q ? q.reason : '', '',
-      r ? r.ticker : '', r ? r.score : '', r ? r.reason : '', '',
       l ? l.ticker : '', l ? l.score : '', l ? l.reason : ''
     ]);
   }
@@ -547,10 +669,9 @@ function writeResearchSheet_(picks, nearMisses, changes, timeBudgetExceeded, pro
   noteRow++;
   const nearMissRows = [];
   for (let i = 0; i < RESEARCH_NEAR_MISS_COUNT; i++) {
-    const q = nearMisses.Quick[i], r = nearMisses.Risky[i], l = nearMisses.Leap[i];
+    const q = nearMisses.Quick[i], l = nearMisses.Leap[i];
     nearMissRows.push([
       q ? q.ticker : '', q ? q.score : '', q ? q.reason : '', '',
-      r ? r.ticker : '', r ? r.score : '', r ? r.reason : '', '',
       l ? l.ticker : '', l ? l.score : '', l ? l.reason : ''
     ]);
   }
@@ -560,7 +681,7 @@ function writeResearchSheet_(picks, nearMisses, changes, timeBudgetExceeded, pro
   sheet.getRange(noteRow, 1).setValue('Changes since last run').setFontWeight('bold');
   noteRow++;
 
-  ['Quick', 'Risky', 'Leap'].forEach(function (tabName) {
+  ['Quick', 'Leap'].forEach(function (tabName) {
     sheet.getRange(noteRow, 1).setValue(tabName + ':').setFontWeight('bold');
     noteRow++;
     changes[tabName].added.forEach(function (t) {
@@ -764,10 +885,12 @@ function runDailyResearch(timeBudgetMsOverride, dryRun) {
   // deduped. Current holdings are always in the running, never excluded.
   const universeSet = {};
   RESEARCH_UNIVERSE.forEach(function (t) { universeSet[t] = true; });
-  ['Quick', 'Risky', 'Leap'].forEach(function (tabName) {
+  ['Quick', 'Leap'].forEach(function (tabName) {
     collectCurrentTabTickers_(tabName).forEach(function (t) { if (t) universeSet[t] = true; });
   });
-  const candidateTickers = Object.keys(universeSet);
+  // Both remaining tabs (Quick, Leap) are large/mega-cap only, so names hand-classified as mid/small-cap can never be picked;
+  // skipping them saves their bar/analyst fetches on every first run of the day.
+  const candidateTickers = Object.keys(universeSet).filter(function (t) { return RESEARCH_KNOWN_MID_OR_SMALLER_CAP.indexOf(t) === -1; });
 
   const finnhubApiKey = getFinnhubApiKey_();
   const fmpApiKey = getFmpApiKey_();
@@ -817,14 +940,20 @@ function runDailyResearch(timeBudgetMsOverride, dryRun) {
 
   flushSlowCacheWrites_(pendingWrites);
 
-  const tabs = ['Quick', 'Risky', 'Leap'];
+  // Leap stage 2 (see LEAP RESEARCH above); leapStage2Active stays false (previous scoring) if no trend data comes back.
+  const leapStage2Active = applyLeapStage2_(scored);
+  let leapDropped = 0;
+
+  const tabs = ['Quick', 'Leap'];
   const picks = {};
   const nearMisses = {};
   tabs.forEach(function (tabName) {
-    // Quick and Leap are restricted to large/mega-cap only — Risky is
-    // deliberately unrestricted (it needs genuine volatility to hit its
-    // objective in 7-14 days, which large/mega-caps structurally lack).
-    const eligible = (tabName === 'Risky') ? scored : scored.filter(function (inputs) { return inputs.isLargeOrMegaCap; });
+    // Quick and Leap are restricted to large/mega-cap only.
+    let eligible = scored.filter(function (inputs) { return inputs.isLargeOrMegaCap; });
+    if (tabName === 'Leap' && leapStage2Active) {
+      const f = filterLeapStage2Eligible_(eligible);
+      eligible = f.kept; leapDropped = f.dropped;
+    }
     const ranked = eligible
       .map(function (inputs) {
         return { ticker: inputs.ticker, score: computeResearchScoreForTab_(tabName, inputs), reason: buildResearchReason_(tabName, inputs) };
@@ -837,6 +966,7 @@ function runDailyResearch(timeBudgetMsOverride, dryRun) {
   // Compared against the LAST research run (any prior run, not "yesterday"
   // specifically) — appropriate since this is meant to run multiple times
   // a day, not once daily.
+  if (leapStage2Active) logToSheet_('Research Leap: trend filter active; ' + leapDropped + ' name(s) dropped for being at/below their 200-day average or without a golden-cross state.');
   const props = PropertiesService.getScriptProperties();
   const changes = {};
   tabs.forEach(function (tabName) {
@@ -871,7 +1001,6 @@ function runDailyResearch(timeBudgetMsOverride, dryRun) {
       : '') +
     'Candidates scored: ' + processed + ' of ' + candidateTickers.length + '\n\n' +
     'Quick: ' + changes.Quick.added.length + ' added, ' + changes.Quick.removed.length + ' removed\n' +
-    'Risky: ' + changes.Risky.added.length + ' added, ' + changes.Risky.removed.length + ' removed\n' +
     'Leap: ' + changes.Leap.added.length + ' added, ' + changes.Leap.removed.length + ' removed\n\n' +
     'See the Research tab for the full lists, scores, and reasons.'
   );
