@@ -83,11 +83,67 @@ const RESEARCH_MIN_SPOT_PRICE = 5; // filters out penny-adjacent names from the 
 // distance climbed gradually (see overextensionRiskScore_). Built from
 // the same two inputs as momentum/trend, so those two are trimmed
 // specifically harder here too, same reasoning as pullback above.
+//
+// inPlay (Quick and Risky, 6 each) — "stocks in play": the last 3 completed
+// sessions' average volume vs the prior 20 sessions' (see computeInPlayRatio_).
+// Small on purpose: an unusually active name is more likely to make a
+// same-day move, but it is not backtested here. If a ticker's cached bars
+// have no volume, the factor is neutral-filled and flagged like any other
+// missing input.
 const RESEARCH_WEIGHTS = {
-  Quick: { momentum: 5, pullback: 4, trend: 6, atr: 11, rs: 13, drawdown: 11, priceFit: 6, trackRecord: 5, quality: 13, meanReversion: 14, overextension: 12 },
-  Risky: { momentum: 14, pullback: 13, atr: 27, trend: 9, rs: 13, drawdown: 14, priceFit: 10 },
+  Quick: { momentum: 5, pullback: 4, trend: 6, atr: 11, rs: 13, drawdown: 11, priceFit: 6, trackRecord: 5, quality: 13, meanReversion: 14, overextension: 12, inPlay: 6 },
+  Risky: { momentum: 14, pullback: 13, atr: 27, trend: 9, rs: 13, drawdown: 14, priceFit: 10, inPlay: 6 },
   Leap: { quality: 22, trend: 12, pullback: 6, rs: 14, upside: 18, drawdown: 18, priceFit: 10 }
 };
+
+// Same-day ATR ramps for Quick and Risky (Research only — the ATR scorers in
+// Momentum.gs that rate actual contracts are untouched). The same-day target is
+// +1.5% on the option; for a deep in-the-money call (delta ~0.85, ~1% spread)
+// that needs roughly a 1.1% stock move, so names whose normal daily range is
+// below ~1.8% earn no ATR credit. Judgment-based calibration, not backtested:
+// the SignalLog hit rates are what should eventually tune it.
+const RESEARCH_SAMEDAY_ATR = {
+  Quick: { low: 1.8, high: 4.0 },
+  Risky: { low: 1.8, high: 6.0 }
+};
+
+// "In play" ratio thresholds: 0.8x the 20-session average volume = no credit, 1.8x or more = full credit.
+const RESEARCH_IN_PLAY = { recentDays: 3, baselineDays: 20, lowRatio: 0.8, highRatio: 1.8 };
+
+function researchSameDayAtrScore_(tabName, atrPercent) {
+  if (atrPercent == null || isNaN(atrPercent)) return 50;
+  const r = RESEARCH_SAMEDAY_ATR[tabName];
+  const clamped = clamp_(atrPercent, r.low, r.high);
+  return ((clamped - r.low) / (r.high - r.low)) * 100;
+}
+
+// Average volume of the last N completed sessions vs the N-session baseline before them.
+// Today's still-forming bar is skipped while the market is open (its partial volume would understate the ratio).
+// Returns null when the bars (e.g. an older cache entry) lack the volume data.
+function computeInPlayRatio_(bars) {
+  if (!bars || !bars.length) return null;
+  const cfg = RESEARCH_IN_PLAY;
+  let end = bars.length;
+  try {
+    const todayEt = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+    if (bars[end - 1].date === todayEt && marketSessionAt_(new Date()).open) end -= 1;
+  } catch (e) { /* if the market-session helper is unavailable, use all bars */ }
+  const vols = bars.slice(0, end).map(function (b) { return b.volume; });
+  if (vols.length < cfg.recentDays + cfg.baselineDays) return null;
+  const recent = vols.slice(-cfg.recentDays);
+  const baseline = vols.slice(-(cfg.recentDays + cfg.baselineDays), -cfg.recentDays);
+  const valid = function (arr) { return arr.every(function (v) { return v != null && isFinite(v) && v >= 0; }); };
+  if (!valid(recent) || !valid(baseline)) return null;
+  const avg = function (arr) { return arr.reduce(function (a, b) { return a + b; }, 0) / arr.length; };
+  const baseAvg = avg(baseline);
+  return baseAvg > 0 ? avg(recent) / baseAvg : null;
+}
+
+function inPlayScore_(ratio) {
+  if (ratio == null || isNaN(ratio)) return 50;
+  const cfg = RESEARCH_IN_PLAY;
+  return ((clamp_(ratio, cfg.lowRatio, cfg.highRatio) - cfg.lowRatio) / (cfg.highRatio - cfg.lowRatio)) * 100;
+}
 
 // Curated candidate universe — liquid, optionable, large/mid-cap US
 // equities spanning every major sector. Deliberately broader than any
@@ -136,7 +192,12 @@ const RESEARCH_UNIVERSE = [
   'PM', 'MO', 'TGT', 'TJX', 'CMG', 'YUM', 'CI', 'ADI', 'CDNS', 'SNPS', 'ARM',
   // Additional mid-cap growth/momentum names, mainly to give Risky (the
   // uncapped tab) more genuinely volatile candidates to choose from
-  'CELH', 'SMCI', 'U', 'PATH', 'IOT'
+  'CELH', 'SMCI', 'U', 'PATH', 'IOT',
+  // Names you trade that discovery was missing (added Oct 2026). Market caps checked
+  // against public sources: FN, ASTS, CRDO and IONQ are above the $10B large-cap line
+  // (IONQ only modestly); MP has hovered right around it (roughly $7-11B depending on
+  // the date), so it is classed as mid-cap below, i.e. Risky-only.
+  'FN', 'ASTS', 'IONQ', 'CRDO', 'MP'
 ];
 
 /* ============================================================================
@@ -157,7 +218,7 @@ const RESEARCH_KNOWN_MID_OR_SMALLER_CAP = [
   'MCHP', 'TER', 'ENTG', 'LSCC', 'PINS', 'SNAP', 'ROKU', 'MTCH', 'BMBL',
   'LYFT', 'RBLX', 'DKNG', 'PENN', 'WYNN', 'CCL', 'NCLH', 'AAL', 'LUV',
   'SYF', 'SOFI', 'BIIB', 'MRNA', 'DXCM', 'CNC', 'DVN', 'ENPH', 'FSLR',
-  'RUN', 'VRT', 'CELH', 'SMCI', 'U', 'PATH', 'IOT'
+  'RUN', 'VRT', 'CELH', 'SMCI', 'U', 'PATH', 'IOT', 'MP'
 ];
 
 // Standard-ish large-cap floor. Used only as a live fallback for tickers
@@ -252,6 +313,8 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
   // Same bars again — feeds Quick's meanReversionSetupScore_ snapback
   // bonus (see computeSnapbackRecoveryPercent_ in Options_Validator.gs).
   const snapbackRecoveryPercent = computeSnapbackRecoveryPercent_(bars);
+  // Same bars again — Quick/Risky "in play" volume factor (null if the cached bars carry no volume).
+  const inPlayRatio = computeInPlayRatio_(bars);
 
   const analystResult = getSlowCached_(slowCache, pendingWrites, 'ANALYST', ticker, SLOW_REFRESH_DAYS.ANALYST, function () {
     let a = fetchYahooAnalystTarget_(ticker);
@@ -289,7 +352,8 @@ function gatherResearchInputs_(ticker, spyBars, finnhubApiKey, fmpApiKey, alphaV
     isLargeOrMegaCap: isLargeOrMegaCap, fetchAttempted: fetchAttempted,
     trackRecordAvgReturn: tickerTrackRecord ? tickerTrackRecord.avgReturnPercent : null,
     trackRecordTradeCount: tickerTrackRecord ? tickerTrackRecord.tradeCount : 0,
-    snapbackRecoveryPercent: snapbackRecoveryPercent
+    snapbackRecoveryPercent: snapbackRecoveryPercent,
+    inPlayRatio: inPlayRatio
   };
 }
 
@@ -323,7 +387,7 @@ function computeResearchScoreForTab_(tabName, inputs) {
   // Quick is large/mega-cap only — use the scale calibrated for that
   // pool (see atrOpportunityScoreLargeCap_'s doc comment). Risky is
   // uncapped and keeps the original broad-universe scale.
-  const atr = (tabName === 'Quick') ? atrOpportunityScoreLargeCap_(inputs.atrPercent) : atrOpportunityScore_(inputs.atrPercent);
+  const atr = researchSameDayAtrScore_(tabName, inputs.atrPercent);
   const rs = relativeStrengthScore_(inputs.rsPercent, 'C');
   const lowDrawdown = 100 - drawdownRiskScore_(inputs.maxDrawdownPercent);
   // trackRecord and quality only exist in Quick's weights (undefined for
@@ -340,10 +404,12 @@ function computeResearchScoreForTab_(tabName, inputs) {
   // other factor here is "higher = better", same reason lowDrawdown
   // inverts drawdownRiskScore_ above.
   const lowOverextension = overextensionWeight ? (100 - overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent)) : 0;
-  const totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + trackRecordWeight + qualityWeight + meanReversionWeight + overextensionWeight;
+  const inPlayWeight = w.inPlay || 0;
+  const inPlay = inPlayWeight ? inPlayScore_(inputs.inPlayRatio) : 0;
+  const totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + trackRecordWeight + qualityWeight + meanReversionWeight + overextensionWeight + inPlayWeight;
   const weightedSum = momentum * w.momentum + pullback * w.pullback + trend * w.trend + atr * w.atr + rs * w.rs +
     lowDrawdown * w.drawdown + priceFit * w.priceFit + trackRecord * trackRecordWeight + quality * qualityWeight +
-    meanReversion * meanReversionWeight + lowOverextension * overextensionWeight;
+    meanReversion * meanReversionWeight + lowOverextension * overextensionWeight + inPlay * inPlayWeight;
   return Math.round((weightedSum / totalWeight) * 10) / 10;
 }
 
@@ -377,7 +443,8 @@ function computeMissingWeightShare_(tabName, inputs) {
     const qualityWeight = w.quality || 0;
     const meanReversionWeight = w.meanReversion || 0;
     const overextensionWeight = w.overextension || 0;
-    totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + qualityWeight + meanReversionWeight + overextensionWeight;
+    const inPlayWeight = w.inPlay || 0;
+    totalWeight = w.momentum + w.pullback + w.trend + w.atr + w.rs + w.drawdown + w.priceFit + qualityWeight + meanReversionWeight + overextensionWeight + inPlayWeight;
     if (inputs.momentumPercent == null) missingWeight += (w.momentum + w.pullback + meanReversionWeight + overextensionWeight);
     else if (inputs.trendPercent == null) missingWeight += (meanReversionWeight + overextensionWeight); // avoid double-adding if momentum was already null
     if (inputs.trendPercent == null) missingWeight += w.trend;
@@ -385,6 +452,7 @@ function computeMissingWeightShare_(tabName, inputs) {
     if (inputs.rsPercent == null) missingWeight += w.rs;
     if (inputs.maxDrawdownPercent == null) missingWeight += w.drawdown;
     if (qualityWeight && inputs.qualityScore == null) missingWeight += qualityWeight;
+    if (inPlayWeight && inputs.inPlayRatio == null) missingWeight += inPlayWeight;
   }
 
   return totalWeight > 0 ? (missingWeight / totalWeight) * 100 : 0;
@@ -420,6 +488,8 @@ function buildResearchReason_(tabName, inputs) {
   const qualityText = (tabName === 'Quick')
     ? (', Quality ' + (inputs.qualityScore != null ? inputs.qualityScore.toFixed(1) + '/5' : 'n/a'))
     : '';
+  const inPlayText = ', volume ' + (inputs.inPlayRatio != null ? round2_(inputs.inPlayRatio) + 'x its 20-day average (last 3 sessions)' : 'n/a') +
+    (inputs.inPlayRatio != null && inputs.inPlayRatio >= RESEARCH_IN_PLAY.highRatio ? ' \u2014 in play' : '');
   const overextensionScoreForText = (tabName === 'Quick') ? overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent) : 0;
   const overextensionText = (tabName === 'Quick' && overextensionScoreForText >= 40)
     ? ' \u2014 run up fast and far above trend, elevated snapback risk'
@@ -432,7 +502,7 @@ function buildResearchReason_(tabName, inputs) {
   return capTierText + priceText + '5D change ' + pctText_(inputs.momentumPercent) + momentumLabel +
     ', RS ' + pctText_(inputs.rsPercent) + ' vs SPY' +
     ', ATR ' + (inputs.atrPercent != null ? round2_(inputs.atrPercent) + '%' : 'n/a') +
-    ', trend ' + pctText_(inputs.trendPercent) + ' vs 20DMA' +
+    ', trend ' + pctText_(inputs.trendPercent) + ' vs 20DMA' + inPlayText +
     ', ~2mo max drawdown ' + drawdownText + qualityText + trackRecordText + meanReversionText + overextensionText +
     (tabName === 'Risky' ? ' \u2014 fast mover suited to a short hold.' : ' \u2014 solid short-term setup.') + confidenceNote;
 }
