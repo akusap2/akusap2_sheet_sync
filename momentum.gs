@@ -117,7 +117,11 @@ const HEADER_MAP = {
   rsi1m: ['R30', 'RSI 1m', 'RSI 1M', 'RSI1m', 'RSI'],
   // Price vs today's session VWAP (percent) and relative volume (today so far vs same time on prior days).
   vwapPct: ['VW', 'VWAP %', 'VWAP'],
-  relVol: ['RV', 'RW', 'RVOL', 'Rel Vol']
+  relVol: ['RV', 'RW', 'RVOL', 'Rel Vol'],
+  // Same-day feasibility (information only, Quick/Risky): stock move needed for the option to gain SAMEDAY_TARGET_PCT net of
+  // spread, and the estimated chance the stock touches that level before the close.
+  needMove: ['MV', 'Need Move'],
+  pToday: ['P1D', 'P Today']
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -182,8 +186,11 @@ const INTRADAY_SIGNAL = {
 };
 // Entry/exit colors and the signal log apply only to these tabs; Leap just shows the values.
 const INTRADAY_SIGNAL_SHEETS = ['Quick', 'Risky'];
+// Same-day target for the feasibility columns and the self-grading log (the existing +3% playbook/Score logic is untouched).
+const SAMEDAY_TARGET_PCT = 1.5;
 const SIGNAL_LOG_SHEET = 'SignalLog';
-const SIGNAL_LOG_HEADERS = ['Time', 'Tab', 'Ticker', 'Strike', 'Expiry', 'Signal', 'AUP', 'ADN', 'RSI 1m', 'RSI low 5m', 'VW %', 'RV', 'SPY', 'Stock', 'Option', 'Spread %', 'Source', 'Outcome (fill later)'];
+const SIGNAL_LOG_HEADERS = ['Time', 'Tab', 'Ticker', 'Strike', 'Expiry', 'Signal', 'AUP', 'ADN', 'RSI 1m', 'RSI low 5m', 'VW %', 'RV', 'SPY', 'Stock', 'Option', 'Spread %', 'Source', 'Outcome (fill later)',
+  'P1D at signal', 'MV % at signal', 'Peak % net', 'Hit +' + SAMEDAY_TARGET_PCT + '%', 'Min to hit', 'Last % net', 'Last updated'];
 const STALE_ROW_SHEETS = ['Quick', 'Risky', 'Leap'];
 
 // NYSE full-day closures and 1:00 pm early closes (ET). Source: NYSE Group holiday
@@ -6453,6 +6460,94 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
   return results;
 }
 
+// Same-day feasibility. Option move needed = target% of price + the full bid/ask spread; stock move = that / delta.
+// Chance the stock touches the needed level before the close (driftless random walk, barrier-hit formula
+// 2*(1 - N(b / (sigma*sqrt(T))))). Returns null when an input is missing.
+function sameDayFeasibility_(meta, sigmaPerMinPct, minutesLeft, targetPct) {
+  const P0 = meta.optionPrice, d = Math.abs(meta.delta), S = meta.stockPrice, sp = meta.spreadPct;
+  const vals = [P0, d, S, sp, sigmaPerMinPct, minutesLeft];
+  for (let k = 0; k < vals.length; k++) if (vals[k] == null || !isFinite(vals[k])) return null;
+  if (P0 <= 0 || S <= 0 || d < 0.1 || sigmaPerMinPct <= 0 || minutesLeft < 5) return null;
+  const optMove = P0 * targetPct / 100 + P0 * sp / 100;
+  const movePct = optMove / d / S * 100;
+  const a = Math.log(1 + movePct / 100) / ((sigmaPerMinPct / 100) * Math.sqrt(minutesLeft));
+  const prob = Math.round(2 * (1 - normCdf_(a)) * 100);
+  return {
+    movePct: Math.round(movePct * 100) / 100,
+    prob: Math.max(0, Math.min(99, prob)),
+    note: 'Same-day estimate for +' + targetPct + '% on the option, net of the spread: needs the stock to move about ' + (Math.round(movePct * 100) / 100) +
+      '% (option +$' + (Math.round(optMove * 100) / 100) + ' at delta ' + (Math.round(d * 100) / 100) + ') within ' + Math.round(minutesLeft) + ' min. Recent volatility ' +
+      sigmaPerMinPct + '%/sqrt(min) gives about ' + Math.max(0, Math.min(99, prob)) + '% chance it touches that level. Random-walk estimate: ignores the dip-bounce edge, theta and delta growth.'
+  };
+}
+
+function signalRowKey_(tab, ticker, strike, expiry) {
+  const ex = (expiry instanceof Date) ? Utilities.formatDate(expiry, 'America/New_York', 'yyyyMMdd') : String(expiry);
+  return tab + '|' + ticker + '|' + String(strike) + '|' + ex;
+}
+
+// Pure grading core (testable): updates the grading columns of today's ENTRY rows from the current run's option prices.
+// Net return = sell at the current bid-equivalent vs the cost at the signal's ask-equivalent. Rows with no hit are
+// finalized as NO once the market has closed (or the day has passed). Returns true if anything changed.
+function gradeEntryRows_(vals, snapshot, sheetName, nowDate, marketOpen, todayStr) {
+  const IDX = { time: 0, tab: 1, ticker: 2, strike: 3, expiry: 4, signal: 5, opt: 14, spread: 15, peak: 20, hit: 21, minHit: 22, last: 23, updated: 24 };
+  let changed = false;
+  vals.forEach(function (r) {
+    if (String(r[IDX.signal]).indexOf('ENTRY') !== 0) return;
+    if (r[IDX.hit] === 'YES' || r[IDX.hit] === 'NO') return;
+    const t = (r[IDX.time] instanceof Date) ? r[IDX.time] : new Date(r[IDX.time]);
+    if (isNaN(t.getTime())) return;
+    const isToday = Utilities.formatDate(t, 'America/New_York', 'yyyy-MM-dd') === todayStr;
+    const cur = (r[IDX.tab] === sheetName) ? snapshot[signalRowKey_(r[IDX.tab], r[IDX.ticker], r[IDX.strike], r[IDX.expiry])] : undefined;
+    if (cur && marketOpen && isToday) {
+      const optLog = parseFloat(r[IDX.opt]), spLog = parseFloat(r[IDX.spread]);
+      if (!isFinite(optLog) || optLog <= 0) return;
+      const cost = optLog * (1 + (isFinite(spLog) ? spLog : 0) / 200);
+      const value = cur.opt * (1 - cur.spread / 200);
+      const ret = (value / cost - 1) * 100;
+      const prevPeak = parseFloat(r[IDX.peak]);
+      r[IDX.peak] = Math.round(Math.max(isFinite(prevPeak) ? prevPeak : -Infinity, ret) * 100) / 100;
+      r[IDX.last] = Math.round(ret * 100) / 100;
+      r[IDX.updated] = nowDate;
+      if (r[IDX.hit] !== 'YES' && r[IDX.peak] >= SAMEDAY_TARGET_PCT && ret >= SAMEDAY_TARGET_PCT) {
+        r[IDX.hit] = 'YES';
+        r[IDX.minHit] = Math.round((nowDate.getTime() - t.getTime()) / 60000);
+      }
+      changed = true;
+    } else if (!isToday || !marketOpen) {
+      r[IDX.hit] = 'NO';
+      r[IDX.updated] = nowDate;
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+// Self-grading: reads recent SignalLog rows only when a signal was logged in the last 36 hours, so most runs skip it.
+function updateSignalOutcomes_(sheetName, snapshot, runTimestamp, marketOpen) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    let state = {};
+    try { state = JSON.parse(props.getProperty('SIGNAL_LOG_STATE') || '{}'); } catch (e) { state = {}; }
+    const nowMs = runTimestamp.getTime();
+    if (!Object.keys(state).some(function (k) { return nowMs - state[k] < 36 * 3600000; })) return;
+    const log = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SIGNAL_LOG_SHEET);
+    if (!log) return;
+    const lastRow = log.getLastRow();
+    if (lastRow < 2) return;
+    const n = Math.min(lastRow - 1, 200);
+    const first = lastRow - n + 1;
+    const vals = log.getRange(first, 1, n, SIGNAL_LOG_HEADERS.length).getValues();
+    const todayStr = Utilities.formatDate(runTimestamp, 'America/New_York', 'yyyy-MM-dd');
+    if (gradeEntryRows_(vals, snapshot, sheetName, runTimestamp, marketOpen, todayStr)) {
+      log.getRange(first, 21, n, 5).setValues(vals.map(function (r) { return r.slice(20, 25); }));
+      log.getRange(first, 25, n, 1).setNumberFormat('m/d/yyyy h:mm:ss');
+    }
+  } catch (e) {
+    logToSheet_('Signal outcome update failed (run continues): ' + e);
+  }
+}
+
 // Appends new strong-entry / exit signals to the SignalLog tab (created on first use). The same signal on the same
 // contract is logged at most once per INTRADAY_SIGNAL.logCooldownMin minutes (state kept in script properties).
 // Never lets a logging problem break the run.
@@ -6477,6 +6572,10 @@ function appendSignalLog_(items, runTimestamp) {
       log.getRange(1, 1, 1, SIGNAL_LOG_HEADERS.length).setValues([SIGNAL_LOG_HEADERS]).setFontWeight('bold');
       log.setFrozenRows(1);
     }
+    const hdrNow = log.getRange(1, 1, 1, SIGNAL_LOG_HEADERS.length).getValues()[0];
+    if (hdrNow.join('|') !== SIGNAL_LOG_HEADERS.join('|')) {   // older logs: add the new right-hand columns, existing ones untouched
+      log.getRange(1, 1, 1, SIGNAL_LOG_HEADERS.length).setValues([SIGNAL_LOG_HEADERS]).setFontWeight('bold');
+    }
     const startRow = Math.max(log.getLastRow(), 1) + 1;
     log.getRange(startRow, 1, fresh.length, SIGNAL_LOG_HEADERS.length).setValues(fresh.map(function (it) { return it.row; }));
     log.getRange(startRow, 1, fresh.length, 1).setNumberFormat('m/d/yyyy h:mm:ss');
@@ -6493,7 +6592,7 @@ function appendSignalLog_(items, runTimestamp) {
 function prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow) {
   const out = { atmPut: {}, intraday: {} };
   const wantPut = !!map.atmPut;
-  const wantIntraday = !!(map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol);
+  const wantIntraday = !!(map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol || map.needMove || map.pToday);
   if (!wantPut && !wantIntraday) return out;
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
@@ -6947,7 +7046,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
 
     // AUP / ADN / R30 / VW / RV values (same for every row of a ticker). Colors and notes are applied after the loop
     // (they need this row's final Risk / Price / Entry / spread).
-    if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol) {
+    if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol || map.needMove || map.pToday) {
       const iv = intradayMap[ticker] || null;
       ivRowState[rowIdx] = iv;
       const put_ = function (col, val, fmt) { if (col) { rowOut[col - 1] = (iv && val != null) ? val : ''; if (iv && val != null) fmtOut[col - 1] = fmt; } };
@@ -7853,7 +7952,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning, quoteAgeWarning].filter(function (w) { return w != null; });
     const statusText = warnings.length ? (baseStatusText + ' | ⚠️ ' + warnings.join(' ⚠️ ')) : baseStatusText;
 
-    ivRowMeta[rowIdx] = { spreadPct: merged.bidAskSpreadPct, stockPrice: merged.stockPrice };
+    ivRowMeta[rowIdx] = { spreadPct: merged.bidAskSpreadPct, stockPrice: merged.stockPrice, delta: merged.greekDelta, optionPrice: merged.optionPrice };
     writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'), true);
 
     // This delay exists to protect TastyTrade/Yahoo from rapid-fire
@@ -7890,7 +7989,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   }
 
   // AUP / ADN / R30 / VW / RV colors, notes and the signal log (see the INTRADAY_SIGNAL block at the top of this file).
-  if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol) {
+  if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol || map.needMove || map.pToday) {
     const ivCols = [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol].filter(function (c) { return !!c; });
     const S = INTRADAY_SIGNAL;
     const sess = marketSessionAt_(runTimestamp);
@@ -7905,13 +8004,14 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       ? ('SPY ' + (spy.vwapPct != null ? ((spy.vwapPct >= 0 ? '+' : '') + spy.vwapPct + '% vs VWAP') : 'VWAP n/a') + ', AUP ' + spy.aroonUp + ' / ADN ' + spy.aroonDown + (spyHead ? ' (headwind)' : ' (ok)'))
       : 'SPY data missing (not blocking)';
     const logRows = [];
+    const outSnap = {};   // contract key -> { opt, spread } for grading earlier signals
     const fmtNum_ = function (v, d) { return (v == null || isNaN(v)) ? '' : Math.round(v * Math.pow(10, d)) / Math.pow(10, d); };
 
     Object.keys(ivRowState).forEach(function (key) {
       const i = parseInt(key, 10);
       const iv = ivRowState[key];
       const meta = ivRowMeta[key] || {};
-      let color = '#ffffff', note = '', signal = null;
+      let color = '#ffffff', note = '', signal = null, ivStaleFlag = false;
       if (!iv) {
         color = INTRADAY_STALE_COLOR;
         note = 'Not refreshed this run (no data came back from TastyTrade or Yahoo).';
@@ -7920,6 +8020,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         const stale = sess.open && sess.minutesSinceOpen > INTRADAY_STALE_MIN && barAgeMin != null && barAgeMin > INTRADAY_STALE_MIN;
         note = 'Aroon (5-min, 25), RSI (1-min, 14), VWAP and relative volume from ' + (iv.source || 'unknown') +
           (barAgeMin != null ? ('; newest 1-minute bar ' + formatQuoteAge_(Math.max(0, barAgeMin)) + ' old') : '') + '. ' + spyText + '.';
+        ivStaleFlag = stale;
         if (stale) {
           color = INTRADAY_STALE_COLOR;
           note += ' STALE: older than ' + INTRADAY_STALE_MIN + 'm while the market is open.';
@@ -7976,12 +8077,23 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
       ivCols.forEach(function (c) { allBackgrounds[i][c - 1] = color; allNotes[i][c - 1] = note; });
 
+      // MV / P1D: same-day feasibility for +SAMEDAY_TARGET_PCT% (information only; never changes the colors above).
+      let fz = null;
+      if (sigSheet && iv && !ivStaleFlag && sess.open) fz = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
+      if (map.needMove) { allValues[i][map.needMove - 1] = fz ? fz.movePct : ''; allNumberFormats[i][map.needMove - 1] = '0.00'; allNotes[i][map.needMove - 1] = fz ? fz.note : ''; }
+      if (map.pToday) { allValues[i][map.pToday - 1] = fz ? fz.prob : ''; allNumberFormats[i][map.pToday - 1] = '0'; allNotes[i][map.pToday - 1] = fz ? fz.note : ''; }
+      if (sigSheet && iv && map.strike && map.expiry && meta.optionPrice != null && isFinite(meta.optionPrice)) {
+        outSnap[signalRowKey_(sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], allValues[i][map.expiry - 1])] =
+          { opt: meta.optionPrice, spread: (meta.spreadPct != null && isFinite(meta.spreadPct)) ? meta.spreadPct : 0 };
+      }
+
       if (signal && !dryRun) {
         logRows.push({
           key: sheet.getName() + '|' + allValues[i][map.ticker - 1] + '|' + allValues[i][map.strike - 1] + '|' + signal.split(' ')[0],
           row: [runTimestamp, sheet.getName(), allValues[i][map.ticker - 1], allValues[i][map.strike - 1], allValues[i][map.expiry - 1], signal,
             iv.aroonUp, iv.aroonDown, iv.rsi1m, iv.rsiMin5, iv.vwapPct, iv.rvol, spyText, fmtNum_(meta.stockPrice, 2),
-            map.optionPrice ? allValues[i][map.optionPrice - 1] : '', fmtNum_(meta.spreadPct, 2), iv.source || '', '']
+            map.optionPrice ? allValues[i][map.optionPrice - 1] : '', fmtNum_(meta.spreadPct, 2), iv.source || '', '',
+            fz ? fz.prob : '', fz ? fz.movePct : '', '', '', '', '', '']
         });
       }
     });
@@ -7989,6 +8101,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // One header note (first of these columns): SPY state right now.
     sheet.getRange(HEADER_ROW, ivCols[0]).setNote('Market filter (strong green is blocked only when SPY is below its VWAP AND Aroon Down is above Aroon Up): ' + spyText + '.');
     if (logRows.length) appendSignalLog_(logRows, runTimestamp);
+    if (sigSheet && !dryRun) updateSignalOutcomes_(sheet.getName(), outSnap, runTimestamp, sess.open);
   }
 
   // LastRun cell: strong fill + note listing why when any data in the row is stale;
