@@ -108,7 +108,9 @@ const HEADER_MAP = {
   // Read-only lookup — this script never writes PtN, only uses it to know
   // which column to apply a standout background to. See
   // applyStandoutColumnHighlights_ further down.
-  ptN: ['PtN', 'Pt N']
+  ptN: ['PtN', 'Pt N'],
+  // Optional: nearest-the-money put for the upcoming Friday, refreshed every run via the Cloud Function.
+  atmPut: ['Put', 'ATM Put']
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -140,6 +142,8 @@ const TIMESTAMP_HEADER = 'LastRun';
 const QUOTE_WARN_AGE_MIN = 30;
 const QUOTE_STALE_BLANKS_SCORE = false;   // true = also clear Score/Risk on a row whose quote is older than the limit
 const STALE_STATUS_COLOR = '#f9cb9c';
+// LastRun cell fill when any of that row's data is stale/unrefreshed this run; every other row's LastRun stays white.
+const LASTRUN_STALE_COLOR = '#ff9900';
 const STALE_ROW_SHEETS = ['Quick', 'Risky', 'Leap'];
 
 // NYSE full-day closures and 1:00 pm early closes (ET). Source: NYSE Group holiday
@@ -1004,22 +1008,14 @@ const FMP_BASE_URL = 'https://financialmodelingprep.com/api/v3';
 const TRACKED_FIELDS = {
   optionPrice: 'Price',
   volume: 'Volume',
-  ivRank: 'IV Rank',
-  atrPercent: 'ATR%',
   oi: 'OI',
-  greekDelta: 'Delta',
-  gamma: 'Gamma',
-  bidAskSpread: 'Slippage',
   extrinsicValue: 'Extra',
   analystTarget: 'Analyst',
-  daysToExpiry: 'Days',
   daysToCatalyst: 'Catalyst',
   changeNow: '%age',
   changeValue: 'Value',
-  relativeStrength: 'RS vs SPY',
   sectorMomentum: 'Sector Momentum',
   riskScore: 'Risk',
-  filterScore: 'Filter',
   themeCluster: 'Theme / Cluster'
 };
 
@@ -6417,6 +6413,65 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
   return results;
 }
 
+// "Put" column: closest-to-the-money put expiring the upcoming Friday (today if it is
+// Friday and the market is still open), premium = mid. One Cloud Function request for
+// all unique tickers; returns {} (every row shows n/a + stale flag) if it can't run.
+function prefetchAtmPutsViaCloudFunction_(sheet, map, lastRow) {
+  const cloudFunctionUrl = getCloudFunctionUrl_();
+  const sharedSecret = getCloudFunctionSharedSecret_();
+  if (!cloudFunctionUrl || !sharedSecret) return {};
+  const numRows = lastRow - DATA_START_ROW + 1;
+  if (numRows <= 0) return {};
+  const tickerValues = sheet.getRange(DATA_START_ROW, map.ticker, numRows, 1).getValues();
+  const tickers = [];
+  const seen = {};
+  for (let i = 0; i < numRows; i++) {
+    if (!tickerValues[i][0]) continue;
+    const t = String(tickerValues[i][0]).trim().toUpperCase();
+    if (seen[t]) continue;
+    seen[t] = true;
+    tickers.push(t);
+  }
+  if (!tickers.length) return {};
+
+  const startTime = Date.now();
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(cloudFunctionUrl, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ apiKey: sharedSecret, atmPut: { tickers: tickers } }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    logToSheet_('Cloud Function ATM Put prefetch FAILED (network error): ' + e);
+    return {};
+  }
+  if (resp.getResponseCode() !== 200) {
+    logToSheet_('Cloud Function ATM Put prefetch FAILED (HTTP ' + resp.getResponseCode() + ') \u2014 is the Cloud Function redeployed? ' + resp.getContentText().substring(0, 200));
+    return {};
+  }
+  let json;
+  try { json = JSON.parse(resp.getContentText()); } catch (e) {
+    logToSheet_('Cloud Function ATM Put prefetch FAILED (unparseable response): ' + e);
+    return {};
+  }
+  const results = json.atmPutResults || {};
+  const errCount = Object.keys(json.atmPutErrors || {}).length;
+  logToSheet_('Cloud Function ATM Put prefetch: ' + tickers.length + ' ticker(s) requested in ' + (Date.now() - startTime) + 'ms \u2014 ' +
+    Object.keys(results).length + ' found' + (errCount ? (', ' + errCount + ' failed') : '') + '.' +
+    ((json.atmPutDiagnostics && json.atmPutDiagnostics.atmPut) ? (' Sample failure: ' + json.atmPutDiagnostics.atmPut) : ''));
+  return results;
+}
+
+// "$270P 10/9 @ $3.45" (a weekday is added when the expiry is not a Friday, e.g. "10/8 Thu").
+function formatAtmPutText_(ap) {
+  const strike = Math.round(ap.strike * 100) / 100;
+  const m = parseInt(ap.expiry.slice(5, 7), 10), d = parseInt(ap.expiry.slice(8, 10), 10);
+  const wd = ap.weekday === 5 ? '' : (' ' + ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][ap.weekday]);
+  const prem = ap.mid != null ? ('$' + ap.mid.toFixed(2)) : 'no quote';
+  return '$' + strike + 'P ' + m + '/' + d + wd + ' @ ' + prem;
+}
+
 function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const sheet = sheetOverride || SpreadsheetApp.getActiveSheet();
   const map = getColumnMap_(sheet);
@@ -6426,6 +6481,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // the sheet from before — see FONT COLOR POLICY further down for what
   // replaced it (resetNeutralColumnFontColor_ / FONT_COLOR_EXEMPT_KEYS).
   removeLegacySignBasedFontRules_(sheet);
+  removeLastRunConditionalRules_(sheet, map);
 
   const required = ['ticker', 'strike', 'expiry'];
   const missing = required.filter(function (k) { return !map[k]; });
@@ -6620,6 +6676,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // unreachable, or misses a specific ticker, and the per-row block
   // falls back to the original individual fetch exactly as before.
   const stockRangeMap = prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow);
+  const atmPutMap = map.atmPut ? prefetchAtmPutsViaCloudFunction_(sheet, map, lastRow) : {};
 
   // Personal track record — Quick only, by explicit request. Pure local
   // sheet read (no network call), so computed once here regardless of
@@ -6690,6 +6747,11 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // Quick/Risky/Leap: wipe the decision cells (Score, Risk) on a row whose data
   // could not be refreshed, so a stale number can't rank or earn a border.
   const clearsStaleRows = STALE_ROW_SHEETS.indexOf(sheet.getName()) !== -1 && !!map.score && !!map.riskScore;
+  // Rows whose data is stale this run -> reasons (drives the LastRun cell color/note at the end).
+  const staleReasons = {};
+  function markStale_(rowIdx, reason) {
+    (staleReasons[rowIdx] = staleReasons[rowIdx] || []).push(reason);
+  }
   function clearDecisionCells_(rowIdx) {
     if (!clearsStaleRows) return false;
     const hadValue = (allValues[rowIdx][map.score - 1] !== '' && allValues[rowIdx][map.score - 1] != null) ||
@@ -6734,6 +6796,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
 
     if (!parsedStrike || !parsedExpiry) {
       clearDecisionCells_(rowIdx);
+      markStale_(rowIdx, 'Strike/Expiry unreadable');
       writeStatusBuffered_(rowIdx, 'PARSE ERROR — check Strike/Expiry format' + (clearsStaleRows ? ' | Score/Risk cleared' : ''), '#f4cccc');
       failCount++;
       continue;
@@ -6766,11 +6829,28 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // ticker the prefetch didn't cover.
     if (map.stockPrice || map.l52 || map.h52 || map.cap) {
       const range52 = stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker);
+      if (!range52) markStale_(rowIdx, 'StockPrice/52-week range not refreshed');
       if (range52) {
         if (map.stockPrice && range52.price != null) rowOut[map.stockPrice - 1] = round2_(range52.price);
         if (map.l52 && range52.low52 != null) rowOut[map.l52 - 1] = round2_(range52.low52);
         if (map.h52 && range52.high52 != null) rowOut[map.h52 - 1] = round2_(range52.high52);
         if (map.cap && range52.cap != null) rowOut[map.cap - 1] = round2_(range52.cap);
+      }
+    }
+
+    // PUT column — nearest-the-money put for the upcoming Friday (same value for every row of a ticker).
+    if (map.atmPut) {
+      const ap = atmPutMap[ticker];
+      if (ap && ap.strike != null && ap.expiry) {
+        rowOut[map.atmPut - 1] = formatAtmPutText_(ap);
+        noteOut[map.atmPut - 1] = 'Closest-to-the-money put (stock $' + ap.underlying + '), expires ' + ap.expiry +
+          '. Bid ' + (ap.bid != null ? ap.bid.toFixed(2) : 'n/a') + ' / Ask ' + (ap.ask != null ? ap.ask.toFixed(2) : 'n/a') +
+          '; premium = mid.' + (ap.expiry !== ap.targetFriday ? (' Target Friday ' + ap.targetFriday + ' not listed; used the nearest expiry.') : '');
+        if (ap.mid == null) markStale_(rowIdx, 'Put has no bid/ask');
+      } else {
+        rowOut[map.atmPut - 1] = 'n/a';
+        noteOut[map.atmPut - 1] = '';
+        markStale_(rowIdx, 'Put not refreshed');
       }
     }
 
@@ -6781,6 +6861,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       ticker, accessToken, finnhubApiKey, fmpApiKey, alphaVantageApiKey,
       getSectorPerfMap_, sectorEtfCache, tickerCache, slowCache, pendingSlowWrites, slowStats, sectorOverrides, getSpyBars_, gfDataMap
     );
+    if (!(tickerData && tickerData.atrInfo && tickerData.atrInfo.atrPercent != null)) markStale_(rowIdx, 'Ticker data (ATR/RS) missing');
 
     // Yahoo's option quote is fetched LAZILY now — only when Tasty's
     // response is missing a field that actually matters downstream, OR
@@ -6809,6 +6890,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       clearDecisionCells_(rowIdx);
       writeStatusBuffered_(rowIdx, (clearsStaleRows ? 'STALE — no option quote this run, Score/Risk cleared | ' : '') +
         'NOT FOUND — verify strike/expiry', clearsStaleRows ? STALE_STATUS_COLOR : '#f4cccc');
+      markStale_(rowIdx, 'No option quote this run');
       failCount++;
       Utilities.sleep(REQUEST_DELAY_MS);
       continue;
@@ -6911,6 +6993,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         oiStaleWarning = 'OI shows ' + existingOi + ' (impossible) but neither TastyTrade nor Yahoo returned fresh OI this run — left untouched.';
       }
     }
+
+    if (oiStaleWarning) markStale_(rowIdx, 'OI invalid, no fresh OI returned');
 
     // STOCK PRICE — reads your own =GOOGLEFINANCE(ticker,"price") formula
     // directly from the row's StockPrice cell (map.stockPrice) instead of
@@ -7652,6 +7736,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (oldestQuoteMin == null || quoteAge.ageMin > oldestQuoteMin) oldestQuoteMin = quoteAge.ageMin;
       if (quoteAge.warn) {
         quoteOldCount++;
+        markStale_(rowIdx, 'Option quote ' + formatQuoteAge_(quoteAge.ageMin) + ' old (market open)');
         quoteAgeWarning = 'Option quote is ' + formatQuoteAge_(quoteAge.ageMin) + ' old while the market is open (limit ' + QUOTE_WARN_AGE_MIN + 'm)' +
           (QUOTE_STALE_BLANKS_SCORE && clearsStaleRows ? ' — Score/Risk cleared' : '');
         if (QUOTE_STALE_BLANKS_SCORE) clearDecisionCells_(rowIdx);
@@ -7687,6 +7772,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       const i = r - DATA_START_ROW;
       if (!allValues[i] || !allValues[i][map.ticker - 1]) continue;
       clearDecisionCells_(i);
+      markStale_(i, 'Not reached this run (time limit)');
       if (map.status) {
         allValues[i][map.status - 1] = clearsStaleRows
           ? 'STALE — not reached this run (time limit), Score/Risk cleared; run again to refresh'
@@ -7696,6 +7782,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       unreachedCount++;
     }
   }
+
+  // LastRun cell: strong fill + note listing why when any data in the row is stale;
+  // otherwise cleared to white. Buffered, so no extra sheet calls.
+  if (map.timestamp && map.ticker) {
+    for (let i = 0; i < allValues.length; i++) {
+      if (!allValues[i][map.ticker - 1]) continue;
+      const reasons = staleReasons[i];
+      allBackgrounds[i][map.timestamp - 1] = reasons ? LASTRUN_STALE_COLOR : '#ffffff';
+      allNotes[i][map.timestamp - 1] = reasons ? ('Stale: ' + reasons.join('; ')) : '';
+    }
+  }
+
+  if (map.timestamp) sheet.getRange(HEADER_ROW, map.timestamp).setNote('LastRun: white = row refreshed fine; orange = some data stale (hover the cell for why).');
 
   // Flush every buffered write back to the sheet now, in one bulk call
   // per property, BEFORE the sort/highlight logic below runs — that
@@ -8148,6 +8247,34 @@ function resetNeutralColumnFontColor_(sheet, map, lastRow) {
 // conditional-format rule on the sheet — safe here since this script is
 // what created them, but worth knowing if you've since added your own
 // manual rule of that same shape.
+// LastRun's color is script-owned now (white = fine, orange = stale). Any conditional-format
+// rule covering that column would override the script's fill, so the column is cut out of
+// every such rule; the rest of each rule's range is kept.
+function removeLastRunConditionalRules_(sheet, map) {
+  if (!map || !map.timestamp) return;
+  const rules = sheet.getConditionalFormatRules();
+  if (!rules.length) return;
+  const c = map.timestamp;
+  let changed = false;
+  const out = [];
+  rules.forEach(function (rule) {
+    const ranges = rule.getRanges();
+    const hits = ranges.some(function (r) { return r.getColumn() <= c && c <= r.getColumn() + r.getNumColumns() - 1; });
+    if (!hits) { out.push(rule); return; }
+    // Rebuild the rule without the LastRun column (split any range that spans it).
+    const newRanges = [];
+    ranges.forEach(function (r) {
+      const first = r.getColumn(), last = first + r.getNumColumns() - 1;
+      if (c < first || c > last) { newRanges.push(r); return; }
+      if (c > first) newRanges.push(sheet.getRange(r.getRow(), first, r.getNumRows(), c - first));
+      if (c < last) newRanges.push(sheet.getRange(r.getRow(), c + 1, r.getNumRows(), last - c));
+    });
+    changed = true;
+    if (newRanges.length) out.push(rule.copy().setRanges(newRanges).build());
+  });
+  if (changed) sheet.setConditionalFormatRules(out);
+}
+
 function removeLegacySignBasedFontRules_(sheet) {
   const existingRules = sheet.getConditionalFormatRules();
   const filtered = existingRules.filter(function (rule) {
