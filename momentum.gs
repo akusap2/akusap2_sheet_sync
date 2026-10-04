@@ -117,6 +117,71 @@ const HEADER_MAP = {
 // being set, so simply not detecting/creating the column is enough.
 const STATUS_HEADER = 'Validation Status';
 const TIMESTAMP_HEADER = 'LastRun';
+
+/* ----------------------------------------------------------------------------
+ * DATA FRESHNESS
+ *
+ * LastRun now means "last time this row's data was actually REFRESHED" — a row
+ * that fails to refresh (not found, parse error, not reached before the time
+ * limit) keeps its old LastRun instead of getting a new one, so the column shows
+ * real data age.
+ *
+ * On Quick / Risky / Leap, a row that could NOT be refreshed this run has its Score
+ * and Risk cleared and its Status set to a STALE message, so an old number can't
+ * be ranked, bordered or acted on next to fresh ones.
+ *
+ * Tasty quotes carry an `updated-at` timestamp (the Cloud Function and the Apps
+ * Script quote fetch both pass it through now). While the US market is open, a
+ * quote older than QUOTE_WARN_AGE_MIN minutes adds a warning to the row's status.
+ * That is a WARNING only (QUOTE_STALE_BLANKS_SCORE = false): a quiet far-dated
+ * option's quote may genuinely not change for a long while, and how Tasty
+ * timestamps those hasn't been checked against your real data yet.
+ * ------------------------------------------------------------------------- */
+const QUOTE_WARN_AGE_MIN = 30;
+const QUOTE_STALE_BLANKS_SCORE = false;   // true = also clear Score/Risk on a row whose quote is older than the limit
+const STALE_STATUS_COLOR = '#f9cb9c';
+const STALE_ROW_SHEETS = ['Quick', 'Risky', 'Leap'];
+
+// NYSE full-day closures and 1:00 pm early closes (ET). Source: NYSE Group holiday
+// calendar; 2027 observed-holiday dates follow the exchange's weekend rule. Add
+// next year's dates each December — a wrong date only affects the quote-age warning.
+const US_MARKET_HOLIDAYS = {
+  '2026-11-26': 1, '2026-12-25': 1,
+  '2027-01-01': 1, '2027-01-18': 1, '2027-02-15': 1, '2027-03-26': 1, '2027-05-31': 1,
+  '2027-06-18': 1, '2027-07-05': 1, '2027-09-06': 1, '2027-11-25': 1, '2027-12-24': 1
+};
+const US_MARKET_EARLY_CLOSES = { '2026-11-27': 1, '2026-12-24': 1, '2027-11-26': 1 };
+
+// { open, minutesSinceOpen } for a moment in time, in New York market hours.
+function marketSessionAt_(date) {
+  const dow = Utilities.formatDate(date, 'America/New_York', 'u');      // 1=Mon ... 7=Sun
+  const ymd = Utilities.formatDate(date, 'America/New_York', 'yyyy-MM-dd');
+  const hm = Utilities.formatDate(date, 'America/New_York', 'HH:mm');
+  if (dow === '6' || dow === '7' || US_MARKET_HOLIDAYS[ymd]) return { open: false, minutesSinceOpen: null };
+  const closeHm = US_MARKET_EARLY_CLOSES[ymd] ? '13:00' : '16:00';
+  if (hm < '09:30' || hm >= closeHm) return { open: false, minutesSinceOpen: null };
+  const parts = hm.split(':');
+  return { open: true, minutesSinceOpen: parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10) - (9 * 60 + 30) };
+}
+
+// { ageMin, warn } for a Tasty quote, or null when the quote has no usable timestamp
+// (Yahoo fallback quotes, or a Cloud Function that hasn't been redeployed yet).
+function quoteAgeInfo_(quote, now) {
+  if (!quote || quote.updatedAt == null) return null;
+  const t = Date.parse(String(quote.updatedAt));
+  if (isNaN(t)) return null;
+  const ageMin = Math.max(0, Math.round((now.getTime() - t) / 60000));
+  const session = marketSessionAt_(now);
+  // Only judge freshness once the market has been open long enough for a fresh quote to exist.
+  const judge = session.open && session.minutesSinceOpen >= QUOTE_WARN_AGE_MIN;
+  return { ageMin: ageMin, warn: judge && ageMin > QUOTE_WARN_AGE_MIN };
+}
+
+function formatQuoteAge_(ageMin) {
+  if (ageMin < 90) return ageMin + 'm';
+  if (ageMin < 36 * 60) return Math.round(ageMin / 60) + 'h';
+  return Math.round(ageMin / 1440) + 'd';
+}
 const HEADER_ROW = 1;
 const DATA_START_ROW = 2;
 const REQUEST_DELAY_MS = 300;
@@ -2194,6 +2259,7 @@ function fetchTastyTradeQuote_(occSymbol, accessToken) {
     ask: isPlausible_(ask, 0, null) ? ask : null,
     volume: isPlausible_(volume, 0, null) ? volume : null,
     openInterest: isPlausible_(openInterest, 0, null) ? openInterest : null,
+    updatedAt: item['updated-at'] != null ? String(item['updated-at']) : null,   // quote timestamp (ISO), for the freshness check
     source: 'TastyTrade'
   };
 }
@@ -5120,6 +5186,21 @@ function qrNormals_() {
   return QR_NORMALS_CACHE_;
 }
 
+// Data-quality guard shared by the Quick/Risky/Leap models. An option can't sell
+// for meaningfully less than its intrinsic value, and a call can't be worth more
+// than the stock (a put, more than the strike). When the inputs say otherwise, one
+// of them is stale or one-sided — typically a last-trade price from earlier in the
+// day, or a stock price that hasn't refreshed. Without this the model happily
+// treated a stale low price as a bargain entry and reported Risk ~0 / Score ~99.
+// Returns true when the price/stock/strike combination is inconsistent.
+function quoteLooksInconsistent_(S0, K, price, optionType, bidAskSpreadPct) {
+  const intrinsic = optionType === 'P' ? Math.max(K - S0, 0) : Math.max(S0 - K, 0);
+  const spreadPct = isPlausible_(bidAskSpreadPct, 0, 100) ? bidAskSpreadPct : 0;
+  if (price < intrinsic * (1 - 0.02 - spreadPct / 200)) return true;   // priced below intrinsic
+  if (optionType === 'P' ? price > K : price > S0) return true;        // worth more than its ceiling
+  return false;
+}
+
 // Builds everything the simulation needs for ONE contract (volatility backed
 // out of the mark, costs, event timing) so Risk and Score can share it.
 // Returns null if price, strike, expiry or a usable volatility is missing.
@@ -5130,6 +5211,7 @@ function prepareQuickRiskySim_(sheetName, inputs) {
   const optionType = inputs.optionType === 'P' ? 'P' : 'C';
   if (!isPlausible_(S0, 0.01, null) || !isPlausible_(K, 0.01, null) || !isPlausible_(price, 0.01, null) ||
       !isPlausible_(dte, 1, null)) return null;
+  if (quoteLooksInconsistent_(S0, K, price, optionType, inputs.bidAskSpreadPct)) return null;
 
   const SIM = QR_RISK_SIM;
   // Volatility, best source first: (1) backed out of the option's own price
@@ -5620,6 +5702,7 @@ function leapPrepare_(inputs) {
   const optionType = inputs.optionType === 'P' ? 'P' : 'C';
   if (!isPlausible_(S0, 0.01, null) || !isPlausible_(K, 0.01, null) || !isPlausible_(price, 0.01, null) ||
       !isPlausible_(dte, 10, null)) return null;
+  if (quoteLooksInconsistent_(S0, K, price, optionType, inputs.bidAskSpreadPct)) return null;
   let quoteSigma = null;
   if (isPlausible_(inputs.ivPercent, 1, 1000)) quoteSigma = inputs.ivPercent / 100;
   else if (isPlausible_(inputs.atrPercent, 0.05, 50)) {
@@ -6446,6 +6529,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const gfDataMap = readGfDataMap_(gfSheet);
 
   let okCount = 0, fallbackCount = 0, failCount = 0, changedCells = 0, changedRows = 0;
+  let staleClearedCount = 0, unreachedCount = 0, quoteOldCount = 0, oldestQuoteMin = null;
   let analystTargetCount = 0, changeNowCount = 0, sectorMomentumCount = 0, themeClusterCount = 0;
 
   // Slow-changing data cache: loaded ONCE for the whole run, written ONCE
@@ -6591,14 +6675,33 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // file) — same exact logic (status value + background, timestamp
   // value), just writing into this run's in-memory arrays instead of the
   // sheet directly, so it can be flushed once in bulk after the loop.
-  function writeStatusBuffered_(rowIdx, text, color) {
+  // `refreshed` = true only when this row's data was genuinely refreshed this run;
+  // LastRun then shows real data age instead of the time of the last ATTEMPT.
+  function writeStatusBuffered_(rowIdx, text, color, refreshed) {
     if (map.status) {
       allValues[rowIdx][map.status - 1] = text;
       allBackgrounds[rowIdx][map.status - 1] = color;
     }
-    if (map.timestamp) {
+    if (map.timestamp && refreshed === true) {
       allValues[rowIdx][map.timestamp - 1] = runTimestamp;
     }
+  }
+
+  // Quick/Risky/Leap: wipe the decision cells (Score, Risk) on a row whose data
+  // could not be refreshed, so a stale number can't rank or earn a border.
+  const clearsStaleRows = STALE_ROW_SHEETS.indexOf(sheet.getName()) !== -1 && !!map.score && !!map.riskScore;
+  function clearDecisionCells_(rowIdx) {
+    if (!clearsStaleRows) return false;
+    const hadValue = (allValues[rowIdx][map.score - 1] !== '' && allValues[rowIdx][map.score - 1] != null) ||
+                     (allValues[rowIdx][map.riskScore - 1] !== '' && allValues[rowIdx][map.riskScore - 1] != null);
+    allValues[rowIdx][map.score - 1] = '';
+    allValues[rowIdx][map.riskScore - 1] = '';
+    allBackgrounds[rowIdx][map.score - 1] = null;
+    allBackgrounds[rowIdx][map.riskScore - 1] = null;
+    allNotes[rowIdx][map.score - 1] = '';
+    allNotes[rowIdx][map.riskScore - 1] = '';
+    if (hadValue) staleClearedCount++;
+    return hadValue;
   }
 
   for (let row = DATA_START_ROW; row <= lastRow; row++) {
@@ -6630,7 +6733,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const parsedExpiry = parseExpiryCell_(expiryVal);
 
     if (!parsedStrike || !parsedExpiry) {
-      writeStatusBuffered_(rowIdx, 'PARSE ERROR — check Strike/Expiry format', '#f4cccc');
+      clearDecisionCells_(rowIdx);
+      writeStatusBuffered_(rowIdx, 'PARSE ERROR — check Strike/Expiry format' + (clearsStaleRows ? ' | Score/Risk cleared' : ''), '#f4cccc');
       failCount++;
       continue;
     }
@@ -6702,7 +6806,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       : fetchYahooQuote_(ticker, parsedExpiry, parsedStrike.strike, parsedStrike.type);
 
     if (!tastyOptionQuote && !yahooQuote) {
-      writeStatusBuffered_(rowIdx, 'NOT FOUND — verify strike/expiry', '#f4cccc');
+      clearDecisionCells_(rowIdx);
+      writeStatusBuffered_(rowIdx, (clearsStaleRows ? 'STALE — no option quote this run, Score/Risk cleared | ' : '') +
+        'NOT FOUND — verify strike/expiry', clearsStaleRows ? STALE_STATUS_COLOR : '#f4cccc');
       failCount++;
       Utilities.sleep(REQUEST_DELAY_MS);
       continue;
@@ -7296,7 +7402,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (oldRisk !== '' && oldRisk != null) {
         rowOut[map.riskScore - 1] = '';
         bgOut[map.riskScore - 1] = null;
-        rowChanges.push('Risk ' + formatForNote_(oldRisk) + '→blank (no usable IV/price/strike/expiry this run)');
+        rowChanges.push('Risk ' + formatForNote_(oldRisk) + '→blank (no usable price/strike/expiry/volatility this run, or the option price is inconsistent with the stock price — a stale quote)');
         changedCells++;
       }
     }
@@ -7538,13 +7644,27 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     }
 
     const sourceLabel = sourcesUsed.size > 0 ? Array.from(sourcesUsed).join(' + ') : (tastyOptionQuote ? 'TastyTrade' : 'Yahoo Finance');
+    // Quote age (Tasty only — Yahoo quotes carry no timestamp). Warning only unless
+    // QUOTE_STALE_BLANKS_SCORE is switched on.
+    const quoteAge = quoteAgeInfo_(tastyOptionQuote, runTimestamp);
+    let quoteAgeWarning = null;
+    if (quoteAge) {
+      if (oldestQuoteMin == null || quoteAge.ageMin > oldestQuoteMin) oldestQuoteMin = quoteAge.ageMin;
+      if (quoteAge.warn) {
+        quoteOldCount++;
+        quoteAgeWarning = 'Option quote is ' + formatQuoteAge_(quoteAge.ageMin) + ' old while the market is open (limit ' + QUOTE_WARN_AGE_MIN + 'm)' +
+          (QUOTE_STALE_BLANKS_SCORE && clearsStaleRows ? ' — Score/Risk cleared' : '');
+        if (QUOTE_STALE_BLANKS_SCORE) clearDecisionCells_(rowIdx);
+      }
+    }
+    const ageLabel = quoteAge ? (' (quote ' + formatQuoteAge_(quoteAge.ageMin) + ' old)') : '';
     const baseStatusText = rowChanges.length > 0
-      ? ('OK — ' + sourceLabel + ' | Changed: ' + rowChanges.join(', '))
-      : ('OK — ' + sourceLabel + ' | No changes');
-    const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning].filter(function (w) { return w != null; });
+      ? ('OK — ' + sourceLabel + ageLabel + ' | Changed: ' + rowChanges.join(', '))
+      : ('OK — ' + sourceLabel + ageLabel + ' | No changes');
+    const warnings = [oiStaleWarning, expiredWarning, maxHoldWarning, lossThresholdWarning, newsBlockWarning, quoteAgeWarning].filter(function (w) { return w != null; });
     const statusText = warnings.length ? (baseStatusText + ' | ⚠️ ' + warnings.join(' ⚠️ ')) : baseStatusText;
 
-    writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'));
+    writeStatusBuffered_(rowIdx, statusText, warnings.length ? '#f4cccc' : (rowChanges.length > 0 ? '#fff2cc' : '#d9ead3'), true);
 
     // This delay exists to protect TastyTrade/Yahoo from rapid-fire
     // individual calls — it has nothing to protect when this row made
@@ -7557,6 +7677,23 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // prefetch actually working.
     if (!tastyFromPrefetch || yahooQuote) {
       Utilities.sleep(REQUEST_DELAY_MS);
+    }
+  }
+
+  // Rows the loop never reached (time limit): their Score/Risk are from an earlier
+  // run, possibly hours old. Clear them so they can't rank next to fresh rows.
+  if (timeBudgetExceeded) {
+    for (let r = lastRowProcessed + 1; r <= lastRow; r++) {
+      const i = r - DATA_START_ROW;
+      if (!allValues[i] || !allValues[i][map.ticker - 1]) continue;
+      clearDecisionCells_(i);
+      if (map.status) {
+        allValues[i][map.status - 1] = clearsStaleRows
+          ? 'STALE — not reached this run (time limit), Score/Risk cleared; run again to refresh'
+          : 'Not reached this run (time limit); values are from an earlier run';
+        allBackgrounds[i][map.status - 1] = STALE_STATUS_COLOR;
+      }
+      unreachedCount++;
     }
   }
 
@@ -7668,6 +7805,13 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           'much faster this time — most of their data is already cached).\n\n')
       : '') +
     'Validation complete.\n\n' +
+    (clearsStaleRows && (staleClearedCount > 0 || unreachedCount > 0)
+      ? ('⚠️ ' + staleClearedCount + ' row(s) had Score/Risk cleared because they could not be refreshed' +
+          (unreachedCount > 0 ? ' (' + unreachedCount + ' not reached before the time limit)' : '') + ' — they sit at the bottom, unranked.\n\n')
+      : '') +
+    (quoteOldCount > 0
+      ? ('⚠️ ' + quoteOldCount + ' option quote(s) older than ' + QUOTE_WARN_AGE_MIN + ' min while the market is open (oldest ' + formatQuoteAge_(oldestQuoteMin) + '). See each row\'s Status.\n\n')
+      : '') +
     'Rows checked: ' + (okCount + fallbackCount + failCount) + '\n' +
     '  TastyTrade: ' + okCount + '\n' +
     '  Yahoo/fallback: ' + fallbackCount + '\n' +
