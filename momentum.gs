@@ -5011,6 +5011,12 @@ function volatilityProbabilityHorizonDays_(daysToExpiry, config) {
  *   cheap out-of-the-money option that needs a big move to ever get back
  *   scores HIGH.
  *
+ * A stock that has just run up gets a pullback tilt: either a big 5-day move AND
+ * far above its 20-day average, or a big up move TODAY measured in daily sigmas
+ * (whichever is stronger). Its expected move over the win window is shifted down
+ * by up to extensionTiltMaxSd standard deviations, in both Risk and Score. It is a judgment call, not validated on your trades; set it to 0 to turn
+ * it off.
+ *
  * Priced in: theta (the option is re-priced with Black-Scholes every day,
  * time shrinking), the bid/ask spread (you buy at the ask, sell at the
  * bid, so +3% means +3% AFTER spread costs), a gradual IV give-back scaled
@@ -5058,7 +5064,10 @@ const QR_RISK_SIM = {
   eventGapDays: 3,          // catalyst-day gap = this many days of normal movement
   tailDof: 4,               // Student-t degrees of freedom for daily moves; must be even and >= 4 (lower = fatter tails). 0 = plain bell curve
   maxShockSd: 8,            // cap on any one day's move, in standard deviations
-  atrToDailyVol: 0.65       // fallback only: daily volatility ~= this x ATR% (Parkinson range estimator)
+  atrToDailyVol: 0.65,      // fallback only: daily volatility ~= this x ATR% (Parkinson range estimator)
+  extensionTiltMaxSd: 0.25, // a fully 'extended' stock leans down by this many sd over the win window
+  dayMoveStartSd: 1,        // today's up-move starts to count at this many daily sigmas (daily sigma = atrToDailyVol x ATR%)...
+  dayMoveFullSd: 3          // ...and counts fully at this many
 };
 
 var QR_NORMALS_CACHE_ = null;
@@ -5141,13 +5150,31 @@ function prepareQuickRiskySim_(sheetName, inputs) {
 
   const halfSpread = isPlausible_(inputs.bidAskSpreadPct, 0, 100) ? (inputs.bidAskSpreadPct / 100) / 2 : 0;
   const cost = price * (1 + halfSpread);   // you pay the ask
+
+  // Pullback signals (0-1 each; the larger one is used):
+  //  - ext5d: a big 5-day run AND far above the 20-day average;
+  //  - extDay: today's UP move measured in daily sigmas, so +5% is huge for a calm
+  //    stock but an ordinary-big day for a wild one. Needs ATR% to scale it.
+  //    (Evidence on one-day reversals is mixed and mostly in small stocks, so this is a small tilt.)
+  const ext5d = overextensionRiskScore_(inputs.momentumPercent, inputs.trendPercent) / 100;
+  let daySigmas = null, extDay = 0;
+  if (isPlausible_(inputs.changeNowPercent, -100, 1000) && isPlausible_(inputs.atrPercent, 0.05, 50)) {
+    daySigmas = inputs.changeNowPercent / (SIM.atrToDailyVol * inputs.atrPercent);
+    extDay = clamp_((daySigmas - SIM.dayMoveStartSd) / (SIM.dayMoveFullSd - SIM.dayMoveStartSd), 0, 1);
+  }
   return {
     sheetName: sheetName, cfg: cfg, S0: S0, K: K, dte: dte, optionType: optionType,
     sigma: cal.sigma, scale: cal.scale, volSource: volSource,
     halfSpread: halfSpread, cost: cost, exitFactor: 1 - halfSpread,   // you receive the bid
     winLevel: cost * (1 + cfg.winPercent / 100),
     rank: isPlausible_(inputs.ivRank, 0, 100) ? inputs.ivRank / 100 : 0.5,
-    daysToCatalyst: inputs.daysToCatalyst
+    daysToCatalyst: inputs.daysToCatalyst,
+    // Pullback tilt: after a big run-up well above the 20-day average the stock
+    // leans lower over the next few days (0 when it isn't extended, or when
+    // momentum/trend are unknown). Applied to BOTH Risk and Score.
+    extension: Math.max(ext5d, extDay),
+    ext5d: ext5d, extDay: extDay, dayMoveSigmas: daySigmas, dayMovePct: isPlausible_(inputs.changeNowPercent, -100, 1000) ? inputs.changeNowPercent : null,
+    extTiltSd: -Math.max(ext5d, extDay) * SIM.extensionTiltMaxSd
   };
 }
 
@@ -5216,7 +5243,7 @@ function runQuickRiskySim_(ctx, opts) {
 // doesn't need to share the prepared context.
 function computeQuickRiskyPremiumLoss_(sheetName, inputs) {
   const ctx = prepareQuickRiskySim_(sheetName, inputs);
-  return ctx ? runQuickRiskySim_(ctx, {}) : null;
+  return ctx ? runQuickRiskySim_(ctx, { tiltSd: ctx.extTiltSd }) : null;
 }
 
 // Risk (0-100) from a prepared context + sim result; null if not computable.
@@ -5231,7 +5258,7 @@ function computeQuickRiskyRisk_(sheetName, inputs, holder) {
   const ctx = prepareQuickRiskySim_(sheetName, inputs);
   if (holder) { holder.ctx = ctx; holder.risk = null; }
   if (!ctx) return null; // can't be computed -> blank Risk (see call site), NOT a neutral 50
-  const r = runQuickRiskySim_(ctx, {});
+  const r = runQuickRiskySim_(ctx, { tiltSd: ctx.extTiltSd });
   if (holder) holder.risk = r;
   return quickRiskyRiskFromSim_(ctx, r, inputs);
 }
@@ -5278,9 +5305,9 @@ const QR_RISK_BANDS = { green: 15, yellow: 25 };   // Risk <= green is low, <= y
 function computeQuickRiskyScore_(ctx, filterScoreValue) {
   if (!ctx) return null;
   const f = isPlausible_(filterScoreValue, 0, 100) ? filterScoreValue : 50;
-  const tiltSd = clamp_((f - 50) / 50, -1, 1) * QR_SCORE_TILT_MAX_SD;
-  const r = runQuickRiskySim_(ctx, { winOnly: true, tiltSd: tiltSd });
-  return { score: Math.round(r.pWin * 1000) / 10, pWin: r.pWin, tiltSd: tiltSd };
+  const filterTiltSd = clamp_((f - 50) / 50, -1, 1) * QR_SCORE_TILT_MAX_SD;
+  const r = runQuickRiskySim_(ctx, { winOnly: true, tiltSd: filterTiltSd + ctx.extTiltSd });
+  return { score: Math.round(r.pWin * 1000) / 10, pWin: r.pWin, tiltSd: filterTiltSd, extTiltSd: ctx.extTiltSd };
 }
 
 function computeQuickSheetRiskScoreVelocity_(inputs) {
@@ -7056,7 +7083,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             daysToCatalyst: daysToCatalystNumeric,
             momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent,
             optionType: parsedStrike.type, strike: parsedStrike.strike, daysToExpiry: daysToExpiry,
-            ivPercent: merged.iv, bidAskSpreadPct: merged.bidAskSpreadPct
+            ivPercent: merged.iv, bidAskSpreadPct: merged.bidAskSpreadPct, changeNowPercent: changeNowNumeric
           }, qrHolder)
         : revisedFormulaSheetName === 'Risky'
         ? computeRiskySheetRiskScore_({
@@ -7065,7 +7092,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             oi: merged.oi, volume: merged.volume,
             stockPrice: merged.stockPrice, optionType: parsedStrike.type, strike: parsedStrike.strike,
             daysToExpiry: daysToExpiry, ivPercent: merged.iv, ivRank: merged.ivRank,
-            daysToCatalyst: daysToCatalystNumeric, atrPercent: merged.atrPercent
+            daysToCatalyst: daysToCatalystNumeric, atrPercent: merged.atrPercent,
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent, changeNowPercent: changeNowNumeric
           }, qrHolder)
         : revisedFormulaSheetName === 'Leap'
         ? computeLeapSheetRiskScore_({
@@ -7362,7 +7390,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           qrHolder.ctx = prepareQuickRiskySim_(revisedFormulaSheetName, {
             stockPrice: merged.stockPrice, strike: parsedStrike.strike, optionPrice: merged.optionPrice,
             daysToExpiry: daysToExpiry, optionType: parsedStrike.type, ivPercent: merged.iv, atrPercent: merged.atrPercent,
-            bidAskSpreadPct: merged.bidAskSpreadPct, ivRank: merged.ivRank, daysToCatalyst: daysToCatalystNumeric
+            bidAskSpreadPct: merged.bidAskSpreadPct, ivRank: merged.ivRank, daysToCatalyst: daysToCatalystNumeric,
+            momentumPercent: merged.momentumPercent, trendPercent: merged.trendPercent, changeNowPercent: changeNowNumeric
           });
         }
         winScore = computeQuickRiskyScore_(qrHolder.ctx, merged.filterScore);
@@ -7407,7 +7436,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             'Chance this contract can be sold for +' + cfgQ.winPercent + '% over what you pay (after the bid/ask spread, ' +
             Math.round(qrHolder.ctx.halfSpread * 2000) / 10 + '% here) within ' + cfgQ.winDays + ' days. Simulated from the ' +
             "contract's leverage, spread and time decay, plus a stock-setup tilt of " + (winScore.tiltSd >= 0 ? '+' : '') +
-            Math.round(winScore.tiltSd * 100) / 100 + ' sd from Filter (max ±' + QR_SCORE_TILT_MAX_SD + '). Volatility: ' +
+            Math.round(winScore.tiltSd * 100) / 100 + ' sd from Filter (max ±' + QR_SCORE_TILT_MAX_SD + ')' +
+            (winScore.extTiltSd < -0.01 ? ' and ' + Math.round(winScore.extTiltSd * 100) / 100 + ' sd for a pullback after a run-up (' +
+              (qrHolder.ctx.extDay >= qrHolder.ctx.ext5d ? "today's +" + Math.round(qrHolder.ctx.dayMovePct * 10) / 10 + '% is ' + Math.round(qrHolder.ctx.dayMoveSigmas * 10) / 10 + ' daily sigma' : 'big 5-day run above its 20-day average') + ')' : '') +
+            '. Volatility: ' +
             qrHolder.ctx.volSource + '. Not a price forecast. Read Risk first: rows with Risk <= ' + GATE_RANKING_BY_SHEET[revisedFormulaSheetName].gate +
             ' are listed first, best Score on top; the green border marks the best of those. Recomputed each run.';
         } else {
@@ -7484,7 +7516,10 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
           Math.round(tp[0] * 100) + '% / ' + Math.round(tp[1] * 100) + '% / ' + Math.round(tp[2] * 100) + '%). Outcomes: +' +
           QR_RISK_MODEL[revisedFormulaSheetName].winPercent + '% win within ' + QR_RISK_MODEL[revisedFormulaSheetName].winDays + 'd ' +
           Math.round(rr.pWin * 100) + '% | back to breakeven later ' + Math.round(rr.pRecover * 100) + '% | stuck ' +
-          Math.round(rr.pStuck * 100) + '%. Volatility: ' + rr.volSource + '. Recomputed each run.';
+          Math.round(rr.pStuck * 100) + '%. Volatility: ' + rr.volSource + '.' +
+(qrHolder.ctx && qrHolder.ctx.extension > 0.05 ? ' Stock looks extended after a run-up (' +
+            (qrHolder.ctx.extDay >= qrHolder.ctx.ext5d ? "today's +" + Math.round(qrHolder.ctx.dayMovePct * 10) / 10 + '% move is ' + Math.round(qrHolder.ctx.dayMoveSigmas * 10) / 10 + ' daily sigma' : 'big 5-day run above its 20-day average') +
+            '), so a pullback tilt of ' + Math.round(qrHolder.ctx.extTiltSd * 100) / 100 + ' sd is built in.' : '') + ' Recomputed each run.';
       }
     }
 
