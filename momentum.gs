@@ -199,7 +199,7 @@ const SAMEDAY_TARGET_PCT = 1.5;
 // Phone alerts: a signal that stays green is re-sent at most this often; a move from get-ready to ENTRY is sent right away.
 const ALERT_CFG = {
   repeatMin: 120, alertLight: true,        // Quick
-  leapRepeatMin: 360, leapAlertLight: false,   // Leap: daily-timeframe signals repeat less often; get-ready stays on the sheet only
+  leapRepeatMin: 360, leapAlertLight: true,    // Leap: daily-timeframe signals repeat less often; set leapAlertLight to false to keep light green (get ready) on the sheet only
   exitRepeatMin: 720,                      // Leap exit alerts (trend break / take profit) repeat at most twice a day
   quickExitRepeatMin: 60                   // Quick exit alerts (held rows only) repeat at most hourly while the signal stays on
 };
@@ -1201,6 +1201,7 @@ function quickScheduleTick_() {
     lock = LockService.getScriptLock();
     if (!lock.tryLock(1000)) return;                          // the previous tick is still running
     const props = PropertiesService.getScriptProperties();
+    props.setProperty('SCHED_TICK_LAST', String(now.getTime()));   // heartbeat: Schedule Status uses it to say whether the trigger is alive
     const Q = QUICK_SCHEDULE;
     const closeMin = US_MARKET_EARLY_CLOSES[nyYmd_(now)] ? 210 : 390;
 
@@ -1312,7 +1313,21 @@ function quickScheduleStatus_() {
   const lastV = parseInt(props.getProperty('SCHED_LAST_VALIDATE_MS') || '0', 10);
   const cfg = getAlertConfig_();
   const sess = marketSessionAt_(now);
+  const lastTickMs = parseInt(props.getProperty('SCHED_TICK_LAST') || '0', 10);
+  const tickAgeMin = lastTickMs ? (now.getTime() - lastTickMs) / 60000 : null;
+  const vAgeMin = lastV ? (now.getTime() - lastV) / 60000 : null;
+  const closeMinNow = US_MARKET_EARLY_CLOSES[nyYmd_(now)] ? 210 : 390;
+  const inValidateWindow = sess.open && sess.minutesSinceOpen >= QUICK_SCHEDULE.firstRunAfterOpenMin + 20 && (closeMinNow - sess.minutesSinceOpen) >= QUICK_SCHEDULE.stopBeforeCloseMin;
+  let health;
+  if (!triggers.length) health = 'NOT RUNNING - no schedule trigger is installed (use Start Quick Schedule)';
+  else if (!sess.open) health = 'idle - market closed (the trigger still fires every 5 minutes and exits at once)';
+  else if (sess.minutesSinceOpen <= 12) health = 'market just opened - first check of the day is due';
+  else if (tickAgeMin == null) health = 'WARNING - trigger installed but it has not run yet; give it a few minutes, then check Extensions > Apps Script > Executions';
+  else if (tickAgeMin > 12) health = 'WARNING - no 5-minute run for ' + Math.round(tickAgeMin) + ' min while the market is open. Check Extensions > Apps Script > Executions for errors';
+  else if (inValidateWindow && (vAgeMin == null || vAgeMin > 40)) health = 'WARNING - running, but Validate & Update is overdue (' + (vAgeMin == null ? 'none yet today' : Math.round(vAgeMin) + ' min since the last one') + '). Check the Log tab and Executions for errors';
+  else health = 'OK - last 5-minute run ' + Math.max(0, Math.round(tickAgeMin)) + ' min ago';
   const lines = [
+    'Health: ' + health,
     'Schedule trigger: ' + (triggers.length ? 'ON (' + triggers.map(function (t) { return t.getHandlerFunction(); }).join(', ') + ')' : 'OFF'),
     'Market right now: ' + (sess.open ? 'open' : 'closed'),
     'Last scheduled Validate & Update: ' + (lastV ? Utilities.formatDate(new Date(lastV), 'America/New_York', 'EEE h:mm a') + ' ET' : 'never'),
@@ -1320,6 +1335,15 @@ function quickScheduleStatus_() {
     'Leap runs today: ' + (function () { try { const st = JSON.parse(props.getProperty('SCHED_LEAP') || '{}'); return (st.d === nyYmd_(now) ? st.n : 0) + ' of ' + LEAP_SCHEDULE.slotsAfterOpenMin.length; } catch (e) { return '0'; } })(),
     'Trigger runtime used today: ' + Math.round(scheduledRuntimeTodayMs_(props, now) / 60000) + ' of about 90 min (guard stops heavy runs at ' + QUICK_SCHEDULE.dailyRuntimeCapMin + ')',
     'Phone alerts: ' + (cfg.ready ? 'ON via ' + cfg.provider : (cfg.enabled ? 'on, but provider not fully set up' : 'OFF')),
+    (function () {
+      const fmt = function (t) { return Utilities.formatDate(new Date(t), 'America/New_York', 'EEE h:mm a') + ' ET'; };
+      let al = null, wl = null;
+      try { al = JSON.parse(props.getProperty('ALERT_LAST') || 'null'); } catch (e) { al = null; }
+      try { wl = JSON.parse(props.getProperty('WATCH_LAST') || 'null'); } catch (e) { wl = null; }
+      return 'Last alert attempt: ' + (al ? (fmt(al.t) + ' - ' + al.tab + ': ' + al.found + ' signal(s) found, ' + al.sent + ' sent' + (al.detail ? ' (' + al.detail + ')' : ''))
+          : 'none yet (no light/strong green or red exit has been found by a run since this was installed)') +
+        '\nLast 5-minute signal check: ' + (wl ? (fmt(wl.t) + ' - ' + wl.note) : 'not run yet');
+    })(),
     '',
     'To see every run, open Extensions > Apps Script > Executions.'
   ];
@@ -6479,7 +6503,7 @@ function prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow) {
  * `stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker)`
  * falls back to fetching individually exactly as before.
  * ========================================================================== */
-function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
+function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {   // returns {} if the Cloud Function is unavailable
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
   if (!cloudFunctionUrl || !sharedSecret) return {};
@@ -6506,7 +6530,7 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
     resp = UrlFetchApp.fetch(cloudFunctionUrl, {
       method: 'post',
       contentType: 'application/json',
-      payload: JSON.stringify({ apiKey: sharedSecret, stockRange: { tickers: tickers } }),
+      payload: JSON.stringify({ apiKey: sharedSecret, stockRange: { tickers: tickers, needCap: !!map.cap } }),
       muteHttpExceptions: true
     });
   } catch (e) {
@@ -6537,7 +6561,10 @@ function prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow) {
 
   const diag = json.stockRangeDiagnostics || {};
   if (diag.stockRange) {
-    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch \u2014 sample failure reason: ' + diag.stockRange);
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap prefetch \u2014 Yahoo problem: ' + diag.stockRange);
+  }
+  if (diag.stockRangeFallbacks) {
+    logToSheet_('Cloud Function StockPrice/L52/H52/Cap \u2014 backup sources filled gaps: ' + diag.stockRangeFallbacks);
   }
 
   return results;
@@ -6686,8 +6713,13 @@ function dispatchEntryAlerts_(tab, items, now) {
     if (!items || !items.length) return;
     const cfg = getAlertConfig_();
     if (!cfg.ready) return;
-    const lock = LockService.getScriptLock();
-    if (!lock.tryLock(3000)) return;
+    // A USER lock, not the script lock: the 5-minute schedule tick already holds the script lock for its whole run, and this
+    // function is called from inside that run, so asking for the script lock here could never be granted and the alert would
+    // be dropped without a trace. If even this lock cannot be had, send anyway - a rare duplicate beats a missed signal.
+    const lock = LockService.getUserLock();
+    let locked = false;
+    try { locked = lock.tryLock(3000); } catch (e) { locked = false; }
+    if (!locked) logToSheet_('Phone alerts (' + tab + '): alert lock busy for 3s, sending anyway.');
     try {
       const props = PropertiesService.getScriptProperties();
       let state = {};
@@ -6696,14 +6728,23 @@ function dispatchEntryAlerts_(tab, items, now) {
       const rank = { light: 1, strong: 2, exit: 3 };
       const isLeap = tab === 'Leap';
       const repeatFor = function (it) { return it.level === 'exit' ? (isLeap ? ALERT_CFG.exitRepeatMin : ALERT_CFG.quickExitRepeatMin) : (isLeap ? ALERT_CFG.leapRepeatMin : ALERT_CFG.repeatMin); };
+      let lightOff = 0, recentlySent = 0;
       const fresh = items.filter(function (it) {
-        if (it.level === 'light' && !(isLeap ? ALERT_CFG.leapAlertLight : ALERT_CFG.alertLight)) return false;
+        if (it.level === 'light' && !(isLeap ? ALERT_CFG.leapAlertLight : ALERT_CFG.alertLight)) { lightOff++; return false; }
         const prev = state[it.key];
         if (!prev) return true;
         if (rank[it.level] > prev.l) return true;
-        return nowMs - prev.t >= repeatFor(it) * 60000;
+        const due = nowMs - prev.t >= repeatFor(it) * 60000;
+        if (!due) recentlySent++;
+        return due;
       });
-      if (!fresh.length) return;
+      if (!fresh.length) {
+        recordAlertAttempt_(props, tab, nowMs, items.length, 0, [
+          lightOff ? lightOff + ' light-green alert(s) are switched off for ' + tab + ' (ALERT_CFG.' + (isLeap ? 'leapAlertLight' : 'alertLight') + ')' : '',
+          recentlySent ? recentlySent + ' already alerted within the repeat window' : ''
+        ].filter(Boolean).join('; '));
+        return;
+      }
       fresh.sort(function (a, b) { return rank[b.level] - rank[a.level]; });
       const nStrong = fresh.filter(function (it) { return it.level === 'strong'; }).length;
       const nExit = fresh.filter(function (it) { return it.level === 'exit'; }).length;
@@ -6717,15 +6758,25 @@ function dispatchEntryAlerts_(tab, items, now) {
         Object.keys(state).forEach(function (k) { if (nowMs - state[k].t > 12 * 3600000) delete state[k]; });
         props.setProperty('ALERT_STATE', JSON.stringify(state));
         logToSheet_('Phone alert sent: ' + title);
+        recordAlertAttempt_(props, tab, nowMs, items.length, fresh.length, '');
       } else {
         logToSheet_('Phone alert FAILED (' + cfg.provider + '): ' + res.detail);
+        recordAlertAttempt_(props, tab, nowMs, items.length, 0, 'send FAILED: ' + String(res.detail).slice(0, 120));
       }
     } finally {
-      lock.releaseLock();
+      if (locked) lock.releaseLock();
     }
   } catch (e) {
     logToSheet_('Phone alert error (run continues): ' + e);
   }
+}
+
+// Remembers the latest alert attempt so "Schedule Status" can say what happened (found / sent / why not).
+function recordAlertAttempt_(props, tab, nowMs, found, sent, detail) {
+  try { props.setProperty('ALERT_LAST', JSON.stringify({ t: nowMs, tab: tab, found: found, sent: sent, detail: detail })); } catch (e) { /* diagnostics only */ }
+}
+function recordWatchCheck_(nowMs, note) {
+  try { PropertiesService.getScriptProperties().setProperty('WATCH_LAST', JSON.stringify({ t: nowMs, note: note })); } catch (e) { /* diagnostics only */ }
 }
 
 // Shortlist of contracts that passed Risk + spread on the last sheet run; the 5-minute watch re-checks only these.
@@ -6771,7 +6822,7 @@ function signalWatchTick_() {
     const sess = marketSessionAt_(now);
     if (!sess.open) return;
     const cfg = getAlertConfig_();
-    if (!cfg.ready) return;
+    if (!cfg.ready) { recordWatchCheck_(now.getTime(), 'skipped: phone alerts are off or the provider is not fully set up'); return; }
     const S = INTRADAY_SIGNAL;
     const closeMin = US_MARKET_EARLY_CLOSES[Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd')] ? 210 : 390;
     // Entry alerts keep the first/last-15-minute blackout; exit alerts on rows you hold do not.
@@ -6787,7 +6838,7 @@ function signalWatchTick_() {
       const held = sn.held || [];
       if (rows.length || held.length) snaps.push({ tab: tab, rows: rows, held: held });
     });
-    if (!snaps.length) return;
+    if (!snaps.length) { recordWatchCheck_(now.getTime(), 'nothing to check: no fresh shortlist (each Validate & Update saves one; it expires after ' + WATCH_SNAPSHOT_MAX_AGE_MIN + ' min)' + (entryTimeOk ? '' : ', and entry alerts are paused in the first/last ' + S.noEntryFirstMin + ' minutes')); return; }
 
     const seen = { SPY: true }, tickers = ['SPY'], occList = [];
     snaps.forEach(function (sn) {
@@ -6795,7 +6846,7 @@ function signalWatchTick_() {
       sn.held.forEach(function (h) { if (!seen[h.t]) { seen[h.t] = true; tickers.push(h.t); } if (h.occ && occList.indexOf(h.occ) === -1) occList.push(h.occ); });
     });
     const ivMap = fetchIntradayMap_(tickers);
-    if (!Object.keys(ivMap).length) return;
+    if (!Object.keys(ivMap).length) { recordWatchCheck_(now.getTime(), 'no intraday data came back from the Cloud Function (' + tickers.length + ' tickers asked)'); return; }
     const quoteMap = occList.length ? fetchOptionQuotesMap_(occList) : {};
 
     const spy = ivMap['SPY'] || null;
@@ -6807,10 +6858,13 @@ function signalWatchTick_() {
       if (sess.minutesSinceOpen > INTRADAY_STALE_MIN && barAgeMin != null && barAgeMin > INTRADAY_STALE_MIN) return null;   // stale data never alerts
       return iv;
     };
+    let watchGreen = 0, watchRows = 0, watchHeld = 0, watchStale = 0;
     snaps.forEach(function (sn) {
       const items = [];
+      watchRows += sn.rows.length; watchHeld += sn.held.length;
       sn.rows.forEach(function (r) {
         const iv = freshIv(r.t);
+        if (!iv && ivMap[r.t]) watchStale++;
         if (!iv) return;
         const ev = evaluateEntryLevel_(iv, S, spyHead);
         if (!ev.level) return;
@@ -6832,8 +6886,10 @@ function signalWatchTick_() {
         items.push({ key: sn.tab + '|' + h.t + '|' + h.k + '|' + h.e, level: 'exit',
           line: alertLineExit_(h.t, h.k, h.x, iv, profitPct, ex.fading, q.mark != null ? q.mark : sell) });
       });
+      watchGreen += items.length;
       dispatchEntryAlerts_(sn.tab, items, now);
     });
+    recordWatchCheck_(now.getTime(), 'checked ' + watchRows + ' shortlisted contract(s) and ' + watchHeld + ' held row(s): ' + watchGreen + ' signal(s) right now' + (watchStale ? ', ' + watchStale + ' skipped for stale data' : ''));
   } catch (e) {
     logToSheet_('Signal watch failed: ' + e);
   }
@@ -7135,6 +7191,244 @@ function prefetchDailyViaCloudFunction_(sheet, map, lastRow) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Keyed backup sources, run from Apps Script itself with YOUR OWN API keys - so they work even when the Cloud Function has no
+// Finnhub key or is unreachable. Shared by every tab with these columns (Quick and Leap).
+//   Finnhub  (quote + metrics): price, 52-week low/high, market cap
+//   FMP      (profile):         price, 52-week range, market cap - only for tickers still missing a market cap
+// Only tickers with a missing field are looked at, so a healthy run does nothing. Results (including "nothing found",
+// which is normal for ETFs and some ADRs) are cached for 6 hours so the free-tier limits are not burned every 15 minutes;
+// a cached price is only reused for 20 minutes.
+const MKTFILL_CACHE_TTL_SEC = 6 * 3600;
+const MKTFILL_PRICE_MAX_AGE_MS = 20 * 60 * 1000;
+const MKTFILL_MAX_FINNHUB_TICKERS = 25;      // 2 calls each; Finnhub's free tier allows 60 per minute
+const MKTFILL_MAX_FMP_TICKERS = 10;
+
+function parseFinnhubSnapshot_(quote, metric) {
+  const m = (metric && metric.metric) || {};
+  const num = function (v) { const n = v != null ? parseFloat(v) : NaN; return isFinite(n) && n > 0 ? n : null; };
+  const capM = num(m.marketCapitalization);                         // USD millions
+  return { price: num(quote && quote.c), low52: num(m['52WeekLow']), high52: num(m['52WeekHigh']), cap: capM != null ? capM / 1000 : null };   // cap in billions
+}
+
+function parseFmpProfile_(json) {
+  const p = Array.isArray(json) ? json[0] : json;
+  if (!p || typeof p !== 'object') return { price: null, low52: null, high52: null, cap: null };
+  const num = function (v) { const n = v != null ? parseFloat(v) : NaN; return isFinite(n) && n > 0 ? n : null; };
+  let low = null, high = null;
+  const m = /^\s*([\d.]+)\s*-\s*([\d.]+)\s*$/.exec(String(p.range || ''));
+  if (m) { low = num(m[1]); high = num(m[2]); }
+  const cap = num(p.marketCap != null ? p.marketCap : p.mktCap);    // USD
+  return { price: num(p.price), low52: low, high52: high, cap: cap != null ? cap / 1e9 : null };
+}
+
+function backfillMarketFieldsFromKeyedSources_(tickers, rangeMap, cols) {
+  const stats = { needed: 0, cached: 0, finnhub: 0, fmp: 0, skippedNoKey: false };
+  const rec = function (t) { return rangeMap[t] || {}; };
+  const slowMissing = function (t) { const r = rec(t); return (cols.low52 && r.low52 == null) || (cols.high52 && r.high52 == null) || (cols.cap && r.cap == null); };
+  const priceMissing = function (t) { return !!cols.price && rec(t).price == null; };
+  const need = tickers.filter(function (t) { return slowMissing(t) || priceMissing(t); });
+  stats.needed = need.length;
+  if (!need.length) return stats;
+  const finnKey = getFinnhubApiKey_(), fmpKey = getFmpApiKey_();
+  if (!finnKey && !fmpKey) { stats.skippedNoKey = true; return stats; }
+  const cache = CacheService.getScriptCache();
+  const nowMs = Date.now();
+  const merge = function (t, v, tag) {
+    const cur = rangeMap[t] ? Object.assign({}, rangeMap[t]) : { price: null, low52: null, high52: null, cap: null, source: '' };
+    let used = false;
+    ['price', 'low52', 'high52', 'cap'].forEach(function (f) { if (cur[f] == null && v && v[f] != null) { cur[f] = v[f]; used = true; } });
+    if (used) cur.source = cur.source ? (cur.source + '+' + tag) : tag;
+    rangeMap[t] = cur;
+    return used;
+  };
+
+  // 1. cache (one call for all tickers)
+  let cached = {};
+  try { cached = cache.getAll(need.map(function (t) { return 'MKTFILL_' + t; })) || {}; } catch (e) { cached = {}; }
+  const entry = {};
+  need.forEach(function (t) {
+    let e = null;
+    try { e = cached['MKTFILL_' + t] ? JSON.parse(cached['MKTFILL_' + t]) : null; } catch (x) { e = null; }
+    entry[t] = e;
+    if (e) {
+      // Slow fields (52-week range, market cap) are reused for the whole TTL; a cached PRICE only while it is fresh.
+      const v = { low52: e.v.low52, high52: e.v.high52, cap: e.v.cap, price: (nowMs - e.ts <= MKTFILL_PRICE_MAX_AGE_MS) ? e.v.price : null };
+      if (merge(t, v, 'cache')) stats.cached++;
+    }
+  });
+
+  const newEntries = {};
+  const remember = function (t, v, flag) {
+    const e = entry[t] || { ts: nowMs, v: { price: null, low52: null, high52: null, cap: null }, ft: false, mt: false };
+    ['price', 'low52', 'high52', 'cap'].forEach(function (f) { if (v && v[f] != null) e.v[f] = v[f]; });
+    e.ts = nowMs; e[flag] = true;
+    entry[t] = e; newEntries['MKTFILL_' + t] = JSON.stringify(e);
+  };
+  // "Found nothing" is remembered per source (ft = Finnhub, mt = FMP) and per kind of data: a source that was rate-limited or failed
+  // is NOT remembered, and a price (which goes stale in minutes) is always allowed to be asked for again.
+  const answered = function (t, flag) { return !!(entry[t] && entry[t][flag]); };
+
+  // 2. Finnhub: full snapshot for tickers missing slow fields, quote only for tickers missing just the price
+  if (finnKey) {
+    const full = need.filter(function (t) { return slowMissing(t) && !answered(t, 'ft'); }).slice(0, MKTFILL_MAX_FINNHUB_TICKERS);
+    const room = Math.max(0, MKTFILL_MAX_FINNHUB_TICKERS - full.length);
+    const priceOnly = need.filter(function (t) { return priceMissing(t) && full.indexOf(t) === -1 && rec(t).price == null; }).slice(0, room);
+    const plan = [];
+    full.forEach(function (t) { plan.push({ t: t, full: true }); });
+    priceOnly.forEach(function (t) { plan.push({ t: t, full: false }); });
+    if (plan.length) {
+      const reqs = [];
+      plan.forEach(function (p) {
+        reqs.push({ url: FINNHUB_BASE_URL + '/quote?symbol=' + encodeURIComponent(p.t) + '&token=' + encodeURIComponent(finnKey), muteHttpExceptions: true });
+        if (p.full) reqs.push({ url: FINNHUB_BASE_URL + '/stock/metric?symbol=' + encodeURIComponent(p.t) + '&metric=all&token=' + encodeURIComponent(finnKey), muteHttpExceptions: true });
+      });
+      let resps = [];
+      try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { logToSheet_('Market-data backfill (Finnhub) failed: ' + e); resps = []; }
+      let limited = false, k = 0;
+      plan.forEach(function (p) {
+        const q = resps[k++], m = p.full ? resps[k++] : null;
+        if (!q || (p.full && !m)) return;
+        if (q.getResponseCode() === 429 || (m && m.getResponseCode() === 429)) { limited = true; return; }
+        let qj = null, mj = null;
+        try { qj = JSON.parse(q.getContentText()); } catch (e) { qj = null; }
+        if (m) { try { mj = JSON.parse(m.getContentText()); } catch (e) { mj = null; } }
+        const v = parseFinnhubSnapshot_(qj, mj);
+        if (merge(p.t, v, 'Finnhub')) stats.finnhub++;
+        if (p.full) remember(p.t, v, 'ft'); else remember(p.t, { price: v.price }, 'pt');
+      });
+      if (limited) logToSheet_('Market-data backfill: Finnhub rate limit hit; the remaining tickers will be retried on a later run.');
+    }
+  }
+
+  // 3. FMP: tickers still missing slow fields (never asked FMP before), or a price when there is no Finnhub key
+  if (fmpKey) {
+    const batch = need.filter(function (t) {
+      return ((slowMissing(t) && !answered(t, 'mt')) || (!finnKey && priceMissing(t) && rec(t).price == null));
+    }).slice(0, MKTFILL_MAX_FMP_TICKERS);
+    if (batch.length) {
+      let resps = [];
+      try {
+        resps = UrlFetchApp.fetchAll(batch.map(function (t) {
+          return { url: 'https://financialmodelingprep.com/stable/profile?symbol=' + encodeURIComponent(t) + '&apikey=' + encodeURIComponent(fmpKey), muteHttpExceptions: true };
+        }));
+      } catch (e) { logToSheet_('Market-data backfill (FMP) failed: ' + e); resps = []; }
+      batch.forEach(function (t, i) {
+        const r = resps[i];
+        if (!r || r.getResponseCode() === 429) return;
+        let j = null;
+        try { j = JSON.parse(r.getContentText()); } catch (e) { j = null; }
+        const v = parseFmpProfile_(j);
+        if (merge(t, v, 'FMP')) stats.fmp++;
+        remember(t, v, 'mt');
+      });
+    }
+  }
+
+  try { if (Object.keys(newEntries).length) cache.putAll(newEntries, MKTFILL_CACHE_TTL_SEC); } catch (e) { /* cache is best-effort */ }
+  if (stats.finnhub || stats.fmp) logToSheet_('Market-data backfill: filled gaps from your own keys - Finnhub ' + stats.finnhub + ', FMP ' + stats.fmp + ' (of ' + stats.needed + ' ticker(s) with a gap).');
+  return stats;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// StockPrice / L52 / H52 / Cap must never end up blank while any source has the number.
+//  1. The Cloud Function now tries Yahoo, then daily bars (TastyTrade, then Yahoo chart), then Finnhub, then a TastyTrade
+//     quote, and fills only the fields still empty (see scanStockPriceRangeForBatch in the Cloud Function).
+//  2. Apps Script's own direct Yahoo call is only a last resort when the Cloud Function itself is unreachable, and it is tried
+//     once per ticker (it used to retry for every row of the same ticker).
+// Returns { price, low52, high52, cap } (any may be null) or null.
+function resolveStockRange_(ticker, rangeMap, memo, allowDirect) {
+  const r = rangeMap[ticker] || null;
+  const complete = r && r.price != null && r.low52 != null && r.high52 != null;
+  if (complete || !allowDirect) return r;
+  if (!(ticker in memo)) memo[ticker] = fetchStockPriceAnd52WeekRange_(ticker);
+  const y = memo[ticker];
+  if (!y) return r;
+  const out = r ? Object.assign({}, r) : { price: null, low52: null, high52: null, cap: null };
+  ['price', 'low52', 'high52', 'cap'].forEach(function (f) { if (out[f] == null && y[f] != null) out[f] = y[f]; });
+  return out;
+}
+
+// If your StockPrice / L52 / H52 / Cap cell holds a GOOGLEFINANCE formula, it is kept - but wrapped so that when the formula
+// returns blank, #N/A, text or 0, the cell shows the script's price instead:
+//   =LET(g, <your formula>, IF(ISNUMBER(g), IF(g>0, g, 181.37), 181.37))
+// (Nested IFs on purpose: IF(AND(ISNUMBER(g), g>0), ...) would itself return #N/A when the formula errors - checked in a real
+// spreadsheet engine.) The number is refreshed on later runs only when it has drifted by more than the tolerance below.
+const STOCK_FORMULA_FALLBACK_ENABLED = true;   // false = never touch your formulas (a blank formula result then shows blank)
+const STOCK_FALLBACK_REFRESH_TOLERANCE = 0.0025;
+const STOCK_FORMULA_WRAP_RE = /^=LET\(g,([\s\S]*),IF\(ISNUMBER\(g\),IF\(g>0,g,(-?\d+(?:\.\d+)?)\),(-?\d+(?:\.\d+)?)\)\)$/;
+function wrapFormulaWithFallback_(formula, fallback) {
+  if (typeof formula !== 'string' || formula.charAt(0) !== '=') return null;
+  if (typeof fallback !== 'number' || !isFinite(fallback) || fallback <= 0) return null;
+  const fb = String(fallback);
+  const m = STOCK_FORMULA_WRAP_RE.exec(formula);
+  if (m) {
+    const stored = parseFloat(m[2]);
+    if (isFinite(stored) && Math.abs(fallback - stored) <= Math.abs(fallback) * STOCK_FALLBACK_REFRESH_TOLERANCE) return null;   // close enough: leave the cell alone
+    return '=LET(g,' + m[1] + ',IF(ISNUMBER(g),IF(g>0,g,' + fb + '),' + fb + '))';
+  }
+  if (!/GOOGLEFINANCE/i.test(formula)) return null;                                  // only wrap GOOGLEFINANCE formulas
+  if (/^=\s*ARRAYFORMULA\(/i.test(formula) || /^=\s*\{/.test(formula)) return null;   // array / spilling formulas are left alone
+  return '=LET(g,' + formula.slice(1) + ',IF(ISNUMBER(g),IF(g>0,g,' + fb + '),' + fb + '))';
+}
+
+// Writes the data block back WITHOUT touching any formula cell (isProtected[r][c] true). Re-setting a formula - which the
+// old whole-range write did on every run - makes the sheet recalculate it, and GOOGLEFINANCE is prone to briefly returning
+// #N/A or blank when many are re-set together. Runs of cells that are safe to write go out in as few calls as possible:
+// whole rectangles across consecutive columns that hold no formulas, and per-column runs inside columns that do.
+// Returns the number of setValues calls made.
+function writeValuesSkippingProtected_(sheet, startRow, values, isProtected) {
+  const nRows = values.length, nCols = nRows ? values[0].length : 0;
+  const colHasProtected = [];
+  for (let c = 0; c < nCols; c++) {
+    let any = false;
+    for (let r = 0; r < nRows; r++) if (isProtected[r][c]) { any = true; break; }
+    colHasProtected.push(any);
+  }
+  let calls = 0, c = 0;
+  while (c < nCols) {
+    if (!colHasProtected[c]) {
+      let c2 = c;
+      while (c2 + 1 < nCols && !colHasProtected[c2 + 1]) c2++;
+      sheet.getRange(startRow, c + 1, nRows, c2 - c + 1).setValues(values.map(function (row) { return row.slice(c, c2 + 1); }));
+      calls++; c = c2 + 1;
+    } else {
+      let r = 0;
+      while (r < nRows) {
+        if (isProtected[r][c]) { r++; continue; }
+        let r2 = r;
+        while (r2 + 1 < nRows && !isProtected[r2 + 1][c]) r2++;
+        sheet.getRange(startRow + r, c + 1, r2 - r + 1, 1).setValues(values.slice(r, r2 + 1).map(function (row) { return [row[c]]; }));
+        calls++; r = r2 + 1;
+      }
+      c++;
+    }
+  }
+  return calls;
+}
+
+// Safety net for the wrapped formulas: after they are written, read a few back. If any shows a formula PARSE error
+// ("#ERROR!" / "Err:"), put every original formula back, switch wrapping off for good (script property STOCK_WRAP_DISABLED) and
+// log why - so a syntax problem can never leave the whole StockPrice column showing errors. Returns true if it rolled back.
+function rollbackWrappedFormulasIfBroken_(sheet, startRow, overrides, originals) {
+  const keys = Object.keys(overrides);
+  if (!keys.length) return false;
+  SpreadsheetApp.flush();
+  const looksBroken = keys.slice(0, 3).some(function (k) {
+    const parts = k.split(':');
+    const v = sheet.getRange(startRow + parseInt(parts[0], 10), parseInt(parts[1], 10) + 1).getValue();
+    return typeof v === 'string' && /^(#ERROR!|Err:)/.test(v);
+  });
+  if (!looksBroken) return false;
+  keys.forEach(function (k) {
+    const parts = k.split(':');
+    if (originals[k]) sheet.getRange(startRow + parseInt(parts[0], 10), parseInt(parts[1], 10) + 1).setFormula(originals[k]);
+  });
+  PropertiesService.getScriptProperties().setProperty('STOCK_WRAP_DISABLED', 'true');
+  logToSheet_('StockPrice fallback wrapper produced a formula error in this spreadsheet, so ' + keys.length + ' original formula(s) were restored and the wrapper is now OFF. Blank results from GOOGLEFINANCE will show blank again. (Set the STOCK_WRAP_DISABLED script property to false to retry.)');
+  return true;
+}
+
 // StockPrice cell note. Says which price the row's calculations used when the StockPrice cell itself is blank or unusable (for
 // example your =GOOGLEFINANCE formula returning #N/A before the open). Returns { action, text }:
 //   'set'   -> write `text` as the cell note
@@ -7142,7 +7436,8 @@ function prefetchDailyViaCloudFunction_(sheet, map, lastRow) {
 //   'keep'  -> leave the cell's note alone
 // a = { shownOk: the cell displayed a usable number before this run touched it, hasFormula: the cell holds a formula,
 //       rangeUsed: the batch refresh produced a price this run, finalPrice: price the calculations used (or null),
-//       fallbackSource: 'Yahoo option chain' | 'TastyTrade equity quote' | null, existingNote: current note text }
+//       fallbackSource: 'Yahoo option chain' | 'TastyTrade equity quote' | null, existingNote: current note text,
+//       wrapped: the formula is wrapped (or being wrapped) so the cell itself falls back to the script price }
 const STOCK_NOTE_PREFIX = 'Stock price: ';
 function stockPriceNote_(a) {
   const ours = typeof a.existingNote === 'string' && a.existingNote.indexOf(STOCK_NOTE_PREFIX) === 0;
@@ -7155,6 +7450,9 @@ function stockPriceNote_(a) {
   }
   const price = '$' + (Math.round(a.finalPrice * 100) / 100);
   const source = a.rangeUsed ? 'the Yahoo quote refresh' : (a.fallbackSource || 'a backup source');
+  if (a.hasFormula && a.wrapped) {
+    return { action: 'set', text: STOCK_NOTE_PREFIX + 'your formula returned blank or an error (GOOGLEFINANCE often does before the open), so this cell now shows ' + price + ' from ' + source + ' until the formula recovers. This note disappears once the formula has a price.' };
+  }
   if (a.hasFormula) {
     return { action: 'set', text: STOCK_NOTE_PREFIX + 'this cell shows your formula\'s result, which is blank or an error right now (GOOGLEFINANCE often is before the open). Calculations used ' + price + ' from ' + source + '. This note disappears once the cell has a price.' };
   }
@@ -7373,6 +7671,27 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // unreachable, or misses a specific ticker, and the per-row block
   // falls back to the original individual fetch exactly as before.
   const stockRangeMap = prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow);
+  const stockRangeBackendDown = Object.keys(stockRangeMap).length === 0;   // only then is Apps Script's own direct Yahoo call worth trying
+  const stockRangeMemo = {};
+  if (map.stockPrice || map.l52 || map.h52 || map.cap) {
+    try {
+      const fillNumRows = lastRow - DATA_START_ROW + 1;
+      const fillTickers = [];
+      if (fillNumRows > 0) {
+        const seenFill = {};
+        sheet.getRange(DATA_START_ROW, map.ticker, fillNumRows, 1).getValues().forEach(function (r) {
+          const t = r[0] ? String(r[0]).trim().toUpperCase() : '';
+          if (t && !seenFill[t]) { seenFill[t] = true; fillTickers.push(t); }
+        });
+      }
+      backfillMarketFieldsFromKeyedSources_(fillTickers, stockRangeMap, { price: !!map.stockPrice, low52: !!map.l52, high52: !!map.h52, cap: !!map.cap });
+    } catch (e) {
+      logToSheet_('Market-data backfill skipped (run continues): ' + e);
+    }
+  }
+  const formulaOverrides = {};      // 'rowIdx:colIdx' -> wrapped formula to write
+  const formulaOriginals = {};      // same keys -> the formula as it was, for rollback
+  let stockWrapActive = STOCK_FORMULA_FALLBACK_ENABLED && PropertiesService.getScriptProperties().getProperty('STOCK_WRAP_DISABLED') !== 'true';
   const extraCols = prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow);
   const atmPutMap = extraCols.atmPut;
   const intradayMap = extraCols.intraday;
@@ -7535,13 +7854,33 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const stockCellShownOrig = map.stockPrice ? rowOut[map.stockPrice - 1] : null;   // what the cell displayed before this run touched it
     let stockRangePriceUsed = false;
     if (map.stockPrice || map.l52 || map.h52 || map.cap) {
-      const range52 = stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker);
-      if (!range52) markStale_(rowIdx, 'StockPrice/52-week range not refreshed');
+      const range52 = resolveStockRange_(ticker, stockRangeMap, stockRangeMemo, stockRangeBackendDown);
+      if (!range52 || (range52.price == null && range52.low52 == null && range52.high52 == null)) markStale_(rowIdx, 'StockPrice/52-week range not refreshed');
       if (range52) {
         if (map.stockPrice && range52.price != null) { rowOut[map.stockPrice - 1] = round2_(range52.price); stockRangePriceUsed = true; }
         if (map.l52 && range52.low52 != null) rowOut[map.l52 - 1] = round2_(range52.low52);
         if (map.h52 && range52.high52 != null) rowOut[map.h52 - 1] = round2_(range52.high52);
         if (map.cap && range52.cap != null) rowOut[map.cap - 1] = round2_(range52.cap);
+        if (map.cap) {
+          const capHasFormula = !!((allFormulas && allFormulas[rowIdx]) ? allFormulas[rowIdx][map.cap - 1] : '');
+          const capNoteNow = noteOut[map.cap - 1];
+          const capNoteIsOurs = !capNoteNow || (typeof capNoteNow === 'string' && capNoteNow.indexOf('Cap: ') === 0);   // a note you wrote yourself is never replaced
+          if (range52.cap == null && !capHasFormula && (rowOut[map.cap - 1] === '' || rowOut[map.cap - 1] == null)) { if (capNoteIsOurs) noteOut[map.cap - 1] = 'Cap: no market cap from Yahoo, Finnhub or FMP for this ticker (common for ETFs and some foreign listings).'; }
+          else if (capNoteIsOurs && capNoteNow) noteOut[map.cap - 1] = '';
+        }
+        if (stockWrapActive) {
+          [['stockPrice', 'price'], ['l52', 'low52'], ['h52', 'high52'], ['cap', 'cap']].forEach(function (pair) {
+            const col = map[pair[0]], v = range52[pair[1]];
+            if (!col || v == null) return;
+            const f = (allFormulas && allFormulas[rowIdx]) ? allFormulas[rowIdx][col - 1] : '';
+            if (!f) return;
+            // The script's Cap is in BILLIONS. A Cap formula is only wrapped if it visibly divides to billions, otherwise the fallback
+            // number would be in different units from what the formula returns when it works.
+            if (pair[0] === 'cap' && !/\/\s*(1e9|1000000000|10\s*\^\s*9)/i.test(f) && !STOCK_FORMULA_WRAP_RE.test(f)) return;
+            const nf = wrapFormulaWithFallback_(f, round2_(v));
+            if (nf) { formulaOverrides[rowIdx + ':' + (col - 1)] = nf; if (!(rowIdx + ':' + (col - 1) in formulaOriginals)) formulaOriginals[rowIdx + ':' + (col - 1)] = f; }
+          });
+        }
       }
     }
 
@@ -7758,6 +8097,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       const stockNote = stockPriceNote_({
         shownOk: isPlausible_(parseFloat(stockCellShownOrig), 0.01, null),
         hasFormula: !!(allFormulas && allFormulas[rowIdx] && allFormulas[rowIdx][map.stockPrice - 1]),
+        wrapped: !!(stockWrapActive && allFormulas && allFormulas[rowIdx] && /GOOGLEFINANCE/i.test(allFormulas[rowIdx][map.stockPrice - 1] || '')),
         rangeUsed: stockRangePriceUsed, finalPrice: merged.stockPrice, fallbackSource: stockFallbackSource,
         existingNote: noteOut[map.stockPrice - 1]
       });
@@ -8744,22 +9084,27 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // dry-run (line below), since it's not relevant to this test and
     // keeps this run as minimal as possible.
     const dataRange = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
-    // Layer formulas back in now, right before writing — see the note
-    // where allFormulas was captured above. Any cell that still has its
-    // original formula (this code never explicitly overwrites a formula
-    // cell) gets that formula string written instead of the stale
-    // computed value sitting in allValues; setValues() correctly
-    // re-creates a formula from a string starting with "=".
-    for (let r = 0; r < allValues.length; r++) {
-      for (let c = 0; c < allValues[r].length; c++) {
-        if (allFormulas[r][c]) allValues[r][c] = allFormulas[r][c];
-      }
-    }
-    dataRange.setValues(allValues);
+    // Formula cells are NOT written back (writing them re-sets the formula and forces a recalculation; GOOGLEFINANCE can come
+    // back blank or #N/A when many are re-set at once). The only formulas this run changes are the wrapped StockPrice / L52 /
+    // H52 / Cap ones in formulaOverrides, and only when their fallback number has moved.
+    const isProtected = allValues.map(function (row, r) {
+      return row.map(function (_, c) { return !!allFormulas[r][c]; });
+    });
+    Object.keys(formulaOverrides).forEach(function (key) {
+      const parts = key.split(':'), r = parseInt(parts[0], 10), c = parseInt(parts[1], 10);
+      allValues[r][c] = formulaOverrides[key];
+      isProtected[r][c] = false;
+    });
+    writeValuesSkippingProtected_(sheet, DATA_START_ROW, allValues, isProtected);
     dataRange.setBackgrounds(allBackgrounds);
     dataRange.setFontColors(allFontColors);
     dataRange.setNotes(allNotes);
     dataRange.setNumberFormats(allNumberFormats);
+    if (Object.keys(formulaOverrides).length) {
+      if (!rollbackWrappedFormulasIfBroken_(sheet, DATA_START_ROW, formulaOverrides, formulaOriginals)) {
+        logToSheet_('StockPrice/L52/H52/Cap: ' + Object.keys(formulaOverrides).length + ' GOOGLEFINANCE formula(s) now fall back to the script price when they return blank or an error.');
+      }
+    }
   }
   if (map.target && !dryRun) {
     targetBorderRows.forEach(function (b) {
