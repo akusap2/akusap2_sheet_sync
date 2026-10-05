@@ -647,65 +647,68 @@ function getOrCreateResearchSheet_() {
 function writeResearchSheet_(picks, nearMisses, changes, timeBudgetExceeded, processed, totalCandidates) {
   const sheet = getOrCreateResearchSheet_();
   const headers = ['Quick Ticker', 'Quick Score', 'Quick Reason', '', 'Leap Ticker', 'Leap Score', 'Leap Reason'];
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
-  sheet.setFrozenRows(1);
+  const W = headers.length;
 
-  const rows = [];
+  // The whole page is built in memory and written with ONE setValues + ONE setFontWeights. This used to be one sheet call per
+  // line (plus one per "Added"/"Removed" note), each a separate round trip.
+  const grid = [];
+  const bold = [];
+  const addRow = function (cells, isBold) {
+    const r = cells.slice(); while (r.length < W) r.push('');
+    grid.push(r); bold.push(new Array(W).fill(isBold ? 'bold' : 'normal'));
+  };
+  // A note line is one text cell in column A (bold only there, exactly as before); the table header is bold across all columns.
+  const addTextRow = function (text, isBold) {
+    addRow([text], false);
+    if (isBold) bold[bold.length - 1][0] = 'bold';
+  };
+
+  addRow(headers, true);
   for (let i = 0; i < RESEARCH_TOP_N; i++) {
     const q = picks.Quick[i], l = picks.Leap[i];
-    rows.push([
+    addRow([
       q ? q.ticker : '', q ? q.score : '', q ? q.reason : '', '',
       l ? l.ticker : '', l ? l.score : '', l ? l.reason : ''
-    ]);
+    ], false);
   }
-  sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
-
-  let noteRow = 2 + RESEARCH_TOP_N + 1;
+  addRow([], false);
 
   // Just outside the top 20 (ranks 21-30) — visible context for a
   // near-miss like a large-cap that fell just short, not another action
   // item to act on. Same column layout as the main table above.
-  sheet.getRange(noteRow, 1).setValue('Just outside the top ' + RESEARCH_TOP_N + ' (ranks ' + (RESEARCH_TOP_N + 1) + '-' + (RESEARCH_TOP_N + RESEARCH_NEAR_MISS_COUNT) + ')').setFontWeight('bold');
-  noteRow++;
-  const nearMissRows = [];
+  addTextRow('Just outside the top ' + RESEARCH_TOP_N + ' (ranks ' + (RESEARCH_TOP_N + 1) + '-' + (RESEARCH_TOP_N + RESEARCH_NEAR_MISS_COUNT) + ')', true);
   for (let i = 0; i < RESEARCH_NEAR_MISS_COUNT; i++) {
     const q = nearMisses.Quick[i], l = nearMisses.Leap[i];
-    nearMissRows.push([
+    addRow([
       q ? q.ticker : '', q ? q.score : '', q ? q.reason : '', '',
       l ? l.ticker : '', l ? l.score : '', l ? l.reason : ''
-    ]);
+    ], false);
   }
-  sheet.getRange(noteRow, 1, nearMissRows.length, headers.length).setValues(nearMissRows);
-  noteRow += nearMissRows.length + 1;
+  addRow([], false);
 
-  sheet.getRange(noteRow, 1).setValue('Changes since last run').setFontWeight('bold');
-  noteRow++;
-
+  addTextRow('Changes since last run', true);
   ['Quick', 'Leap'].forEach(function (tabName) {
-    sheet.getRange(noteRow, 1).setValue(tabName + ':').setFontWeight('bold');
-    noteRow++;
+    addTextRow(tabName + ':', true);
     changes[tabName].added.forEach(function (t) {
-      sheet.getRange(noteRow, 1).setValue('  + Added: ' + t + ' \u2014 newly in the top ' + RESEARCH_TOP_N + ' this run.');
-      noteRow++;
+      addTextRow('  + Added: ' + t + ' \u2014 newly in the top ' + RESEARCH_TOP_N + ' this run.', false);
     });
     changes[tabName].removed.forEach(function (t) {
-      sheet.getRange(noteRow, 1).setValue('  \u2212 Removed: ' + t + ' \u2014 no longer ranks in the top ' + RESEARCH_TOP_N + ' (other candidates scored higher this run).');
-      noteRow++;
+      addTextRow('  \u2212 Removed: ' + t + ' \u2014 no longer ranks in the top ' + RESEARCH_TOP_N + ' (other candidates scored higher this run).', false);
     });
-    if (!changes[tabName].added.length && !changes[tabName].removed.length) {
-      sheet.getRange(noteRow, 1).setValue('  No changes since last run.');
-      noteRow++;
-    }
-    noteRow++;
+    if (!changes[tabName].added.length && !changes[tabName].removed.length) addTextRow('  No changes since last run.', false);
+    addRow([], false);
   });
 
-  sheet.getRange(noteRow, 1).setValue(
+  addTextRow(
     'Scanned ' + processed + ' of ' + totalCandidates + ' candidates' +
     (timeBudgetExceeded ? ' \u2014 stopped early, run again to complete the pass.' : '.') +
-    ' Last run: ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMM d, yyyy h:mm a')
-  );
+    ' Last run: ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMM d, yyyy h:mm a'), false);
 
-  sheet.autoResizeColumns(1, headers.length);
+  const block = sheet.getRange(1, 1, grid.length, W);
+  block.setValues(grid);
+  block.setFontWeights(bold);
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, W);
 }
 
 

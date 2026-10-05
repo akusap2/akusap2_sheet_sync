@@ -1896,7 +1896,9 @@ function getColumnMap_(sheet) {
     sheet.getRange(HEADER_ROW, lastCol2 + 1).setValue(TIMESTAMP_HEADER);
     map.timestamp = lastCol2 + 1;
   } else {
-    sheet.getRange(HEADER_ROW, tsCol + 1).setValue(TIMESTAMP_HEADER); // upgrade old label in place
+    // Upgrade an old label in place — but only when it actually differs. This used to write the header cell on EVERY call
+    // (every Validate, Scan, Promote...), a pointless sheet edit that can also set off a recalculation for nothing.
+    if (String(headers[tsCol]).trim() !== TIMESTAMP_HEADER) sheet.getRange(HEADER_ROW, tsCol + 1).setValue(TIMESTAMP_HEADER);
     map.timestamp = tsCol + 1;
   }
 
@@ -2551,20 +2553,23 @@ function fetchTastyMarketMetrics_(ticker, accessToken) {
   const item = json.data && json.data.items && json.data.items[0];
   if (!item) return null;
 
-  const ivRank = item['implied-volatility-rank'] != null ? parseFloat(item['implied-volatility-rank']) : null;
-  const ivIndex = item['implied-volatility-index'] != null ? parseFloat(item['implied-volatility-index']) : null;
-  const raw = ivRank != null ? ivRank : ivIndex;
-  if (raw == null || isNaN(raw)) return null;
-
-  const ivPercent = raw <= 1 ? raw * 100 : raw;
-  // Can't legitimately be negative, whether this is a Rank (bounded 0-100)
-  // or an Index (unbounded — a very volatile name can genuinely show
-  // 100+), so only the lower bound is enforced here. There's no free
-  // fallback source for this metric, so an invalid reading just means the
-  // column stays blank this run rather than showing something impossible.
-  if (!isPlausible_(ivPercent, 0, null)) return null;
-
-  return { ivPercent: ivPercent, source: 'TastyTrade (underlying IV Rank)' };
+  // The IV INDEX ('implied-volatility-index', e.g. 0.31) is the stock's implied volatility LEVEL, not a rank, so it must never
+  // stand in for one: a calm stock with a low level but a high rank would read as "low IV Rank". Preference: the rank (either
+  // field name TastyTrade uses), then the percentile (a close cousin); otherwise blank.
+  const num = function (v) { const n = v != null ? parseFloat(v) : NaN; return isNaN(n) ? null : n; };
+  const candidates = [
+    { raw: num(item['implied-volatility-rank']), source: 'TastyTrade (underlying IV Rank)' },
+    { raw: num(item['implied-volatility-index-rank']), source: 'TastyTrade (underlying IV Rank)' },
+    { raw: num(item['implied-volatility-percentile']), source: 'TastyTrade (IV percentile, no rank available)' }
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    const raw = candidates[i].raw;
+    if (raw == null) continue;
+    const ivPercent = raw <= 1 ? raw * 100 : raw;   // the API sends fractions (0.4567 = 45.67); anything above 1 is taken as already in percent
+    if (!isPlausible_(ivPercent, 0, 100)) continue;
+    return { ivPercent: ivPercent, source: candidates[i].source };
+  }
+  return null;
 }
 
 
@@ -4475,6 +4480,7 @@ function meanReversionSetupScore_(momentumPercent, trendPercent, snapbackRecover
 // other calibration choices flagged elsewhere in this project.
 function overextensionRiskScore_(momentumPercent, trendPercent) {
   if (momentumPercent == null || trendPercent == null) return 0; // missing data fails toward neutral, not toward risk
+  if (typeof momentumPercent !== 'number' || typeof trendPercent !== 'number' || !isFinite(momentumPercent) || !isFinite(trendPercent)) return 0; // NaN / text / Infinity: same, never a NaN
   if (momentumPercent <= 0 || trendPercent <= 0) return 0; // only an upward run can be "overextended" in this sense
   const momentumExcess = clamp_(((momentumPercent - 4) / 8) * 100, 0, 100);
   const trendExcess = clamp_(((trendPercent - 5) / 10) * 100, 0, 100);
@@ -5374,7 +5380,7 @@ function prepareQuickRiskySim_(sheetName, inputs) {
     daySigmas = inputs.changeNowPercent / (SIM.atrToDailyVol * inputs.atrPercent);
     extDay = clamp_((daySigmas - SIM.dayMoveStartSd) / (SIM.dayMoveFullSd - SIM.dayMoveStartSd), 0, 1);
   }
-  return {
+  const prepared = {
     sheetName: sheetName, cfg: cfg, S0: S0, K: K, dte: dte, optionType: optionType,
     sigma: cal.sigma, scale: cal.scale, volSource: volSource,
     halfSpread: halfSpread, cost: cost, exitFactor: 1 - halfSpread,   // you receive the bid
@@ -5388,6 +5394,9 @@ function prepareQuickRiskySim_(sheetName, inputs) {
     ext5d: ext5d, extDay: extDay, dayMoveSigmas: daySigmas, dayMovePct: isPlausible_(inputs.changeNowPercent, -100, 1000) ? inputs.changeNowPercent : null,
     extTiltSd: -Math.max(ext5d, extDay) * SIM.extensionTiltMaxSd
   };
+  const mustBeFinite = [prepared.S0, prepared.K, prepared.dte, prepared.sigma, prepared.scale, prepared.halfSpread, prepared.cost, prepared.winLevel, prepared.rank, prepared.extension, prepared.extTiltSd];
+  for (let i = 0; i < mustBeFinite.length; i++) if (typeof mustBeFinite[i] !== 'number' || !isFinite(mustBeFinite[i])) return null;
+  return prepared;
 }
 
 // Runs the paths. opts.winOnly: stop at the end of the win window and report
@@ -5406,7 +5415,8 @@ function runQuickRiskySim_(ctx, opts) {
   const revMax = SIM.ivReversionMax * ctx.rank;
   const crush = SIM.eventIvCrushMax * ctx.rank;
   const dc = ctx.daysToCatalyst;
-  const eventDay = (isPlausible_(dc, 0, null) && Math.ceil(dc) >= 1 && Math.ceil(dc) <= endDay) ? Math.ceil(dc) : null;
+  // An event dated TODAY (dc = 0) counts as landing at the next close (day 1) — it used to be ignored here while Leap counted it.
+  const eventDay = (isPlausible_(dc, 0, null) && Math.max(1, Math.ceil(dc)) <= endDay) ? Math.max(1, Math.ceil(dc)) : null;
 
   const drift = -0.5 * sigma * sigma / 365;
   const vol = sigma * Math.sqrt(1 / 365);
@@ -5417,8 +5427,9 @@ function runQuickRiskySim_(ctx, opts) {
   const tiers = cfg.lossTiers;
   const tierHits = tiers.map(function () { return 0; });
   let nWin = 0, nRec = 0, nStuck = 0;
+  let invalid = false;
 
-  for (let p = 0; p < SIM.paths; p++) {
+  for (let p = 0; p < SIM.paths && !invalid; p++) {
     const z = normals.z[p];
     let S = ctx.S0;
     for (let d = 1; d <= endDay; d++) {
@@ -5430,6 +5441,7 @@ function runQuickRiskySim_(ctx, opts) {
       if (sigD < 0.05) sigD = 0.05;
 
       const proceeds = bsPriceYears_(S, K, (dte - d) / 365, sigD, optionType) * ctx.scale * ctx.exitFactor;
+      if (!isFinite(proceeds)) { invalid = true; break; }   // a NaN path would silently count as "stuck, no loss" = a fake Risk of 0
 
       if (d <= cfg.winDays && proceeds >= ctx.winLevel) { nWin++; break; }
       if (opts.winOnly) continue;
@@ -5442,6 +5454,7 @@ function runQuickRiskySim_(ctx, opts) {
     }
   }
 
+  if (invalid) return null;
   const tierProbabilities = tierHits.map(function (h) { return h / SIM.paths; });
   const avg = tierProbabilities.reduce(function (a, b) { return a + b; }, 0) / tierProbabilities.length;
   return {
@@ -5512,6 +5525,7 @@ function computeQuickRiskyScore_(ctx, filterScoreValue) {
   const f = isPlausible_(filterScoreValue, 0, 100) ? filterScoreValue : 50;
   const filterTiltSd = clamp_((f - 50) / 50, -1, 1) * QR_SCORE_TILT_MAX_SD;
   const r = runQuickRiskySim_(ctx, { winOnly: true, tiltSd: filterTiltSd + ctx.extTiltSd });
+  if (!r) return null;
   return { score: Math.round(r.pWin * 1000) / 10, pWin: r.pWin, tiltSd: filterTiltSd, extTiltSd: ctx.extTiltSd };
 }
 
@@ -5779,12 +5793,15 @@ function leapPrepare_(inputs) {
   const cal = calibrateVolToMark_(price, S0, K, dte / 365, optionType, quoteSigma);
   if (!cal) return null;
   const halfSpread = isPlausible_(inputs.bidAskSpreadPct, 0, 100) ? (inputs.bidAskSpreadPct / 100) / 2 : 0;
-  return {
+  const prepared = {
     S0: S0, K: K, price: price, dte: dte, optionType: optionType,
     sigma: cal.sigma, scale: cal.scale, halfSpread: halfSpread,
     cost: price * (1 + halfSpread), exitFactor: 1 - halfSpread,
     rank: isPlausible_(inputs.ivRank, 0, 100) ? inputs.ivRank / 100 : null
   };
+  const mustBeFinite = [prepared.S0, prepared.K, prepared.price, prepared.dte, prepared.sigma, prepared.scale, prepared.halfSpread, prepared.cost, prepared.exitFactor];
+  for (let i = 0; i < mustBeFinite.length; i++) if (typeof mustBeFinite[i] !== 'number' || !isFinite(mustBeFinite[i])) return null;
+  return prepared;
 }
 
 // Returns { risk, tierProbabilities:[p10,p20,p30], eventWithin, extension } or null if inputs are unusable.
@@ -5826,7 +5843,9 @@ function computeLeapPremiumLoss_(inputs) {
 
   let wSum = 0, pSum = 0;
   for (let i = 0; i < probs.length; i++) { wSum += M.tierWeights[i]; pSum += probs[i] * M.tierWeights[i]; }
-  return { risk: Math.round((pSum / wSum) * 1000) / 10, tierProbabilities: probs, eventWithin: eventWithin, extension: extension };
+  const riskPct = Math.round((pSum / wSum) * 1000) / 10;
+  if (!isFinite(riskPct)) return null;   // never a NaN Risk
+  return { risk: riskPct, tierProbabilities: probs, eventWithin: eventWithin, extension: extension };
 }
 
 // holder (optional) receives the full result so the cell note can show the 10/20/30% split.
@@ -5916,6 +5935,7 @@ function computeLeapUpsideScore_(inputs, filterScoreValue) {
   } else {
     pUp = sol.outOfRange === 'low' ? 1 : (sol.outOfRange === 'high' ? 0 : 1 - normalCdf_((Math.log(sol.level / c.S0) - mu) / sd));
   }
+  if (!isFinite(pUp)) return null;   // never a NaN Score
   return {
     score: Math.round(pUp * 1000) / 10, pUp: pUp, tiltSd: tiltSd, horizonDays: H,
     requiredStock: sol.outOfRange ? null : sol.level,
@@ -7115,6 +7135,32 @@ function prefetchDailyViaCloudFunction_(sheet, map, lastRow) {
   }
 }
 
+// StockPrice cell note. Says which price the row's calculations used when the StockPrice cell itself is blank or unusable (for
+// example your =GOOGLEFINANCE formula returning #N/A before the open). Returns { action, text }:
+//   'set'   -> write `text` as the cell note
+//   'clear' -> remove an earlier note of OURS (identified by the "Stock price: " prefix; a note you wrote yourself is never touched)
+//   'keep'  -> leave the cell's note alone
+// a = { shownOk: the cell displayed a usable number before this run touched it, hasFormula: the cell holds a formula,
+//       rangeUsed: the batch refresh produced a price this run, finalPrice: price the calculations used (or null),
+//       fallbackSource: 'Yahoo option chain' | 'TastyTrade equity quote' | null, existingNote: current note text }
+const STOCK_NOTE_PREFIX = 'Stock price: ';
+function stockPriceNote_(a) {
+  const ours = typeof a.existingNote === 'string' && a.existingNote.indexOf(STOCK_NOTE_PREFIX) === 0;
+  const clearOrKeep = ours ? { action: 'clear', text: '' } : { action: 'keep', text: '' };
+  // The cell shows a usable number, or the script writes the refreshed price straight into it: nothing to explain.
+  if (a.shownOk) return clearOrKeep;
+  if (a.rangeUsed && !a.hasFormula) return clearOrKeep;
+  if (a.finalPrice == null || !isFinite(a.finalPrice)) {
+    return { action: 'set', text: STOCK_NOTE_PREFIX + 'no price from any source this run (cell, Yahoo refresh, Yahoo option chain, TastyTrade). Score, Target and Risk may be blank for this row.' };
+  }
+  const price = '$' + (Math.round(a.finalPrice * 100) / 100);
+  const source = a.rangeUsed ? 'the Yahoo quote refresh' : (a.fallbackSource || 'a backup source');
+  if (a.hasFormula) {
+    return { action: 'set', text: STOCK_NOTE_PREFIX + 'this cell shows your formula\'s result, which is blank or an error right now (GOOGLEFINANCE often is before the open). Calculations used ' + price + ' from ' + source + '. This note disappears once the cell has a price.' };
+  }
+  return { action: 'set', text: STOCK_NOTE_PREFIX + 'this cell was empty and could not be refreshed. Calculations used ' + price + ' from ' + source + '.' };
+}
+
 // "$270P 10/9 @ $3.45" (a weekday is added when the expiry is not a Friday, e.g. "10/8 Thu").
 function formatAtmPutText_(ap) {
   const strike = Math.round(ap.strike * 100) / 100;
@@ -7486,11 +7532,13 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // prefetch first (see prefetchStockPriceRangeViaCloudFunction_
     // above), falling back to the individual per-ticker fetch for any
     // ticker the prefetch didn't cover.
+    const stockCellShownOrig = map.stockPrice ? rowOut[map.stockPrice - 1] : null;   // what the cell displayed before this run touched it
+    let stockRangePriceUsed = false;
     if (map.stockPrice || map.l52 || map.h52 || map.cap) {
       const range52 = stockRangeMap[ticker] || fetchStockPriceAnd52WeekRange_(ticker);
       if (!range52) markStale_(rowIdx, 'StockPrice/52-week range not refreshed');
       if (range52) {
-        if (map.stockPrice && range52.price != null) rowOut[map.stockPrice - 1] = round2_(range52.price);
+        if (map.stockPrice && range52.price != null) { rowOut[map.stockPrice - 1] = round2_(range52.price); stockRangePriceUsed = true; }
         if (map.l52 && range52.low52 != null) rowOut[map.l52 - 1] = round2_(range52.low52);
         if (map.h52 && range52.high52 != null) rowOut[map.h52 - 1] = round2_(range52.high52);
         if (map.cap && range52.cap != null) rowOut[map.cap - 1] = round2_(range52.cap);
@@ -7692,16 +7740,29 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
         sourceByField.stockPrice = 'GOOGLEFINANCE (your formula)';
       }
     }
+    let stockFallbackSource = null;
     if (merged.stockPrice == null && yahooQuote && yahooQuote.underlying != null) {
       merged.stockPrice = yahooQuote.underlying;
       sourceByField.stockPrice = 'Yahoo Finance (unofficial, fallback — StockPrice cell empty/invalid)';
+      stockFallbackSource = 'Yahoo option chain';
     }
     if (merged.stockPrice == null) {
       const tastyEquityQuote = fetchTastyEquityQuote_(ticker, accessToken);
       if (tastyEquityQuote && tastyEquityQuote.price != null) {
         merged.stockPrice = tastyEquityQuote.price;
         sourceByField.stockPrice = 'TastyTrade (fallback — GOOGLEFINANCE and Yahoo both empty/invalid)';
+        stockFallbackSource = 'TastyTrade equity quote';
       }
+    }
+    if (map.stockPrice) {
+      const stockNote = stockPriceNote_({
+        shownOk: isPlausible_(parseFloat(stockCellShownOrig), 0.01, null),
+        hasFormula: !!(allFormulas && allFormulas[rowIdx] && allFormulas[rowIdx][map.stockPrice - 1]),
+        rangeUsed: stockRangePriceUsed, finalPrice: merged.stockPrice, fallbackSource: stockFallbackSource,
+        existingNote: noteOut[map.stockPrice - 1]
+      });
+      if (stockNote.action === 'set') noteOut[map.stockPrice - 1] = stockNote.text;
+      else if (stockNote.action === 'clear') noteOut[map.stockPrice - 1] = '';
     }
 
     // DELTA / GAMMA — both estimates (when a broker quote isn't available)

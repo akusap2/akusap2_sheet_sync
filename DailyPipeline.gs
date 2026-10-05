@@ -79,6 +79,8 @@ const DAILY_PIPELINE_TRIGGER_FN = 'runDailyPipelineStage_';
 const DAILY_PIPELINE_STAGE_TIME_BUDGET_MS = 4 * 60 * 1000;
 const DAILY_PIPELINE_AUTOFILL_TIME_BUDGET_MS = 4 * 60 * 1000;
 const DAILY_PIPELINE_AUTOFILL_SLEEP_MS = 400;
+// Promote runs in the same execution as Research only if Research finished with at least ~90 seconds of the 6-minute limit left.
+const DAILY_PIPELINE_INLINE_PROMOTE_MAX_ELAPSED_MS = 4.5 * 60 * 1000;
 
 // When false (current setting), the pipeline ENDS after PROMOTE: Research ->
 // Promote -> DONE. Strike/Expiry auto-fill (Best Open Interest) is skipped
@@ -155,6 +157,14 @@ function dailyPipelineWatchdog_() {
   runDailyPipelineStage_();
 }
 
+// The watchdog only matters while a run is in flight. Left installed it fires every 10 minutes around the clock (about 144
+// executions a day, each using some of the daily trigger-runtime quota) to find nothing. Removed when the pipeline finishes.
+function removeDailyPipelineWatchdog_() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'dailyPipelineWatchdog_') ScriptApp.deleteTrigger(t);
+  });
+}
+
 function ensureDailyPipelineWatchdog_() {
   const exists = ScriptApp.getProjectTriggers().some(function (t) {
     return t.getHandlerFunction() === 'dailyPipelineWatchdog_';
@@ -205,9 +215,18 @@ function runDailyPipelineStage_() {
     }
     const state = JSON.parse(raw);
 
+    const executionStart = Date.now();
     try {
       if (state.stage === 'RESEARCH') {
         runDailyPipelineResearchStage_(state);
+        // Promote is a few seconds of sheet work, but handing it to a new time trigger costs a wait of unpredictable length
+        // (Apps Script fires "after N ms" triggers whenever it gets to them, often a minute or more later). So when Research just
+        // finished and this execution still has headroom, run Promote right here. If Research stopped early, or time is short,
+        // the old trigger hand-off still happens.
+        if (state.stage === 'PROMOTE' && (Date.now() - executionStart) < DAILY_PIPELINE_INLINE_PROMOTE_MAX_ELAPSED_MS) {
+          state.log.push('Promote: running immediately in the same execution (no trigger wait).');
+          runDailyPipelinePromoteStage_(state);
+        }
       } else if (state.stage === 'PROMOTE') {
         runDailyPipelinePromoteStage_(state);
       } else if (state.stage === 'AUTOFILL') {
@@ -223,6 +242,7 @@ function runDailyPipelineStage_() {
 
     if (state.stage === 'DONE' || state.stage === 'FAILED') {
       props.deleteProperty(DAILY_PIPELINE_STATE_KEY);
+      removeDailyPipelineWatchdog_();   // nothing left to watch; it is re-created the next time the pipeline starts
       const summary = 'Daily Pipeline ' + (state.stage === 'DONE' ? 'complete' : 'FAILED') +
         ' (' + Math.round((Date.now() - state.startedAt) / 60000) + ' min total):\n' + state.log.join('\n');
       logToSheet_(summary);
@@ -311,14 +331,20 @@ function findTickersNeedingContract_(sheet, map) {
   if (!map.ticker) return [];
   const lastRow = sheet.getLastRow();
   const results = [];
-  for (let row = DATA_START_ROW; row <= lastRow; row++) {
-    const ticker = String(sheet.getRange(row, map.ticker).getValue()).trim().toUpperCase();
+  const n = lastRow - DATA_START_ROW + 1;
+  if (n <= 0) return results;
+  // Three column reads for the whole tab instead of up to three single-cell reads per row.
+  const tickers = sheet.getRange(DATA_START_ROW, map.ticker, n, 1).getValues();
+  const strikes = map.strike ? sheet.getRange(DATA_START_ROW, map.strike, n, 1).getValues() : null;
+  const expiries = map.expiry ? sheet.getRange(DATA_START_ROW, map.expiry, n, 1).getValues() : null;
+  for (let i = 0; i < n; i++) {
+    const ticker = String(tickers[i][0]).trim().toUpperCase();
     if (!ticker) continue;
-    const strikeVal = map.strike ? sheet.getRange(row, map.strike).getValue() : '';
-    const expiryVal = map.expiry ? sheet.getRange(row, map.expiry).getValue() : '';
+    const strikeVal = strikes ? strikes[i][0] : '';
+    const expiryVal = expiries ? expiries[i][0] : '';
     const missingStrike = strikeVal === '' || strikeVal == null;
     const missingExpiry = expiryVal === '' || expiryVal == null;
-    if (missingStrike || missingExpiry) results.push({ ticker: ticker, row: row });
+    if (missingStrike || missingExpiry) results.push({ ticker: ticker, row: DATA_START_ROW + i });
   }
   return results;
 }
@@ -326,6 +352,19 @@ function findTickersNeedingContract_(sheet, map) {
 // Reads the LAST Research run's top-20 picks for tabName straight from the
 // same snapshot ResearchEngine.gs already writes (RESEARCH_LAST_<TAB>) —
 // no need to re-read or re-parse the Research sheet itself.
+// [10, 9, 8, 5, 4, 2] (any order) -> [{start: 8, count: 3}, {start: 4, count: 2}, {start: 2, count: 1}], highest block first
+// so deleting them in order never shifts a row that is still waiting to be deleted.
+function groupAdjacentRowsDescending_(rows) {
+  const desc = rows.slice().sort(function (a, b) { return b - a; });
+  const runs = [];
+  desc.forEach(function (r) {
+    const last = runs[runs.length - 1];
+    if (last && last.start - 1 === r) { last.start = r; last.count++; }
+    else if (!last || last.start !== r) runs.push({ start: r, count: 1 });
+  });
+  return runs;
+}
+
 function promoteResearchPicksForTab_(tabName, dryRun) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(tabName);
@@ -402,7 +441,11 @@ function promoteResearchPicksForTab_(tabName, dryRun) {
     return { added: newTickers.length, deleted: rowsToDelete.length, keptWithPosition: keptWithPosition, keptColored: keptColored, addedTickers: newTickers };
   }
 
-  rowsToDelete.forEach(function (row) { sheet.deleteRow(row); });
+  // Delete bottom-up, but one API call per RUN of adjacent rows instead of one per row: every deleteRow is a separate round trip
+  // that also makes the sheet recalculate its formulas (GOOGLEFINANCE, PtC...), so 15 single deletes cost 15 recalculations.
+  // [10, 9, 8, 5, 4, 2] -> deleteRows(8, 3), deleteRows(4, 2), deleteRows(2, 1). The result is identical.
+  const deleteRuns = groupAdjacentRowsDescending_(rowsToDelete);
+  deleteRuns.forEach(function (run) { sheet.deleteRows(run.start, run.count); });
 
   if (newTickers.length) {
     // Anchored on the actual last row with a real Ticker value, not
@@ -410,13 +453,17 @@ function promoteResearchPicksForTab_(tabName, dryRun) {
     // leftover trailing-formula extension in a far-right column from an
     // earlier, larger dataset, which would insert new tickers several
     // rows below the real data and leave a blank-row gap in between.
-    const sheetLastRow = sheet.getLastRow();
+    // Worked out from the values already read above (no second read of the column): every remaining ticker's new row is its old
+    // row minus the number of deleted rows above it.
     let lastTickerRow = DATA_START_ROW - 1;
-    if (sheetLastRow >= DATA_START_ROW) {
-      const freshTickerValues = sheet.getRange(DATA_START_ROW, map.ticker, sheetLastRow - DATA_START_ROW + 1, 1).getValues();
-      for (let i = freshTickerValues.length - 1; i >= 0; i--) {
-        if (freshTickerValues[i][0]) { lastTickerRow = DATA_START_ROW + i; break; }
-      }
+    const deletedAsc = rowsToDelete.slice().sort(function (a, b) { return a - b; });
+    for (let i = tickerValues.length - 1; i >= 0; i--) {
+      const oldRow = DATA_START_ROW + i;
+      if (!tickerValues[i][0]) continue;
+      if (deletedAsc.indexOf(oldRow) !== -1) continue;          // that row is gone
+      const deletedAbove = deletedAsc.filter(function (r) { return r < oldRow; }).length;
+      lastTickerRow = oldRow - deletedAbove;
+      break;
     }
     const startRow = lastTickerRow + 1;
     sheet.getRange(startRow, map.ticker, newTickers.length, 1).setValues(newTickers.map(function (t) { return [t]; }));
