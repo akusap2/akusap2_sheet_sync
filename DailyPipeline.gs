@@ -123,9 +123,27 @@ function runDailyPipeline() {
     );
   } catch (e) { /* fine if there's no active spreadsheet context */ }
 
+  // Pipeline start only: wipe every earlier ScriptLog row so the tab doesn't keep growing. Stages and other runs never clear it.
+  clearScriptLogForPipeline_();
   logToSheet_('Daily Pipeline started.');
 
   ScriptApp.newTrigger(DAILY_PIPELINE_TRIGGER_FN).timeBased().after(1000).create();
+}
+
+// Deletes all ScriptLog rows below the header (the header and frozen row stay). Called only from runDailyPipeline.
+// Rows are physically deleted, not just blanked, so the tab actually shrinks. A sheet must keep at least one
+// non-frozen row, so one spare row is added first when the log fills the sheet. Never throws: a failed cleanup must not block the pipeline.
+function clearScriptLogForPipeline_() {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SCRIPT_LOG_SHEET_NAME);
+    if (!sheet) return;
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return;
+    if (sheet.getMaxRows() <= lastRow) sheet.insertRowAfter(lastRow);
+    sheet.deleteRows(2, lastRow - 1);
+  } catch (e) {
+    Logger.log('clearScriptLogForPipeline_ failed: ' + e);
+  }
 }
 
 function clearDailyPipelineTriggers_() {

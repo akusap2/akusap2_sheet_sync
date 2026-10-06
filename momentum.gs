@@ -61,7 +61,7 @@ const HEADER_MAP = {
   // TRACKED_FIELDS below and the "STOCK PRICE" section in validateAndUpdate.
   // You're expected to have your own =GOOGLEFINANCE(ticker,"price") formula
   // in this column; the script reads whatever it shows.
-  stockPrice: ['StockPrice', 'Current Stock Price', 'Current'],
+  stockPrice: ['StockPrice', 'Current Stock Price', 'Current', 'Stock Price', 'Stock'],
   // 52-week low/high and market cap — script-fetched now (see
   // fetchStockPriceAnd52WeekRange_) only when the cell is blank; never
   // overwrites an existing value.
@@ -1425,6 +1425,7 @@ function onOpen() {
     // Everything else is grouped into one-level submenus (Apps Script custom menus nest reliably only one level deep).
     .addSubMenu(SpreadsheetApp.getUi().createMenu('📱 Phone Alerts')
       .addItem('Set Up Telegram (free)', 'setupTelegramAlerts_')
+      .addItem('Add Telegram Recipient (e.g. wife)', 'addTelegramRecipient_')
       .addItem('Send Test Alert', 'sendTestPhoneAlert_')
       .addItem('Turn Alerts On / Off', 'togglePhoneAlerts_')
       .addSeparator()
@@ -2207,6 +2208,26 @@ function debugFetchRawQuote() {
   function safe_(fn) {
     try { return String(fn()); } catch (e) { return 'ERROR: ' + e.message; }
   }
+
+  // STOCK PRICE SOURCES — placed first so the 5000-character alert never cuts it off. Shows what each source returns for this ticker,
+  // which is exactly what decides whether a blank StockPrice cell can be filled.
+  output += '--- STOCK PRICE SOURCES ---\n';
+  output += 'StockPrice cell: value=' + safe_(function () { return JSON.stringify(sheet.getRange(row, map.stockPrice).getValue()); }) +
+    ' formula=' + safe_(function () { return JSON.stringify(sheet.getRange(row, map.stockPrice).getFormula()); }) + '\n';
+  output += 'Tasty equity quote (parsed): ' + safe_(function () { return JSON.stringify(fetchTastyEquityQuote_(ticker, getTastyTradeAccessToken_())); }) + '\n';
+  output += 'Tasty equity quote (raw): ' + safe_(function () {
+    const tok = getTastyTradeAccessToken_();
+    if (!tok) return 'no credentials';
+    const r = UrlFetchApp.fetch('https://api.tastyworks.com/market-data/by-type?equity=' + encodeURIComponent(ticker), { method: 'get', headers: { Authorization: 'Bearer ' + tok, 'User-Agent': TASTY_USER_AGENT, Accept: 'application/json' }, muteHttpExceptions: true });
+    return 'HTTP ' + r.getResponseCode() + ' ' + r.getContentText().substring(0, 350);
+  }) + '\n';
+  output += 'Yahoo quote: ' + safe_(function () { return JSON.stringify(fetchStockPriceAnd52WeekRange_(ticker)); }) + '\n';
+  output += 'Cloud Function stockRange: ' + safe_(function () {
+    const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+    if (!url || !secret) return 'Cloud Function URL or shared secret not set in Script Properties';
+    const r = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ apiKey: secret, stockRange: { tickers: [ticker], needCap: false } }), muteHttpExceptions: true });
+    return 'HTTP ' + r.getResponseCode() + ' ' + r.getContentText().substring(0, 600);
+  }) + '\n\n';
 
   output += '--- Timezone Diagnostic ---\n';
   output += 'Script timezone: ' + safe_(function () { return Session.getScriptTimeZone(); }) + '\n';
@@ -6755,13 +6776,21 @@ function sendPhoneAlert_(cfg, title, body, high) {
     }
     if (cfg.provider === 'telegram') {
       // Telegram's limits are per bot (about 1 message/second per chat), not per sending IP, so Apps Script's shared servers are fine.
-      const resp = UrlFetchApp.fetch('https://api.telegram.org/bot' + cfg.telegramToken + '/sendMessage', {
-        method: 'post', muteHttpExceptions: true,
-        payload: { chat_id: String(cfg.telegramChatId), text: (String(title) + '\n' + String(body)).slice(0, 4000) }
+      // TELEGRAM_CHAT_ID may hold several chats, comma-separated (yours, your wife's...). Each gets its own copy, sent in parallel.
+      // ok = at least one delivered, so one person blocking the bot never makes the same alert repeat for everyone else.
+      const chatIds = telegramChatIdList_(cfg.telegramChatId);
+      if (!chatIds.length) return { ok: false, detail: 'No Telegram chat id set.' };
+      const text = (String(title) + '\n' + String(body)).slice(0, 4000);
+      const resps = UrlFetchApp.fetchAll(chatIds.map(function (id) {
+        return { url: 'https://api.telegram.org/bot' + cfg.telegramToken + '/sendMessage', method: 'post', muteHttpExceptions: true, payload: { chat_id: id, text: text } };
+      }));
+      let delivered = 0; const fails = [];
+      resps.forEach(function (resp, i) {
+        let okFlag = false;
+        try { okFlag = JSON.parse(resp.getContentText()).ok === true; } catch (e) { /* ignore */ }
+        if (resp.getResponseCode() === 200 && okFlag) delivered++; else fails.push(chatIds[i] + ': HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 100));
       });
-      let okFlag = false;
-      try { okFlag = JSON.parse(resp.getContentText()).ok === true; } catch (e) { /* ignore */ }
-      return { ok: resp.getResponseCode() === 200 && okFlag, detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+      return { ok: delivered > 0, detail: delivered + ' of ' + chatIds.length + ' chats delivered' + (fails.length ? ' | failed: ' + fails.join(' ; ') : '') };
     }
     if (cfg.provider === 'ntfy') {
       const headers = { Title: String(title).replace(/[^\x20-\x7e]/g, '?'), Priority: high ? '4' : '3', Tags: high ? 'chart_with_upwards_trend' : 'eyes' };
@@ -7002,6 +7031,49 @@ function findTelegramChatId_(token) {
   } catch (e) {
     return { id: null, detail: String(e) };
   }
+}
+
+// "123, -456" -> ['123', '-456']  (a group chat id is negative).
+function telegramChatIdList_(raw) {
+  return String(raw == null ? '' : raw).split(/[,\s]+/).filter(function (s) { return /^-?\d+$/.test(s); });
+}
+
+// Every distinct chat that has messaged the bot recently: [{ id, name }]. getUpdates only keeps about the last 24 hours of messages.
+function listTelegramChats_(token) {
+  try {
+    const resp = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/getUpdates', { muteHttpExceptions: true });
+    const json = JSON.parse(resp.getContentText());
+    if (!json.ok || !json.result) return { chats: [], detail: 'HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 160) };
+    const seen = {}, chats = [];
+    for (let i = json.result.length - 1; i >= 0; i--) {
+      const u = json.result[i], m = u.message || u.edited_message || null;
+      if (!m || !m.chat || m.chat.id == null) continue;
+      const id = String(m.chat.id);
+      if (seen[id]) continue;
+      seen[id] = true;
+      chats.push({ id: id, name: [m.chat.first_name, m.chat.last_name].filter(Boolean).join(' ') || m.chat.title || m.chat.username || id });
+    }
+    return { chats: chats, detail: '' };
+  } catch (e) {
+    return { chats: [], detail: String(e) };
+  }
+}
+
+// Menu: add one more person (e.g. your wife) to the same bot. She opens the bot, presses Start and sends "hi" first; run this the same day.
+function addTelegramRecipient_() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('TELEGRAM_TOKEN');
+  if (!token) { ui.alert('Set up Telegram first (Phone Alerts > Set Up Telegram).'); return; }
+  const have = telegramChatIdList_(props.getProperty('TELEGRAM_CHAT_ID'));
+  const found = listTelegramChats_(token);
+  const fresh = found.chats.filter(function (c) { return have.indexOf(c.id) === -1; });
+  if (!fresh.length) { ui.alert('No new chat found (' + (found.detail || 'nobody new has messaged the bot in the last day') + '). Ask her to open the bot, press Start and send "hi", then run this again. Already receiving: ' + have.length + ' chat(s).'); return; }
+  const c = fresh[0];
+  if (ui.alert('Add recipient', 'Send alerts to "' + c.name + '" (chat ' + c.id + ') as well?', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  props.setProperty('TELEGRAM_CHAT_ID', have.concat([c.id]).join(','));
+  const res = sendPhoneAlert_(getAlertConfig_(), 'Options Validator test', 'Phone alerts are working.', false);
+  ui.alert(res.ok ? 'Added. A test alert went to everyone on the list (' + res.detail + ').' : 'Added, but the test failed: ' + res.detail);
 }
 
 function setupTelegramAlerts_() {
@@ -7521,6 +7593,43 @@ function rollbackWrappedFormulasIfBroken_(sheet, startRow, overrides, originals)
 //       fallbackSource: 'Yahoo option chain' | 'TastyTrade equity quote' | null, existingNote: current note text,
 //       wrapped: the formula is wrapped (or being wrapped) so the cell itself falls back to the script price }
 const STOCK_NOTE_PREFIX = 'Stock price: ';
+// ---------------------------------------------------------------------------
+// STOCK PRICE GUARD: the price in a row is cross-checked against the option's OWN quote. TastyTrade's mark and contract IV are
+// computed off the same underlying price, so Black-Scholes solved backwards for the stock price gives what the option implies.
+// If the row's price is more than tolerancePct away from that, it is wrong or stale (wrong source, stale cell, bad fallback).
+// Skipped when the option can't pin the stock price down (deep out of the money, very wide spread, nearly expired, tiny premium).
+// ---------------------------------------------------------------------------
+const STOCK_GUARD = { enabled: true, tolerancePct: 5, minAbsDelta: 0.25, maxSpreadPct: 30, minOptionPrice: 0.5, minDaysToExpiry: 3 };
+
+// Stock price implied by an option's price and IV (bisection on blackScholesPrice_, which is monotonic in the stock price). null if unsolvable.
+function impliedStockFromOption_(optionPrice, strike, daysToExpiry, ivPercent, optionType) {
+  if (!isPlausible_(optionPrice, 0.01, null) || !isPlausible_(strike, 0.01, null) || !isPlausible_(daysToExpiry, 0.5, null) || !isPlausible_(ivPercent, 0.01, 1000)) return null;
+  const f = function (s) { return blackScholesPrice_(s, strike, daysToExpiry, ivPercent, optionType); };
+  let lo = strike * 0.05, hi = strike * 20;
+  const increasing = optionType !== 'P';   // a call gains value as the stock rises, a put loses it
+  const fLo = f(lo), fHi = f(hi);
+  if (fLo == null || fHi == null) return null;
+  if (optionPrice < Math.min(fLo, fHi) || optionPrice > Math.max(fLo, fHi)) return null;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    const fm = f(mid);
+    if (fm == null) return null;
+    if ((fm < optionPrice) === increasing) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// { status: 'ok' | 'skip' | 'mismatch', implied, diffPct } where diffPct = (row price - implied) / implied * 100.
+function stockPriceGuard_(stockPrice, optionPrice, ivPercent, delta, spreadPct, strike, daysToExpiry, optionType) {
+  const G = STOCK_GUARD;
+  if (!G.enabled || !isPlausible_(stockPrice, 0.01, null) || delta == null || !isFinite(delta) || Math.abs(delta) < G.minAbsDelta ||
+      (spreadPct != null && spreadPct > G.maxSpreadPct) || !(optionPrice >= G.minOptionPrice) || !(daysToExpiry >= G.minDaysToExpiry)) return { status: 'skip' };
+  const implied = impliedStockFromOption_(optionPrice, strike, daysToExpiry, ivPercent, optionType);
+  if (implied == null) return { status: 'skip' };
+  const diffPct = (stockPrice - implied) / implied * 100;
+  return { status: Math.abs(diffPct) > G.tolerancePct ? 'mismatch' : 'ok', implied: implied, diffPct: diffPct };
+}
+
 function stockPriceNote_(a) {
   const ours = typeof a.existingNote === 'string' && a.existingNote.indexOf(STOCK_NOTE_PREFIX) === 0;
   const clearOrKeep = ours ? { action: 'clear', text: '' } : { action: 'keep', text: '' };
@@ -7755,6 +7864,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const stockRangeMap = prefetchStockPriceRangeViaCloudFunction_(sheet, map, lastRow);
   const stockRangeBackendDown = Object.keys(stockRangeMap).length === 0;   // only then is Apps Script's own direct Yahoo call worth trying
   const stockRangeMemo = {};
+  const stockGuardEquityMemo = {};   // ticker -> Tasty equity quote, fetched at most once per run (only when the StockPrice cell needs a fallback or the price guard fires)
+  if (!map.stockPrice && (map.l52 || map.h52)) logToSheet_('StockPrice column NOT FOUND on "' + sheet.getName() + '": the price is neither read nor filled until a header reads StockPrice, Current Stock Price, Current, Stock Price or Stock.');
   if (map.stockPrice || map.l52 || map.h52 || map.cap) {
     try {
       const fillNumRows = lastRow - DATA_START_ROW + 1;
@@ -8169,11 +8280,26 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       stockFallbackSource = 'Yahoo option chain';
     }
     if (merged.stockPrice == null) {
-      const tastyEquityQuote = fetchTastyEquityQuote_(ticker, accessToken);
+      // Memoized per ticker (shared with the stock price guard below): rows of the same ticker used to each pay a network call here.
+      if (!(ticker in stockGuardEquityMemo)) { let q = null; try { q = fetchTastyEquityQuote_(ticker, accessToken); } catch (e) { q = null; } stockGuardEquityMemo[ticker] = q; }
+      const tastyEquityQuote = stockGuardEquityMemo[ticker];
       if (tastyEquityQuote && tastyEquityQuote.price != null) {
         merged.stockPrice = tastyEquityQuote.price;
         sourceByField.stockPrice = 'TastyTrade (fallback — GOOGLEFINANCE and Yahoo both empty/invalid)';
         stockFallbackSource = 'TastyTrade equity quote';
+      }
+    }
+    // A blank or broken StockPrice cell must never stay blank while a price was found: the fallback price used to feed only the
+    // calculations and left the cell empty. No formula in the cell: write the number. A GOOGLEFINANCE formula: wrap it so the cell
+    // shows this price whenever the formula errors or is blank, and go back to the formula's own value the moment it works again.
+    if (map.stockPrice && stockFallbackSource && merged.stockPrice != null && !stockRangePriceUsed) {
+      const sfFormula = (allFormulas && allFormulas[rowIdx]) ? allFormulas[rowIdx][map.stockPrice - 1] : '';
+      if (!sfFormula) {
+        rowOut[map.stockPrice - 1] = round2_(merged.stockPrice);
+        stockRangePriceUsed = true;   // the script wrote the cell itself, so no explanatory note is needed
+      } else if (stockWrapActive) {
+        const nf = wrapFormulaWithFallback_(sfFormula, round2_(merged.stockPrice));
+        if (nf) { formulaOverrides[rowIdx + ':' + (map.stockPrice - 1)] = nf; if (!(rowIdx + ':' + (map.stockPrice - 1) in formulaOriginals)) formulaOriginals[rowIdx + ':' + (map.stockPrice - 1)] = sfFormula; }
       }
     }
     if (map.stockPrice) {
@@ -8186,6 +8312,37 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       });
       if (stockNote.action === 'set') noteOut[map.stockPrice - 1] = stockNote.text;
       else if (stockNote.action === 'clear') noteOut[map.stockPrice - 1] = '';
+    }
+
+    // STOCK PRICE GUARD (see STOCK_GUARD): the price must agree with this option's own TastyTrade quote. Only runs when that quote
+    // supplied the option price, IV and delta; costs a Black-Scholes solve per row, and a network call only when it fires.
+    if (STOCK_GUARD.enabled && merged.stockPrice != null && tastyOptionQuote && tastyOptionQuote.mark != null && tastyOptionQuote.contractIv != null) {
+      const gSpread = (tastyOptionQuote.bid != null && tastyOptionQuote.ask != null && tastyOptionQuote.mark > 0) ? ((tastyOptionQuote.ask - tastyOptionQuote.bid) / tastyOptionQuote.mark) * 100 : null;
+      const g = stockPriceGuard_(merged.stockPrice, tastyOptionQuote.mark, tastyOptionQuote.contractIv, tastyOptionQuote.delta, gSpread, parsedStrike.strike, daysToExpiry, parsedStrike.type);
+      if (g.status === 'mismatch') {
+        const shownPx = '$' + round2_(merged.stockPrice), impliedPx = '$' + round2_(g.implied);
+        let confirmed = null;
+        if (stockFallbackSource !== 'TastyTrade equity quote') {
+          if (!(ticker in stockGuardEquityMemo)) { let q = null; try { q = fetchTastyEquityQuote_(ticker, accessToken); } catch (e) { q = null; } stockGuardEquityMemo[ticker] = q; }
+          const eq = stockGuardEquityMemo[ticker];
+          if (eq && eq.price != null && Math.abs((eq.price - g.implied) / g.implied) * 100 <= STOCK_GUARD.tolerancePct) confirmed = eq.price;
+        }
+        let guardNote;
+        if (confirmed != null) {
+          merged.stockPrice = confirmed;
+          sourceByField.stockPrice = 'TastyTrade equity quote (replaced a price that disagreed with the option quote)';
+          const cellHasFormula = !!(allFormulas && allFormulas[rowIdx] && allFormulas[rowIdx][map.stockPrice - 1]);
+          if (map.stockPrice && !cellHasFormula) rowOut[map.stockPrice - 1] = round2_(confirmed);   // a formula cell is never overwritten
+          guardNote = STOCK_NOTE_PREFIX + shownPx + ' disagreed with this option\'s own quote (it implies about ' + impliedPx + ', ' + Math.abs(Math.round(g.diffPct * 10) / 10) + '% apart), so calculations used $' + round2_(confirmed) + ' from the TastyTrade equity quote' + (cellHasFormula ? '. Your formula cell was left alone and still shows ' + shownPx + '.' : '.');
+        } else {
+          markStale_(rowIdx, 'StockPrice disagrees with the option quote by ' + Math.abs(Math.round(g.diffPct * 10) / 10) + '%');
+          guardNote = STOCK_NOTE_PREFIX + shownPx + ' disagrees with this option\'s own quote (it implies about ' + impliedPx + ', ' + Math.abs(Math.round(g.diffPct * 10) / 10) + '% apart) and no live quote confirmed either number. Check this price: Score, Target and Risk for this row may be wrong.';
+        }
+        if (map.stockPrice) {
+          const curNote = noteOut[map.stockPrice - 1];
+          if (!curNote || (typeof curNote === 'string' && curNote.indexOf(STOCK_NOTE_PREFIX) === 0)) noteOut[map.stockPrice - 1] = guardNote;   // a note you wrote yourself is never replaced
+        }
+      }
     }
 
     // DELTA / GAMMA — both estimates (when a broker quote isn't available)
