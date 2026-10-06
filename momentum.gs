@@ -114,7 +114,7 @@ const HEADER_MAP = {
   // Optional intraday readouts (Cloud Function): Aroon length 25 on 5-minute bars, RSI length 14 (Wilder) on 1-minute closes.
   aroonUp: ['AUP', 'Aroon Up', 'AroonUp'],
   aroonDown: ['ADN', 'Aroon Down', 'AroonDown'],
-  rsi1m: ['R30', 'RSI 1m', 'RSI 1M', 'RSI1m', 'RSI'],
+  rsi1m: ['RSI', 'R30', 'RSI 1m', 'RSI 1M', 'RSI1m'],   // header may be "RSI" (new) or the old "R30"
   // Price vs today's session VWAP (percent) and relative volume (today so far vs same time on prior days).
   vwapPct: ['VW', 'VWAP %', 'VWAP'],
   relVol: ['RV', 'RW', 'RVOL', 'Rel Vol'],
@@ -129,7 +129,10 @@ const HEADER_MAP = {
   leapOffHigh: ['OFFH'],       // % below the 52-week high
   leapIvr: ['IVR'],            // IV Rank
   leapCarry: ['CARRY'],        // time value as % of the stock price, annualized by days to expiry
-  leapSpread: ['SPRD']         // option bid/ask spread, % of option price
+  leapSpread: ['SPRD'],        // option bid/ask spread, % of option price
+  // "Bounce" works on both tabs. Leap: % of the fall from the 52-week high (to the lowest low since) already recovered.
+  // Quick: the same idea for TODAY's session (fall from the session high to the low after it).
+  bounce: ['Bounce']
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -163,12 +166,14 @@ const QUOTE_STALE_BLANKS_SCORE = false;   // true = also clear Score/Risk on a r
 const STALE_STATUS_COLOR = '#f9cb9c';
 // LastRun cell fill when any of that row's data is stale/unrefreshed this run; every other row's LastRun stays white.
 const LASTRUN_STALE_COLOR = '#ff9900';
-// AUP / ADN / R30 (Aroon Up, Aroon Down, RSI 1m) have their OWN colors, separate from LastRun, and only while the market is open:
+// AUP / ADN / RSI (Aroon Up, Aroon Down, RSI 1m) have their OWN colors, separate from LastRun, and only while the market is open:
 //   ENTRY (candidate rows = no Entry price, and Risk passes the tab's gate):
-//     light green  = trend up (AUP high, ADN low) and R30 is low             -> get ready
-//     strong green = trend up, R30 dipped to the dip level within the last 5 minutes and is now rising -> enter
-//   EXIT (rows WITH an Entry price): red = option up at least the minimum profit and R30 high;
+//     light green  = trend up (AUP high, ADN low) and RSI is low             -> get ready
+//     strong green = trend up, RSI dipped to the dip level within the last 5 minutes and is now rising -> enter
+//   EXIT (rows WITH an Entry price): red = option up at least the minimum profit and RSI high;
 //     strong red = same, and AUP has already dropped (momentum fading)
+//   same-day bounce (Quick "Bounce" column): light green (READY only) when the stock fell >= bounceMinFall% from today's high and has won back
+//     bounceMinPct%+ of it with room left to the high; it does not need the Aroon trend. Needs the Cloud Function redeployed.
 //   orange = these three values are stale; white = nothing to flag.
 const INTRADAY_STALE_MIN = 5;                 // newest 1-minute bar older than this (market open) = stale
 const INTRADAY_STALE_COLOR = '#ff9900';
@@ -179,10 +184,10 @@ const INTRADAY_EXIT_STRONG_COLOR = '#e06666';
 const INTRADAY_SIGNAL = {
   trendAupMin: 70,        // trend filter: Aroon Up at least this...
   trendAdnMax: 40,        // ...and Aroon Down at most this
-  lightRsiMax: 40,        // light green: R30 at or below this
-  dipRsi: 30,             // strong green: R30 was at or below this within the last 5 minutes...
+  lightRsiMax: 40,        // light green: RSI at or below this
+  dipRsi: 30,             // strong green: RSI was at or below this within the last 5 minutes...
   recoverRsiMax: 45,      // ...is rising now, and has not already run above this
-  exitRsiMin: 65,         // red: R30 at or above this
+  exitRsiMin: 65,         // red: RSI at or above this
   exitMinProfitPct: 1.5,  // red only when the option is up at least this % vs your Entry, counted after the selling spread (matches the +1.5% same-day target)
   exitStrongAupBelow: 50, // strong red: Aroon Up has dropped below this
   maxSpreadPct: 1.5,      // no green when the option's bid/ask spread is wider than this % of its price (eats the same-day target)
@@ -190,7 +195,14 @@ const INTRADAY_SIGNAL = {
   rvolMin: 1.0,           // strong green needs relative volume at or above this (volume at least normal for this time of day)
   noEntryFirstMin: 15,    // no green in the first N minutes after the open...
   noEntryLastMin: 15,     // ...or the last N minutes before the close (wide spreads, unreliable quotes)
-  logCooldownMin: 30      // the same signal on the same contract is logged at most once per this many minutes
+  logCooldownMin: 30,     // the same signal on the same contract is logged at most once per this many minutes
+  // Same-day bounce lane (GET READY only, never ENTRY, and it ignores the Aroon trend filter because a fresh V-bounce fails it):
+  bounceLane: true,
+  bounceMinFall: 1.5,         // today's fall from the session high to the low after it must be at least this %
+  bounceMinPct: 35,           // at least this % of that fall already recovered
+  bounceMinLowAgeMin: 5,      // the low is at least this many minutes old (it has held)
+  bounceFallbackRoomPct: 1.5, // room back up to the session high must cover the stock move the +target needs (MV); used when MV is unknown
+  bounceMaxRsi: 60            // RSI is rising but not already overheated
 };
 // Entry/exit colors and the signal log apply only to these tabs; Leap just shows the values.
 const INTRADAY_SIGNAL_SHEETS = ['Quick'];
@@ -207,6 +219,11 @@ const ALERT_CFG = {
 const LEAP_SIGNAL = {
   strongMaxOffHigh: 15,    // within this % of the 52-week high
   lightMaxOffHigh: 25,
+  bounceLane: true,        // READY (never ENTRY) may also reach out to bounceMaxOffHigh when the stock has clearly bounced off a real fall:
+  bounceMaxOffHigh: 30,
+  bounceMinPct: 50,        // at least this % of the fall from the high already recovered
+  bounceMinLowAge: 40,     // and the low is at least this many trading days old (not a fresh crash bounce)
+  bounceMinFall: 8,        // the fall must be at least this % to count as a real fall
   strongMaxRsi: 45,        // mild daily pullback
   lightMaxRsi: 55,
   maxIvr: 40,              // IV Rank at or below
@@ -6623,7 +6640,7 @@ function alertLineExit_(ticker, strike, expiryText, iv, profitPct, fading, optio
   const parts = ['EXIT ' + ticker + ' ' + strike + ' ' + expiryText];
   if (optionPrice != null && isFinite(optionPrice)) parts.push('opt $' + (Math.round(optionPrice * 100) / 100));
   parts.push('up ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry after spread');
-  parts.push('R30 ' + iv.rsi1m + ' | AUP ' + iv.aroonUp + (fading ? ' (momentum fading)' : ''));
+  parts.push('RSI ' + iv.rsi1m + ' | AUP ' + iv.aroonUp + (fading ? ' (momentum fading)' : ''));
   return parts.join(' | ');
 }
 
@@ -6647,7 +6664,9 @@ function evaluateLeapState_(d, x, L) {
   if (!(num(x.sprd) && x.sprd <= L.maxSpreadPct)) missing.push('spread ' + (num(x.sprd) ? (Math.round(x.sprd * 100) / 100) + '%' : 'n/a') + ' (needs ' + L.maxSpreadPct + '% or less)');
   if (!(num(x.carry) && x.carry <= L.maxCarryPct)) missing.push('carry ' + (num(x.carry) ? (Math.round(x.carry * 10) / 10) + '%/yr' : 'n/a') + ' (needs ' + L.maxCarryPct + '% or less)');
   if (!missing.length) return { kind: 'strong', missing: [], why: '' };
-  if (num(d.offHigh) && d.offHigh <= L.lightMaxOffHigh && num(d.rsi14d) && d.rsi14d <= L.lightMaxRsi) return { kind: 'light', missing: missing, why: 'waiting: ' + missing.join('; ') };
+  const bounceOk = !!(L.bounceLane && num(d.offHigh) && d.offHigh <= L.bounceMaxOffHigh && num(d.bounce) && d.bounce >= L.bounceMinPct &&
+    num(d.fallPct) && d.fallPct >= L.bounceMinFall && num(d.lowAge) && d.lowAge >= L.bounceMinLowAge);
+  if (((num(d.offHigh) && d.offHigh <= L.lightMaxOffHigh) || bounceOk) && num(d.rsi14d) && d.rsi14d <= L.lightMaxRsi) return { kind: 'light', missing: missing, why: 'waiting: ' + missing.join('; ') };
   return { kind: 'none', missing: missing, why: 'trend fine, no pullback yet' };
 }
 
@@ -6657,6 +6676,7 @@ function alertLineLeap_(kind, ticker, strike, expiryText, d, x) {
   const parts = [head + ' ' + ticker + ' ' + strike + ' ' + expiryText];
   if (x.optionPrice != null && isFinite(x.optionPrice)) parts.push('opt $' + (Math.round(x.optionPrice * 100) / 100));
   parts.push('T200 ' + sg(d.t200) + '% | OFFH ' + d.offHigh + '% | R14D ' + d.rsi14d);
+  if (d.bounce != null && isFinite(d.bounce) && d.fallPct != null && d.fallPct >= 8) parts.push('bounce ' + Math.round(d.bounce) + '% of a ' + Math.round(d.fallPct) + '% fall');
   if (x.ivr != null && isFinite(x.ivr)) parts.push('IVR ' + Math.round(x.ivr));
   if (x.carry != null && isFinite(x.carry)) parts.push('carry ' + (Math.round(x.carry * 10) / 10) + '%/yr');
   if (x.sprd != null && isFinite(x.sprd)) parts.push('sprd ' + (Math.round(x.sprd * 100) / 100) + '%');
@@ -6667,7 +6687,28 @@ function alertLineLeap_(kind, ticker, strike, expiryText, d, x) {
 
 // The shared entry decision (used by the sheet run and the 5-minute signal watch): given fresh intraday values for a
 // contract that already passed the Risk / spread / time gates, is it a strong ENTRY, a light "get ready", or nothing?
-function evaluateEntryLevel_(iv, S, spyHead) {
+function evaluateEntryLevel_(iv, S, spyHead, needMovePct) {
+  const ev = evaluateEntryLevelCore_(iv, S, spyHead);
+  if (ev.level) return ev;
+  const b = bounceSetup_(iv, S, spyHead, needMovePct);
+  return b ? { level: 'light', dip: false, missing: [], bounce: b } : ev;
+}
+
+// Same-day bounce: the stock fell at least bounceMinFall% from today's high, has won back bounceMinPct%+ of it off a low that has
+// held, RSI is rising, SPY is not a headwind, and the room back to the session high still covers the move the +target needs.
+function bounceSetup_(iv, S, spyHead, needMovePct) {
+  if (!S.bounceLane || spyHead || !iv) return null;
+  const num = function (v) { return v != null && isFinite(v); };
+  if (!(num(iv.dayBounce) && num(iv.dayFall) && num(iv.dayLowAgeMin) && num(iv.dayRoomPct) && num(iv.rsiPrev) && num(iv.rsi1m))) return null;
+  const need = num(needMovePct) ? needMovePct : S.bounceFallbackRoomPct;
+  if (iv.dayFall >= S.bounceMinFall && iv.dayBounce >= S.bounceMinPct && iv.dayLowAgeMin >= S.bounceMinLowAgeMin &&
+      iv.dayRoomPct >= need && iv.rsi1m > iv.rsiPrev && iv.rsi1m <= S.bounceMaxRsi) return { fall: iv.dayFall, pct: iv.dayBounce, room: iv.dayRoomPct, need: need };
+  return null;
+}
+
+function bounceWhy_(b) { return 'bounce ' + Math.round(b.pct) + '% of a ' + (Math.round(b.fall * 10) / 10) + '% fall today, ' + (Math.round(b.room * 10) / 10) + '% room to the high (needs ' + (Math.round(b.need * 10) / 10) + '%)'; }
+
+function evaluateEntryLevelCore_(iv, S, spyHead) {
   const trend = iv.aroonUp >= S.trendAupMin && iv.aroonDown <= S.trendAdnMax;
   if (!trend) return { level: null, dip: false, missing: [] };
   const rising = iv.rsiPrev != null && iv.rsi1m > iv.rsiPrev;
@@ -6739,7 +6780,7 @@ function sendPhoneAlert_(cfg, title, body, high) {
 function alertLine_(level, ticker, strike, expiryText, iv, meta, fz, why) {
   const parts = [(level === 'strong' ? 'ENTRY ' : 'READY ') + ticker + ' ' + strike + ' ' + expiryText];
   if (meta && meta.optionPrice != null && isFinite(meta.optionPrice)) parts.push('opt $' + (Math.round(meta.optionPrice * 100) / 100));
-  parts.push('AUP ' + iv.aroonUp + ' ADN ' + iv.aroonDown + ' R30 ' + iv.rsi1m);
+  parts.push('AUP ' + iv.aroonUp + ' ADN ' + iv.aroonDown + ' RSI ' + iv.rsi1m);
   if (iv.vwapPct != null) parts.push('VW ' + (iv.vwapPct >= 0 ? '+' : '') + iv.vwapPct + '%');
   if (iv.rvol != null) parts.push('RV ' + iv.rvol + 'x');
   if (fz) parts.push('P1D ' + fz.prob + '%');
@@ -6907,12 +6948,12 @@ function signalWatchTick_() {
         const iv = freshIv(r.t);
         if (!iv && ivMap[r.t]) watchStale++;
         if (!iv) return;
-        const ev = evaluateEntryLevel_(iv, S, spyHead);
-        if (!ev.level) return;
         const meta = { optionPrice: r.p, spreadPct: r.sp, delta: r.d, stockPrice: r.s };
         const fz = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
+        const ev = evaluateEntryLevel_(iv, S, spyHead, fz ? fz.movePct : null);
+        if (!ev.level) return;
         items.push({ key: sn.tab + '|' + r.t + '|' + r.k + '|' + r.e, level: ev.level,
-          line: alertLine_(ev.level, r.t, r.k, r.x, iv, meta, fz, ev.dip ? ('waiting: ' + ev.missing.join('; ')) : 'RSI low, no dip/turn yet') });
+          line: alertLine_(ev.level, r.t, r.k, r.x, iv, meta, fz, ev.dip ? ('waiting: ' + ev.missing.join('; ')) : (ev.bounce ? bounceWhy_(ev.bounce) : 'RSI low, no dip/turn yet')) });
       });
       // Exit check for rows you hold: fresh option quote (sell price = the bid) vs your Entry price.
       sn.held.forEach(function (h) {
@@ -7736,7 +7777,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   const extraCols = prefetchExtraColumnsViaCloudFunction_(sheet, map, lastRow);
   const atmPutMap = extraCols.atmPut;
   const intradayMap = extraCols.intraday;
-  const leapWanted = !!(map.leapT200 || map.leapX50 || map.leapR14 || map.leapOffHigh || map.leapIvr || map.leapCarry || map.leapSpread);
+  const leapWanted = !!(map.leapT200 || map.leapX50 || map.leapR14 || map.leapOffHigh || map.leapIvr || map.leapCarry || map.leapSpread || (sheet.getName() === 'Leap' && map.bounce));
   const leapTiltNeedsDaily = sheet.getName() === 'Leap' && LEAP_SCORE_MODEL.tiltSource === 'stock';
   const dailyMap = (leapWanted || leapTiltNeedsDaily) ? prefetchDailyViaCloudFunction_(sheet, map, lastRow) : {};
 
@@ -7941,7 +7982,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       }
     }
 
-    // AUP / ADN / R30 / VW / RV values (same for every row of a ticker). Colors and notes are applied after the loop
+    // AUP / ADN / RSI / VW / RV values (same for every row of a ticker). Colors and notes are applied after the loop
     // (they need this row's final Risk / Price / Entry / spread).
     if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol || map.needMove || map.pToday) {
       const iv = intradayMap[ticker] || null;
@@ -7952,6 +7993,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       put_(map.rsi1m, iv && iv.rsi1m, '0.0');
       put_(map.vwapPct, iv && iv.vwapPct, '+0.00;-0.00;0.00');
       put_(map.relVol, iv && iv.rvol, '0.00');
+      if (sheet.getName() !== 'Leap') put_(map.bounce, iv && iv.dayBounce, '0');   // Quick: today's session bounce (Leap's Bounce is the daily one)
     }
 
     const tastyFromPrefetch = !!tastyQuoteMap[occSymbol];
@@ -8874,7 +8916,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (!allValues[i] || !allValues[i][map.ticker - 1]) continue;
       clearDecisionCells_(i);
       markStale_(i, 'Not reached this run (time limit)');
-      [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol].forEach(function (c) { if (c) allBackgrounds[i][c - 1] = INTRADAY_STALE_COLOR; });
+      [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol, sheet.getName() !== 'Leap' ? map.bounce : 0].forEach(function (c) { if (c) allBackgrounds[i][c - 1] = INTRADAY_STALE_COLOR; });
       if (map.status) {
         allValues[i][map.status - 1] = clearsStaleRows
           ? 'STALE — not reached this run (time limit), Score/Risk cleared; run again to refresh'
@@ -8885,9 +8927,9 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     }
   }
 
-  // AUP / ADN / R30 / VW / RV colors, notes and the signal log (see the INTRADAY_SIGNAL block at the top of this file).
+  // AUP / ADN / RSI / VW / RV colors, notes and the signal log (see the INTRADAY_SIGNAL block at the top of this file).
   if (map.aroonUp || map.aroonDown || map.rsi1m || map.vwapPct || map.relVol || map.needMove || map.pToday) {
-    const ivCols = [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol].filter(function (c) { return !!c; });
+    const ivCols = [map.aroonUp, map.aroonDown, map.rsi1m, map.vwapPct, map.relVol, sheet.getName() !== 'Leap' ? map.bounce : 0].filter(function (c) { return !!c; });
     const S = INTRADAY_SIGNAL;
     const sess = marketSessionAt_(runTimestamp);
     const sigSheet = INTRADAY_SIGNAL_SHEETS.indexOf(sheet.getName()) !== -1;
@@ -8950,7 +8992,8 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
             } else if (!spreadOk) {
               note += ' No entry: option spread ' + (meta.spreadPct != null && isFinite(meta.spreadPct) ? fmtNum_(meta.spreadPct, 2) + '%' : 'unknown') + ' is wider than ' + S.maxSpreadPct + '% (it eats most of a +' + SAMEDAY_TARGET_PCT + '% target).';
             } else {
-              const ev = evaluateEntryLevel_(iv, S, spyHead);
+              const fzE = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
+              const ev = evaluateEntryLevel_(iv, S, spyHead, fzE ? fzE.movePct : null);
               if (ev.level === 'strong') {
                 color = INTRADAY_ENTRY_COLOR; signal = 'ENTRY';
                 note += ' ENTRY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI dipped to ' + iv.rsiMin5 + ' and is rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '), VWAP ' + iv.vwapPct + '%, volume ' + iv.rvol + 'x, spread ' + fmtNum_(meta.spreadPct, 2) + '%.';
@@ -8958,12 +9001,14 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
                 color = INTRADAY_ENTRY_LIGHT_COLOR;
                 if (ev.dip) {
                   note += ' GET READY: dip and turn confirmed, waiting on: ' + ev.missing.join('; ') + '.';
+                } else if (ev.bounce) {
+                  note += ' GET READY (same-day bounce, no Aroon trend needed): ' + bounceWhy_(ev.bounce) + ', low ' + iv.dayLowAgeMin + ' min old, RSI rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '). READY only, never ENTRY.';
                 } else {
                   note += ' GET READY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI ' + iv.rsi1m + ' is low' +
                     (iv.rsiPrev == null ? ' (no recovery check: Cloud Function not updated).' : (iv.rsi1m <= S.dipRsi ? ', at the dip level, waiting for it to turn up.' : ', waiting for a dip to ' + S.dipRsi + ' and a turn up.'));
                 }
               }
-              if (ev.level) { alertLevel = ev.level; alertWhy = ev.dip ? ('waiting: ' + ev.missing.join('; ')) : 'RSI low, no dip/turn yet'; }
+              if (ev.level) { alertLevel = ev.level; alertWhy = ev.dip ? ('waiting: ' + ev.missing.join('; ')) : (ev.bounce ? bounceWhy_(ev.bounce) : 'RSI low, no dip/turn yet'); }
             }
           } else {
             const price = map.optionPrice ? parseFloat(allValues[i][map.optionPrice - 1]) : NaN;
@@ -9035,7 +9080,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // ===== LEAP INDICATORS: T200 / X50 / R14D / OFFH / IVR / CARRY / SPRD (colors, notes, alerts) =====
   if (leapWanted) {
     const L = LEAP_SIGNAL;
-    const lcols = [map.leapT200, map.leapX50, map.leapR14, map.leapOffHigh, map.leapIvr, map.leapCarry, map.leapSpread].filter(function (c) { return !!c; });
+    const lcols = [map.leapT200, map.leapX50, map.leapR14, map.leapOffHigh, map.leapIvr, map.leapCarry, map.leapSpread, map.bounce].filter(function (c) { return !!c; });
     const lsess = marketSessionAt_(runTimestamp);
     const lGate = GATE_RANKING_BY_SHEET[sheet.getName()];
     const lGateOn = !!(lGate && lGate.enabled && map.riskScore);
@@ -9060,6 +9105,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       put(map.leapIvr, ivr, '0');
       put(map.leapCarry, carry, '0.0');
       put(map.leapSpread, sprd, '0.0');
+      put(map.bounce, d.bounce, '0');
 
       const entryNum = map.entryPrice ? parseFloat(allValues[i][map.entryPrice - 1]) : NaN;
       const held = isPlausible_(entryNum, 0.01, null);
@@ -9072,7 +9118,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       const color = colorByKind[ev.kind] || '#ffffff';
       const head = { strong: 'ENTRY: trend up, near the high, mild pullback, IV and carry reasonable.', light: 'GET READY, ' + ev.why + '.',
         'exit-trend': 'EXIT: ' + ev.why + ' (your trend-based exit).', 'exit-profit': 'TAKE PROFIT? ' + ev.why + '.', none: ev.why ? ('No signal: ' + ev.why + '.') : '' }[ev.kind];
-      const note = 'Daily indicators from ' + (d.source || 'unknown') + ' (price ' + d.price + ', 200-day ' + d.sma200 + ', 50-day ' + d.sma50 + ', 52-week high ' + d.high52 + '). ' + head +
+      const note = 'Daily indicators from ' + (d.source || 'unknown') + ' (price ' + d.price + ', 200-day ' + d.sma200 + ', 50-day ' + d.sma50 + ', 52-week high ' + d.high52 + (d.bounce != null && isFinite(d.bounce) ? (', fall from it ' + d.fallPct + '% to a low ' + d.lowAge + ' trading days ago, ' + d.bounce + '% of that fall recovered') : '') + '). ' + head +
         (held && profitPct != null && ev.kind === 'none' ? (' P&L ' + (profitPct >= 0 ? '+' : '') + (Math.round(profitPct * 10) / 10) + '% vs Entry.') : '');
       lcols.forEach(function (c) { allBackgrounds[i][c - 1] = color; allNotes[i][c - 1] = note; });
 
