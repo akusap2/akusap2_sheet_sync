@@ -1191,9 +1191,40 @@ function scheduledRuntimeTodayMs_(props, now) {
   try { const r = JSON.parse(props.getProperty('SCHED_RUNTIME') || '{}'); return r.d === nyYmd_(now) ? (r.ms || 0) : 0; } catch (e) { return 0; }
 }
 
+// One "schedule is running" Telegram message per trading day, a few minutes after the open (once the first Validate & Update of
+// the day has had its chance). It is the "dead man's switch": if it ever fails to arrive, the background timer is not running.
+// Retried on later ticks if sending fails (3 attempts a day), and not marked as sent while alerts are not set up.
+const HEARTBEAT_MIN_MINUTES_AFTER_OPEN = 16;
+const HEARTBEAT_MAX_ATTEMPTS = 3;
+function maybeSendDailyHeartbeat_(props, now, sess) {
+  try {
+    if (!sess.open || sess.minutesSinceOpen < HEARTBEAT_MIN_MINUTES_AFTER_OPEN) return;
+    const cfg = getAlertConfig_();
+    if (!cfg.ready) return;
+    const today = nyYmd_(now);
+    let hb = null;
+    try { hb = JSON.parse(props.getProperty('SCHED_HEARTBEAT') || 'null'); } catch (e) { hb = null; }
+    if (hb && hb.d === today && (hb.ok || hb.n >= HEARTBEAT_MAX_ATTEMPTS)) return;
+    const lastV = parseInt(props.getProperty('SCHED_LAST_VALIDATE_MS') || '0', 10);
+    const fmt = function (ms) { return Utilities.formatDate(new Date(ms), 'America/New_York', 'h:mm a') + ' ET'; };
+    const slots = LEAP_SCHEDULE.slotsAfterOpenMin.map(function (m) { return Utilities.formatDate(new Date(2026, 0, 5, 9, 30 + m), 'America/New_York', 'h:mm'); }).join(', ');
+    const body = 'Your Quick schedule is running (' + fmt(now.getTime()) + ').\n' +
+      'It checks every 5 minutes, runs Validate & Update on Quick about every ' + QUICK_SCHEDULE.validateEveryMin + ' minutes, and on Leap around ' + slots + ' ET.\n' +
+      'Last Validate & Update: ' + (lastV && nyYmd_(new Date(lastV)) === today ? fmt(lastV) : 'not yet today') + '.\n' +
+      'You will get one of these every trading morning. If one is missing, open Quick Schedule Status.';
+    const res = sendPhoneAlert_(cfg, 'Schedule running', body, false);
+    const n = (hb && hb.d === today ? hb.n : 0) + 1;
+    props.setProperty('SCHED_HEARTBEAT', JSON.stringify({ d: today, n: n, ok: !!res.ok, t: now.getTime() }));
+    if (!res.ok) logToSheet_('Morning heartbeat message failed (attempt ' + n + ' of ' + HEARTBEAT_MAX_ATTEMPTS + '): ' + res.detail);
+  } catch (e) {
+    logToSheet_('Morning heartbeat error (run continues): ' + e);
+  }
+}
+
 function quickScheduleTick_() {
   const t0 = Date.now();
   let lock = null;
+  let heartbeatCtx = null;
   try {
     const now = new Date();
     const sess = marketSessionAt_(now);
@@ -1201,6 +1232,7 @@ function quickScheduleTick_() {
     lock = LockService.getScriptLock();
     if (!lock.tryLock(1000)) return;                          // the previous tick is still running
     const props = PropertiesService.getScriptProperties();
+    heartbeatCtx = { props: props, now: now, sess: sess };
     props.setProperty('SCHED_TICK_LAST', String(now.getTime()));   // heartbeat: Schedule Status uses it to say whether the trigger is alive
     const Q = QUICK_SCHEDULE;
     const closeMin = US_MARKET_EARLY_CLOSES[nyYmd_(now)] ? 210 : 390;
@@ -1255,6 +1287,7 @@ function quickScheduleTick_() {
   } catch (e) {
     logToSheet_('Quick schedule tick failed: ' + e);
   } finally {
+    if (heartbeatCtx) maybeSendDailyHeartbeat_(heartbeatCtx.props, heartbeatCtx.now, heartbeatCtx.sess);   // after this tick's work, whichever way it ended
     try {
       const sess2 = marketSessionAt_(new Date(t0));
       if (sess2.open) addScheduledRuntime_(PropertiesService.getScriptProperties(), Date.now() - t0, new Date(t0));
@@ -1333,6 +1366,14 @@ function quickScheduleStatus_() {
     'Last scheduled Validate & Update: ' + (lastV ? Utilities.formatDate(new Date(lastV), 'America/New_York', 'EEE h:mm a') + ' ET' : 'never'),
     'Last chain scan day: ' + (props.getProperty('SCHED_LAST_SCAN_DAY') || 'never'),
     'Leap runs today: ' + (function () { try { const st = JSON.parse(props.getProperty('SCHED_LEAP') || '{}'); return (st.d === nyYmd_(now) ? st.n : 0) + ' of ' + LEAP_SCHEDULE.slotsAfterOpenMin.length; } catch (e) { return '0'; } })(),
+    (function () {
+      let hb = null;
+      try { hb = JSON.parse(props.getProperty('SCHED_HEARTBEAT') || 'null'); } catch (e) { hb = null; }
+      const today = nyYmd_(now);
+      if (!cfg.ready) return 'Morning "schedule running" message: needs phone alerts set up';
+      if (hb && hb.d === today) return 'Morning "schedule running" message: ' + (hb.ok ? 'sent ' + Utilities.formatDate(new Date(hb.t), 'America/New_York', 'h:mm a') + ' ET' : 'FAILED today (' + hb.n + ' attempt(s))');
+      return 'Morning "schedule running" message: not sent yet today (comes a few minutes after the open)';
+    })(),
     'Trigger runtime used today: ' + Math.round(scheduledRuntimeTodayMs_(props, now) / 60000) + ' of about 90 min (guard stops heavy runs at ' + QUICK_SCHEDULE.dailyRuntimeCapMin + ')',
     'Phone alerts: ' + (cfg.ready ? 'ON via ' + cfg.provider : (cfg.enabled ? 'on, but provider not fully set up' : 'OFF')),
     (function () {
