@@ -302,7 +302,10 @@ const RESEARCH_UNIVERSE = [
   // against public sources: FN, ASTS, CRDO and IONQ are above the $10B large-cap line
   // (IONQ only modestly); MP has hovered right around it (roughly $7-11B depending on
   // the date), so it is classed as mid-cap below, which keeps it off the Quick and Leap picks.
-  'FN', 'ASTS', 'IONQ', 'CRDO', 'MP'
+  'FN', 'ASTS', 'IONQ', 'CRDO', 'MP',
+  // Added Oct 2026 to match the AI power / infrastructure / momentum names you trade (VRT, CEG, APP, FN, CRDO). From general
+  // knowledge, not verified for today: the live market-cap check drops any of them that is not actually large-cap.
+  'GEV', 'VST', 'PWR', 'APH', 'GLW', 'HOOD', 'COIN', 'AXON', 'STX', 'WDC'
 ];
 
 /* ============================================================================
@@ -318,13 +321,20 @@ const RESEARCH_UNIVERSE = [
  * a classification looks wrong.
  * ========================================================================== */
 
+// Only a FALLBACK now. Large/mega-cap status is decided by a live market-cap check (cached 30 days, see
+// prefetchMarketCapsViaCloudFunction_ and resolveIsLargeOrMegaCap_); this hand list is used only for a ticker whose live cap
+// could not be fetched. It had misfiled VRT (a ~$100B+ company) as mid-cap, which kept it out of every Quick/Leap pick.
 const RESEARCH_KNOWN_MID_OR_SMALLER_CAP = [
   'SNOW', 'NET', 'DDOG', 'MDB', 'ZS', 'OKTA', 'TEAM', 'ON', 'SWKS', 'QRVO',
   'MCHP', 'TER', 'ENTG', 'LSCC', 'PINS', 'SNAP', 'ROKU', 'MTCH', 'BMBL',
   'LYFT', 'RBLX', 'DKNG', 'PENN', 'WYNN', 'CCL', 'NCLH', 'AAL', 'LUV',
   'SYF', 'SOFI', 'BIIB', 'MRNA', 'DXCM', 'CNC', 'DVN', 'ENPH', 'FSLR',
-  'RUN', 'VRT', 'CELH', 'SMCI', 'U', 'PATH', 'IOT', 'MP'
+  'RUN', 'CELH', 'SMCI', 'U', 'PATH', 'IOT', 'MP'
 ];
+
+// Quick and Leap are LARGE and MEGA cap only. A mid-cap gets in ONLY if it is listed here (your exceptions). Empty = no exceptions.
+// Example: const RESEARCH_MIDCAP_EXCEPTIONS = ['MP'];
+const RESEARCH_MIDCAP_EXCEPTIONS = [];
 
 // Standard-ish large-cap floor. Used only as a live fallback for tickers
 // NOT in RESEARCH_UNIVERSE (i.e. pulled dynamically from your actual
@@ -365,13 +375,53 @@ function fetchYahooMarketCap_(ticker) {
 // above (zero cost); anything else (pulled from your own tabs) gets a
 // real, cached market-cap lookup rather than a guess.
 function resolveIsLargeOrMegaCap_(ticker, slowCache, pendingWrites) {
-  if (RESEARCH_KNOWN_MID_OR_SMALLER_CAP.indexOf(ticker) !== -1) return false;
-  if (RESEARCH_UNIVERSE.indexOf(ticker) !== -1) return true;
+  if (RESEARCH_MIDCAP_EXCEPTIONS.indexOf(ticker) !== -1) return true;
 
-  const capResult = getSlowCached_(slowCache, pendingWrites, 'MARKETCAP', ticker, 30, function () {
-    return fetchYahooMarketCap_(ticker);
-  });
-  return capResult.value != null && capResult.value >= RESEARCH_LARGE_CAP_MIN_MARKET_CAP;
+  // Live market cap first. Known-universe names only READ the cache that prefetchMarketCapsViaCloudFunction_ fills in one batch
+  // call (no per-ticker network call, so a failed batch can never turn into ~220 slow Yahoo calls). Names outside the universe
+  // (pulled from your tabs) still get the cached per-ticker lookup, as before.
+  const cached = slowCache[slowKey_('MARKETCAP', ticker)];
+  let cap = (cached && cached.value != null) ? cached.value : null;
+  if (cap == null && RESEARCH_UNIVERSE.indexOf(ticker) === -1) {
+    cap = getSlowCached_(slowCache, pendingWrites, 'MARKETCAP', ticker, 30, function () { return fetchYahooMarketCap_(ticker); }).value;
+  }
+  if (cap != null) return cap >= RESEARCH_LARGE_CAP_MIN_MARKET_CAP;
+
+  // No live cap available (lookups failed): fall back to the hand classification, and never guess a stranger is large.
+  if (RESEARCH_KNOWN_MID_OR_SMALLER_CAP.indexOf(ticker) !== -1) return false;
+  return RESEARCH_UNIVERSE.indexOf(ticker) !== -1;
+}
+
+// One batch call to the Cloud Function for the market cap of every ticker whose cached cap is older than 30 days (usually none).
+// Writes into the same MARKETCAP slow-cache entries resolveIsLargeOrMegaCap_ reads, so the tier check is then a cache hit.
+// Never throws: on any failure the per-ticker Yahoo lookup / hand classification above still decide.
+function prefetchMarketCapsViaCloudFunction_(tickers, slowCache, pendingWrites) {
+  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
+  if (!url || !secret) return;
+  const stale = tickers.filter(function (t) { return RESEARCH_MIDCAP_EXCEPTIONS.indexOf(t) === -1 && slowEntryAgeDays_(slowCache[slowKey_('MARKETCAP', t)]) >= 30; });
+  if (!stale.length) return;
+  const startTime = Date.now();
+  let got = 0;
+  for (let i = 0; i < stale.length; i += 60) {
+    if (Date.now() - startTime > 90 * 1000) break;   // never let the cap check eat the run's time budget
+    const chunk = stale.slice(i, i + 60);
+    try {
+      const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ apiKey: secret, stockRange: { tickers: chunk, needCap: true } }), muteHttpExceptions: true });
+      if (resp.getResponseCode() !== 200) continue;
+      const results = (JSON.parse(resp.getContentText()).stockRangeResults) || {};
+      chunk.forEach(function (t) {
+        const capB = results[t] && results[t].cap;
+        if (capB != null && isFinite(capB) && capB > 0) {
+          const key = slowKey_('MARKETCAP', t);
+          const record = { date: todayKey_(), value: capB * 1e9 };   // the Cloud Function returns billions; the cache holds dollars
+          pendingWrites[key] = JSON.stringify(record);
+          slowCache[key] = record;
+          got++;
+        }
+      });
+    } catch (e) { /* fall back silently */ }
+  }
+  logToSheet_('Research market-cap check: ' + stale.length + ' ticker(s) requested, ' + got + ' got a live cap, in ' + (Date.now() - startTime) + 'ms (the rest use the hand classification).');
 }
 
 // Soft price preference — full credit at/under the threshold, gradually
@@ -891,15 +941,16 @@ function runDailyResearch(timeBudgetMsOverride, dryRun) {
   ['Quick', 'Leap'].forEach(function (tabName) {
     collectCurrentTabTickers_(tabName).forEach(function (t) { if (t) universeSet[t] = true; });
   });
-  // Both remaining tabs (Quick, Leap) are large/mega-cap only, so names hand-classified as mid/small-cap can never be picked;
-  // skipping them saves their bar/analyst fetches on every first run of the day.
-  const candidateTickers = Object.keys(universeSet).filter(function (t) { return RESEARCH_KNOWN_MID_OR_SMALLER_CAP.indexOf(t) === -1; });
-
   const finnhubApiKey = getFinnhubApiKey_();
   const fmpApiKey = getFmpApiKey_();
   const alphaVantageApiKey = getAlphaVantageApiKey_();
   const slowCache = loadSlowCache_();
   const pendingWrites = {};
+  // Large/mega-cap only, decided by live market cap (cached 30 days), so a name that grew past $10B is never locked out
+  // and one that shrank below it is dropped before any of its bars are fetched.
+  const universeAll = Object.keys(universeSet);
+  prefetchMarketCapsViaCloudFunction_(universeAll, slowCache, pendingWrites);
+  const candidateTickers = universeAll.filter(function (t) { return resolveIsLargeOrMegaCap_(t, slowCache, pendingWrites); });
 
   // Cloud Function batch prefetch: fetches daily bars for every ticker
   // that actually needs a fresh one (SPY included) in ONE request,

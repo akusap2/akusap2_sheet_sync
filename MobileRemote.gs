@@ -23,10 +23,11 @@
  *
  * SCOPE: only functions already built to run with no interactive UI (they
  * use tryGetUi_() internally, same as the existing scheduled-run
- * dispatcher) are wired up here — validateAndUpdate, scanOptionChainForBestOi,
- * runHedgeAnalysis, runDeepDiveScan. Place Trades is deliberately NOT
- * exposed here — it executes real trades, and a home-screen icon is too
- * easy to tap by accident.
+ * dispatcher) are wired up here — Validate & Update (Quick, Leap), the daily
+ * pipeline (Research + Promote, then it stops), Start/Stop Quick Schedule,
+ * Scan Chain by Delta/OI (Quick, Leap), Deep Dive and Hedge. There is no
+ * Risky tab any more. Place Trades is deliberately NOT exposed here — it
+ * executes real trades, and a home-screen icon is too easy to tap by accident.
  *
  * DEEP DIVE SCAN: runs off whatever ticker and settings are already in the
  * DeepDive sheet's row 2 (no input field on this page) — update those
@@ -45,17 +46,19 @@
 // (shown at the bottom of every page) after redeploying — the single
 // fastest way to confirm the live web app actually matches what's in the
 // editor, rather than guessing based on symptoms.
-const MOBILE_REMOTE_VERSION = 'v9';
+const MOBILE_REMOTE_VERSION = 'v10';
 
 const MOBILE_REMOTE_ACTIONS = {
-  'validate-quick': { label: 'Validate & Update — Quick', run: function () { return runValidateForSheet_('Quick'); } },
-  'validate-leap': { label: 'Validate & Update — Leap', run: function () { return runValidateForSheet_('Leap'); } },
-  'scan-quick': { label: 'Scan Chain by Delta/OI — Quick', run: function () { return runScanForSheet_('Quick'); } },
-  'scan-leap': { label: 'Scan Chain by Delta/OI — Leap', run: function () { return runScanForSheet_('Leap'); } },
-  'hedge': { label: 'Run Hedge Analysis', run: function () { return runHedgeForRemote_(); } },
-  'research': { label: 'Run Daily Research', run: function () { return runResearchForRemote_(); } },
-  'pipeline': { label: 'Run Full Daily Pipeline', run: function () { return runDailyPipelineForRemote_(); } },
-  'deepdive': { label: 'Run Deep Dive Scan', run: function () { return runDeepDiveScanSafe_(); } }
+  'validate-quick': { label: 'Validate & Update \u2014 Quick', run: function () { return runValidateForSheet_('Quick'); } },
+  'validate-leap': { label: 'Validate & Update \u2014 Leap', run: function () { return runValidateForSheet_('Leap'); } },
+  'pipeline': { label: 'Run Daily Pipeline (Research + Promote)', run: function () { return runDailyPipelineForRemote_(); } },
+  'research': { label: 'Run Daily Research only', run: function () { return runResearchForRemote_(); } },
+  'schedule-start': { label: 'Start Quick Schedule (alerts + auto-run)', run: function () { return runScheduleActionForRemote_(startQuickSchedule_); } },
+  'schedule-stop': { label: 'Stop Quick Schedule', run: function () { return runScheduleActionForRemote_(stopQuickSchedule_); } },
+  'scan-quick': { label: 'Scan Chain by Delta/OI \u2014 Quick', run: function () { return runScanForSheet_('Quick'); } },
+  'scan-leap': { label: 'Scan Chain by Delta/OI \u2014 Leap', run: function () { return runScanForSheet_('Leap'); } },
+  'deepdive': { label: 'Run Deep Dive Scan', run: function () { return runDeepDiveScanSafe_(); } },
+  'hedge': { label: 'Run Hedge Analysis', run: function () { return runHedgeForRemote_(); } }
 };
 
 // Reads back whatever the Log tab gained during this call — validateAndUpdate/
@@ -115,9 +118,17 @@ function runResearchForRemote_() {
 // or implying a finished result.
 function runDailyPipelineForRemote_() {
   runDailyPipeline();
-  return 'Daily Pipeline started \u2014 it runs in stages over several minutes (sometimes longer) ' +
-    'and keeps going in the background even after this page shows complete. Check the ScriptLog ' +
-    'tab for the final summary once it actually finishes.';
+  return 'Daily Pipeline started \u2014 Research, then Promote, then it stops (Best Open Interest is run manually). ' +
+    'It runs in stages over several minutes and keeps going in the background even after this page shows complete. ' +
+    'Starting it cleared the old ScriptLog rows; check the ScriptLog tab for the final summary once it finishes.';
+}
+
+// Start/Stop Quick Schedule use tryGetUi_() and write their confirmation to the ScriptLog when no Sheets UI is attached
+// (always the case here), so the generic log read-back is exactly the message the sheet menu would have shown as a pop-up.
+function runScheduleActionForRemote_(fn) {
+  const startTimeMs = new Date().getTime();
+  fn();
+  return getLatestLogText_(startTimeMs);
 }
 
 function runDeepDiveScanSafe_() {
@@ -254,11 +265,10 @@ function escapeHtml_(text) {
 function renderHomePage_(baseUrl) {
   const groups = [
     { title: 'Validate & Update', keys: ['validate-quick', 'validate-leap'] },
-    { title: 'Scan Chain by Delta / OI', keys: ['scan-quick', 'scan-leap'] },
-    { title: 'Hedge', keys: ['hedge'] },
-    { title: 'Research', keys: ['research'] },
-    { title: 'Full Pipeline', keys: ['pipeline'] },
-    { title: 'DeepDive', keys: ['deepdive'] }
+    { title: 'Daily Pipeline', keys: ['pipeline', 'research'] },
+    { title: 'Quick Schedule', keys: ['schedule-start', 'schedule-stop'] },
+    { title: 'Scans', keys: ['scan-quick', 'scan-leap', 'deepdive'] },
+    { title: 'Hedge', keys: ['hedge'] }
   ];
 
   const sections = groups.map(function (g) {
@@ -281,7 +291,7 @@ function renderHomePage_(baseUrl) {
     '<h1>Options Validator Remote <span class="version-badge">' + MOBILE_REMOTE_VERSION + '</span></h1>' +
     statusBanner +
     sections +
-    '<p class="hint">Tapping a button starts the run in the background and confirms immediately \u2014 refresh or reopen this page any time to check on it. Deep Dive runs off whatever ticker/settings are already in the DeepDive sheet.</p>' +
+    '<p class="hint">Tapping a button starts the run in the background and confirms immediately \u2014 refresh or reopen this page any time to check on it. Deep Dive runs off whatever ticker/settings are already in the DeepDive sheet. Place Trades is not available here.</p>' +
     '</body></html>';
 }
 
