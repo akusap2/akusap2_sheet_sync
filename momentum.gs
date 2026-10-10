@@ -132,7 +132,9 @@ const HEADER_MAP = {
   leapSpread: ['SPRD'],        // option bid/ask spread, % of option price
   // "Bounce" works on both tabs. Leap: % of the fall from the 52-week high (to the lowest low since) already recovered.
   // Quick: the same idea for TODAY's session (fall from the session high to the low after it).
-  bounce: ['Bounce']
+  bounce: ['Bounce'],
+  // Quick only: the one-word call for each row (ENTER / READY / WAIT / HOLD / EXIT / CUT / REVIEW). Add a column headed "Action".
+  action: ['Action']
 };
 
 // Validation Status is now fully optional — the script uses it if the
@@ -6495,6 +6497,7 @@ function validateAndUpdateDryRun() {
  * per-row News Risk block's own `newsRiskMap[ticker] || getNewsRisk(...)`
  * falls back to fetching individually exactly as before.
  * ========================================================================== */
+const NEWS_RISK_CACHE_MIN = 30;   // minutes a scored ticker is reused between runs; 0 = off
 function prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow) {
   const cloudFunctionUrl = getCloudFunctionUrl_();
   const sharedSecret = getCloudFunctionSharedSecret_();
@@ -6523,13 +6526,36 @@ function prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow) {
   }
   if (!tickers.length) return {};
 
+  // Speed: News Risk was the slowest step of a run (about 34 s for 32 tickers, Finnhub pacing). News changes slowly, so a score
+  // scored in the last NEWS_RISK_CACHE_MIN minutes is reused and only the other tickers are requested. 0 = always fetch (old behaviour).
+  const cached = {};
+  let cacheSvc = null;
+  if (NEWS_RISK_CACHE_MIN > 0) {
+    try {
+      cacheSvc = CacheService.getScriptCache();
+      const got = cacheSvc.getAll(tickers.map(function (t) { return 'newsrisk:' + t; }));
+      tickers.forEach(function (t) {
+        const raw = got['newsrisk:' + t];
+        if (raw) { try { cached[t] = JSON.parse(raw); } catch (eP) { /* refetch this one */ } }
+      });
+    } catch (eC) { cacheSvc = null; }
+  }
+  const allTickers = tickers;
+  const needTickers = allTickers.filter(function (t) { return !(t in cached); });
+  if (!needTickers.length) {
+    logToSheet_('Cloud Function News Risk prefetch: all ' + allTickers.length + ' ticker(s) reused from the last ' + NEWS_RISK_CACHE_MIN + ' min, no request made.');
+    return cached;
+  }
+  tickers.length = 0;
+  needTickers.forEach(function (t) { tickers.push(t); });
+
   const startTime = Date.now();
   let resp;
   try {
     resp = UrlFetchApp.fetch(cloudFunctionUrl, {
       method: 'post',
       contentType: 'application/json',
-      payload: JSON.stringify({ apiKey: sharedSecret, newsRisk: { tickers: tickers, gapPctByTicker: gapPctByTicker } }),
+      payload: JSON.stringify({ apiKey: sharedSecret, newsRisk: { tickers: needTickers, gapPctByTicker: gapPctByTicker } }),
       muteHttpExceptions: true
     });
   } catch (e) {
@@ -6564,6 +6590,14 @@ function prefetchNewsRiskViaCloudFunction_(sheet, map, lastRow) {
     logToSheet_('Cloud Function News Risk prefetch \u2014 sample failure reason: ' + diag.newsRisk);
   }
 
+  if (cacheSvc) {
+    try {
+      const put = {};
+      Object.keys(results).forEach(function (t) { put['newsrisk:' + t] = JSON.stringify(results[t]); });
+      if (Object.keys(put).length) cacheSvc.putAll(put, NEWS_RISK_CACHE_MIN * 60);
+    } catch (eW) { /* cache is optional */ }
+  }
+  Object.keys(cached).forEach(function (t) { if (!(t in results)) results[t] = cached[t]; });
   return results;
 }
 
@@ -6655,6 +6689,86 @@ function evaluateQuickExit_(iv, profitPct, S) {
   if (!iv || iv.rsi1m == null || profitPct == null || !isFinite(profitPct)) return { exit: false, fading: false };
   if (profitPct >= S.exitMinProfitPct && iv.rsi1m >= S.exitRsiMin) return { exit: true, fading: iv.aroonUp != null && iv.aroonUp < S.exitStrongAupBelow };
   return { exit: false, fading: false };
+}
+
+/* ============================================================================
+ * ACTION: one word per Quick row, so the decision is a glance, not six columns to combine.
+ * ----------------------------------------------------------------------------
+ *   Rows with no Entry (candidates):  ENTER (strong green) | READY (light green) | WAIT | CLOSED | STALE
+ *   Rows with an Entry (held):        EXIT | CUT | REVIEW | HOLD | SET DATE
+ *
+ * Held rows, first match wins (P = option gain vs Entry after the selling spread, D = trading days held):
+ *   EXIT    P >= the Quick target (+3%)                                   your playbook target
+ *           P >= +1.5% and RSI >= 65                                      same as the existing red exit
+ *           P >= +1.5% and D >= edgeDays                                  your quick-win window is over, take any gain
+ *   REVIEW  P <= -lossConcernPercent (15%)                                no longer a small loss: cut or hedge, your call
+ *   CUT     D >= cutDays and still under +1.5%                            your 7-10 day time stop (5 trading days is about 7 calendar days)
+ *   SET DATE  no Entry Date in the row                                    the age rules need it
+ *   HOLD    otherwise
+ *
+ * Why the day counts: in the 53 closed Quick calls to Oct 7, trades held 0-1 trading days made $10.5K (35 of 37 won), trades held 5-9
+ * trading days made $71 in total (2 of 4 won) and carried the two largest closed losses by percent. Starting thresholds, not backtested.
+ * Needs an "Entry Date" column and an "Action" column on Quick. Score, Risk, colors and alerts are untouched.
+ * ========================================================================== */
+const QUICK_ACTION = {
+  edgeDays: 3,            // trading days held: from here any gain of at least INTRADAY_SIGNAL.exitMinProfitPct is a sell
+  cutDays: 5,             // trading days held: time stop for anything still under that gain
+  enabled: true,          // set false to switch the whole Action column off (A/B test if a run gets slow)
+  stampEntryDate: true    // fill a blank Entry Date with today the first time a held row is seen, once the column is already in use
+};
+let QUICK_ACTION_MS = null;   // set to 0 at the start of a run on Quick, logged once, then back to null
+const QUICK_ACTION_COLORS = {
+  ENTER: '#93c47d', READY: '#d9ead3', WAIT: '#ffffff', HOLD: '#f3f3f3', EXIT: '#ea9999', CUT: '#e06666',
+  REVIEW: '#ffe599', 'SET DATE': '#cfe2f3', CLOSED: '#efefef', STALE: '#ff9900'
+};
+
+// Trading days from the entry date (exclusive) up to today (inclusive), skipping weekends and NYSE holidays. Same day = 0.
+function tradingDaysHeld_(entryDate, now) {
+  if (!(entryDate instanceof Date) || isNaN(entryDate.getTime())) return null;
+  const tz = 'America/New_York';
+  // Two formatDate calls in total; the day loop is plain arithmetic on UTC calendar days (formatDate is slow in Apps Script).
+  const a = Utilities.formatDate(entryDate, tz, 'yyyy-MM-dd').split('-');
+  const b = Utilities.formatDate(now, tz, 'yyyy-MM-dd').split('-');
+  const start = Date.UTC(parseInt(a[0], 10), parseInt(a[1], 10) - 1, parseInt(a[2], 10));
+  const end = Date.UTC(parseInt(b[0], 10), parseInt(b[1], 10) - 1, parseInt(b[2], 10));
+  if (!isFinite(start) || !isFinite(end) || end < start) return 0;
+  const days = Math.round((end - start) / 86400000);
+  if (days > 400) return days;   // absurd date: skip the loop
+  let n = 0;
+  for (let k = 1; k <= days; k++) {
+    const d = new Date(start + k * 86400000);
+    const dow = d.getUTCDay();
+    if (dow === 0 || dow === 6) continue;
+    const key = d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
+    if (!US_MARKET_HOLIDAYS[key]) n++;
+  }
+  return n;
+}
+
+// x = { held, profitPct, days, rsi, level ('strong'|'light'|null), block (text or ''), marketOpen, stale } -> { action, why }
+function quickAction_(x) {
+  const I = INTRADAY_SIGNAL, O = TRADE_OBJECTIVE_SHEETS['Quick'], Q = QUICK_ACTION;
+  const num = function (v) { return v != null && isFinite(v); };
+  const r1 = function (v) { return Math.round(v * 10) / 10; };
+  if (!x.held) {
+    if (x.stale) return { action: 'STALE', why: 'intraday data not refreshed, no call' };
+    if (!x.marketOpen) return { action: 'CLOSED', why: 'market closed' };
+    if (x.block) return { action: 'WAIT', why: x.block };
+    if (x.level === 'strong') return { action: 'ENTER', why: 'trend up, RSI dipped and is turning up, volume and VWAP fine (details in the RSI cell note)' };
+    if (x.level === 'light') return { action: 'READY', why: 'setup forming, see the RSI cell note for what is still missing' };
+    return { action: 'WAIT', why: 'no setup yet' };
+  }
+  if (!num(x.profitPct)) return { action: 'HOLD', why: 'no option price to judge this run' };
+  const p = x.profitPct, d = x.days;
+  const pTxt = (p >= 0 ? '+' : '') + r1(p) + '%';
+  const dTxt = num(d) ? ('day ' + d) : 'no Entry Date';
+  if (p >= O.minProfitPercent) return { action: 'EXIT', why: 'up ' + pTxt + ': your +' + O.minProfitPercent + '% target is hit (' + dTxt + ')' };
+  if (p >= I.exitMinProfitPct && num(x.rsi) && x.rsi >= I.exitRsiMin) return { action: 'EXIT', why: 'up ' + pTxt + ' and RSI ' + x.rsi + ' is high (' + dTxt + ')' };
+  if (p >= I.exitMinProfitPct && num(d) && d >= Q.edgeDays) return { action: 'EXIT', why: 'up ' + pTxt + ' on ' + dTxt + ': the quick-win window (first ' + Q.edgeDays + ' trading days) is over, take the gain' };
+  if (p <= -O.lossConcernPercent) return { action: 'REVIEW', why: 'down ' + r1(-p) + '% (' + dTxt + '): not a small loss any more, decide cut or hedge (see Put)' };
+  if (num(d) && d >= Q.cutDays) return { action: 'CUT', why: dTxt + ' and only ' + pTxt + ': past the ' + Q.cutDays + '-trading-day time stop, cut it for a small loss' };
+  if (!num(d)) return { action: 'SET DATE', why: 'type the Entry Date so the age rules work; P&L now ' + pTxt };
+  return { action: 'HOLD', why: dTxt + ', ' + pTxt + '. Sell at +' + O.minProfitPercent + '%, or at +' + I.exitMinProfitPct + '% once RSI >= ' + I.exitRsiMin + ' or from day ' + Q.edgeDays + '. Time stop day ' + Q.cutDays + '.' };
 }
 
 function alertLineExit_(ticker, strike, expiryText, iv, profitPct, fading, optionPrice) {
@@ -9099,6 +9213,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     const spyText = spy
       ? ('SPY ' + (spy.vwapPct != null ? ((spy.vwapPct >= 0 ? '+' : '') + spy.vwapPct + '% vs VWAP') : 'VWAP n/a') + ', AUP ' + spy.aroonUp + ' / ADN ' + spy.aroonDown + (spyHead ? ' (headwind)' : ' (ok)'))
       : 'SPY data missing (not blocking)';
+    // Action column: auto-fill a blank Entry Date only once the column is already in use (some held row has a date), so the first run
+    // after adding the column never stamps today onto positions opened weeks ago.
+    let stampDatesOn = false;
+    QUICK_ACTION_MS = 0;   // total time spent inside the Action block this run (logged once after the loop)
+    if (map.action && map.entryDate && map.entryPrice && sigSheet && QUICK_ACTION.stampEntryDate && !dryRun) {
+      try {
+        stampDatesOn = allValues.some(function (r) {
+          if (!isPlausible_(parseFloat(r[map.entryPrice - 1]), 0.01, null)) return false;
+          const dv = parseEntryDateCell_(r[map.entryDate - 1]);
+          return !!(dv && !isNaN(dv.getTime()));
+        });
+      } catch (e) { stampDatesOn = false; }
+    }
     const logRows = [];
     const outSnap = {};   // contract key -> { opt, spread } for grading earlier signals
     const alertItems = [];   // new light/strong green rows for the phone alert
@@ -9111,6 +9238,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       const iv = ivRowState[key];
       const meta = ivRowMeta[key] || {};
       let color = '#ffffff', note = '', signal = null, ivStaleFlag = false, alertLevel = null, alertWhy = '', alertExit = null;
+      let actLevel = null, actBlock = '';   // for the Action column: the entry level reached, or why entry is blocked right now
       if (!iv) {
         color = INTRADAY_STALE_COLOR;
         note = 'Not refreshed this run (no data came back from TastyTrade or Yahoo).';
@@ -9143,14 +9271,18 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
               });
             }
             if (!timeOk) {
+              actBlock = 'inside the first ' + S.noEntryFirstMin + ' / last ' + S.noEntryLastMin + ' minutes of the session';
               note += ' No entry signals in the first ' + S.noEntryFirstMin + ' / last ' + S.noEntryLastMin + ' minutes of the session.';
             } else if (!gateOk) {
+              actBlock = 'Risk is above the gate';
               note += ' No entry: Risk is above the gate.';
             } else if (!spreadOk) {
+              actBlock = 'option spread is wider than ' + S.maxSpreadPct + '%';
               note += ' No entry: option spread ' + (meta.spreadPct != null && isFinite(meta.spreadPct) ? fmtNum_(meta.spreadPct, 2) + '%' : 'unknown') + ' is wider than ' + S.maxSpreadPct + '% (it eats most of a +' + SAMEDAY_TARGET_PCT + '% target).';
             } else {
               const fzE = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
               const ev = evaluateEntryLevel_(iv, S, spyHead, fzE ? fzE.movePct : null);
+              actLevel = ev.level;
               if (ev.level === 'strong') {
                 color = INTRADAY_ENTRY_COLOR; signal = 'ENTRY';
                 note += ' ENTRY: trend up (AUP ' + iv.aroonUp + ', ADN ' + iv.aroonDown + '), RSI dipped to ' + iv.rsiMin5 + ' and is rising (' + iv.rsiPrev + ' -> ' + iv.rsi1m + '), VWAP ' + iv.vwapPct + '%, volume ' + iv.rvol + 'x, spread ' + fmtNum_(meta.spreadPct, 2) + '%.';
@@ -9198,6 +9330,42 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
       if (sigSheet && iv && !ivStaleFlag && sess.open) fz = sameDayFeasibility_(meta, iv.sigmaPerMin, closeMin - sess.minutesSinceOpen, SAMEDAY_TARGET_PCT);
       if (map.needMove) { allValues[i][map.needMove - 1] = fz ? fz.movePct : ''; allNumberFormats[i][map.needMove - 1] = '0.00'; allNotes[i][map.needMove - 1] = fz ? fz.note : ''; }
       if (map.pToday) { allValues[i][map.pToday - 1] = fz ? fz.prob : ''; allNumberFormats[i][map.pToday - 1] = '0'; allNotes[i][map.pToday - 1] = fz ? fz.note : ''; }
+      // ACTION: one word for this row (see QUICK_ACTION). Reads what is worked out above and changes nothing else; any problem leaves it blank.
+      if (QUICK_ACTION.enabled && map.action && sigSheet) {
+        const actT0 = Date.now();
+        try {
+          const entryA = map.entryPrice ? parseFloat(allValues[i][map.entryPrice - 1]) : NaN;
+          const heldA = isPlausible_(entryA, 0.01, null);
+          let profitA = null, daysA = null;
+          if (heldA) {
+            const pxA = map.optionPrice ? parseFloat(allValues[i][map.optionPrice - 1]) : NaN;
+            const hsA = (meta.spreadPct != null && isFinite(meta.spreadPct)) ? meta.spreadPct / 200 : 0;
+            if (isFinite(pxA)) profitA = (pxA * (1 - hsA) / entryA - 1) * 100;
+            if (map.entryDate) {
+              let edA = parseEntryDateCell_(allValues[i][map.entryDate - 1]);
+              if (!(edA && !isNaN(edA.getTime())) && stampDatesOn) {
+                const ymdA = Utilities.formatDate(runTimestamp, 'America/New_York', 'yyyy-MM-dd').split('-');
+                edA = new Date(parseInt(ymdA[0], 10), parseInt(ymdA[1], 10) - 1, parseInt(ymdA[2], 10), 12, 0, 0);
+                allValues[i][map.entryDate - 1] = edA;
+                allNumberFormats[i][map.entryDate - 1] = 'm/d/yyyy';
+                allNotes[i][map.entryDate - 1] = 'Filled in by the script the first time this position was seen. Correct it if the real entry was earlier.';
+              }
+              if (edA && !isNaN(edA.getTime())) daysA = tradingDaysHeld_(edA, runTimestamp);
+            }
+          }
+          const staleA = !iv || ivStaleFlag;
+          const act = quickAction_({ held: heldA, profitPct: profitA, days: daysA, rsi: staleA ? null : iv.rsi1m, level: actLevel, block: actBlock,
+            marketOpen: sess.open, stale: staleA });
+          // No position on this row: only a real entry call (ENTER / READY) is shown; WAIT, CLOSED and STALE stay blank.
+          const blankIt = !heldA && act.action !== 'ENTER' && act.action !== 'READY';
+          allValues[i][map.action - 1] = blankIt ? '' : act.action;
+          allBackgrounds[i][map.action - 1] = blankIt ? '#ffffff' : (QUICK_ACTION_COLORS[act.action] || '#ffffff');
+          allNotes[i][map.action - 1] = blankIt ? '' : act.action + ': ' + act.why;
+        } catch (eAct) {
+          allValues[i][map.action - 1] = '';
+        }
+        QUICK_ACTION_MS += Date.now() - actT0;
+      }
       if (alertLevel && map.strike && map.expiry) {
         const exA = allValues[i][map.expiry - 1];
         alertItems.push({
@@ -9306,6 +9474,7 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
 
   if (map.timestamp) sheet.getRange(HEADER_ROW, map.timestamp).setNote('LastRun: white = row refreshed fine; orange = some data stale (hover the cell for why).');
 
+  if (QUICK_ACTION_MS != null && !dryRun) { logToSheet_('Action column: ' + QUICK_ACTION_MS + ' ms total this run (' + (QUICK_ACTION.enabled ? 'on' : 'OFF') + ').'); QUICK_ACTION_MS = null; }
   // Flush every buffered write back to the sheet now, in one bulk call
   // per property, BEFORE the sort/highlight logic below runs — that
   // logic reads the sheet's current state directly, so it has to see
