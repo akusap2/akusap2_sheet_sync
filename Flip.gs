@@ -203,6 +203,7 @@ function flipAddMenu_() {
   ui.createMenu('🔁 Flip')
     .addItem('Run Flip Scan', 'runFlipScan')
     .addItem('Promote Research Picks to Flip', 'runFlipPromote')
+    .addItem('🗂 Update Universe (Universe tab)', 'flipUpdateUniverse')
     .addSeparator()
     .addItem('Build Stats (FlipStats tab)', 'flipBuildStats')
     .addItem('Grade Past Signals', 'flipGradeSignals')
@@ -220,6 +221,72 @@ function flipAddMenu_() {
       .addItem('Promote Dry Run (no writes)', 'runFlipPromoteDryRun'))
     .addToUi();
 }
+
+// Rewrites the Flip block (columns U-AB) of the Universe tab from the lists the promotion really uses (built-in list + Quick + Research
+// + Flip tab + Results history). Sheet reads/writes only: no API calls. Sector / Industry / Cap tier already filled for a ticker are kept.
+function flipUpdateUniverse() {
+  const ui = tryGetUi_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const uni = ss.getSheetByName('Universe') || ss.insertSheet('Universe');
+  const HEAD = ['Flip Ticker', 'Sector', 'Industry', 'Cap tier (hand classification)', 'Theme (position-limit group)', 'On Flip tab now', 'Open position now', 'Sector source'];
+  let startCol = 21;
+  try {
+    const row = uni.getRange(1, 1, 1, Math.max(uni.getLastColumn(), 1)).getValues()[0];
+    for (let i = 0; i < row.length; i++) if (String(row[i]).trim() === HEAD[0]) { startCol = i + 1; break; }
+  } catch (e) { /* default */ }
+  const old = {}, left = {};
+  if (uni.getLastRow() >= 2) {
+    uni.getRange(2, startCol, uni.getLastRow() - 1, HEAD.length).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) old[t] = r; });
+    uni.getRange(2, 1, uni.getLastRow() - 1, 4).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) left[t] = r; });
+  }
+  const overrides = (typeof loadSectorOverrides_ === 'function') ? loadSectorOverrides_() : {};
+  // Flip tab: which tickers are on it, and which have an open position (Qty filled).
+  const onTab = {}, held = {};
+  const flipSheet = ss.getSheetByName(FLIP_SHEET_NAME);
+  if (flipSheet && flipSheet.getLastRow() >= 2) {
+    const map = flipHeaderMap_(flipSheet);
+    const data = flipSheet.getRange(2, 1, flipSheet.getLastRow() - 1, flipSheet.getLastColumn()).getValues();
+    data.forEach(function (r) {
+      const t = String(r[(map['Ticker'] || 1) - 1] || '').trim().toUpperCase();
+      if (!t) return;
+      onTab[t] = true;
+      const q = map['Qty'] ? parseFloat(r[map['Qty'] - 1]) : NaN;
+      if (q > 0) held[t] = true;
+    });
+  }
+  const list = [], seen = {};
+  const add = function (t) { if (t && !seen[t] && t !== 'SPY') { seen[t] = true; list.push(t); } };
+  FLIP_UNIVERSE.forEach(add);
+  flipReadTickerColumn_(FLIP_QUICK_SHEET).forEach(add); flipReadTickerColumn_('Research').forEach(add);
+  Object.keys(onTab).forEach(add); Object.keys(flipResultsByTicker_()).forEach(add);
+  let fresh = 0, unclassified = 0;
+  const rows = list.map(function (t) {
+    const o = old[t], theme = FLIP_THEME_OF[t] || '';
+    if (o && String(o[1] || '').trim() !== '' && String(o[1]).trim() !== '?' && String(o[1]).trim() !== 'unclassified') return [t, o[1], o[2], o[3], theme, onTab[t] ? 'Yes' : '', held[t] ? 'Yes' : '', o[7] || ''];
+    let sec = '', ind = '', cap = '', src = '';
+    const ov = overrides[t], st = (typeof STATIC_SECTOR_MAP !== 'undefined') ? STATIC_SECTOR_MAP[t] : null, lf = left[t];
+    if (ov && ov.sector) { sec = ov.sector; ind = ov.industry || ''; src = 'Sector override'; }
+    else if (st) { sec = st.sector; ind = st.industry; src = 'Project STATIC_SECTOR_MAP'; }
+    else if (lf && String(lf[1] || '').trim() !== '') { sec = lf[1]; ind = lf[2]; cap = lf[3]; src = 'Quick/Leap block'; }
+    else { sec = 'unclassified'; src = 'unclassified'; unclassified++; }
+    fresh++;
+    return [t, sec, ind, cap || 'Large/mega (assumed)', theme, onTab[t] ? 'Yes' : '', held[t] ? 'Yes' : '', src];
+  });
+  if (uni.getMaxColumns() < startCol + HEAD.length - 1) uni.insertColumnsAfter(uni.getMaxColumns(), startCol + HEAD.length - 1 - uni.getMaxColumns());
+  uni.getRange(2, startCol, Math.max(uni.getMaxRows() - 1, 1), HEAD.length).clearContent();
+  uni.getRange(1, startCol, 1, HEAD.length).setValues([HEAD]);
+  if (rows.length) {
+    if (uni.getMaxRows() < rows.length + 1) uni.insertRowsAfter(uni.getMaxRows(), rows.length + 1 - uni.getMaxRows());
+    uni.getRange(2, startCol, rows.length, HEAD.length).setValues(rows);
+  }
+  notify_(ui, 'Flip universe updated',
+    rows.length + ' tickers written to the Universe tab (columns from ' + startCol + ').\n' +
+    'Sources: built-in Flip list, the Quick and Research tabs, the Flip tab, and your Results history.\n' +
+    'New or re-classified: ' + fresh + (unclassified ? ' (' + unclassified + ' unclassified: type the sector in, it is kept next time)' : '') + '.\n\n' +
+    'This lists who Flip looks at. Who is kept on the Flip tab is still decided by Promote Research Picks to Flip.');
+  return { count: rows.length, fresh: fresh };
+}
+
 
 function runFlipScanDryRun() { return runFlipScan(null, true); }
 function runFlipPromoteDryRun() { return flipPromote_({ dryRun: true }); }
@@ -1332,7 +1399,7 @@ function flipDispatchAlerts_(items, now) {
     if (!flipAlertsOn_()) return { sent: 0, note: 'Flip alerts are switched off (menu: Flip > Alerts & Schedule).' };
     const A = FLIP_CONFIG.alerts;
     const cfg = getAlertConfig_();
-    if (!cfg.ready) return { sent: 0, note: 'phone alerts are not set up or are off (menu: Options Validator > Phone Alerts).' };
+    if (!cfg.ready) return { sent: 0, note: 'phone alerts are not set up or are off (menu: Quick and Leap > Phone Alerts).' };
     const props = PropertiesService.getScriptProperties();
     let state = {};
     try { state = JSON.parse(props.getProperty('FLIP_ALERT_STATE') || '{}'); } catch (e) { state = {}; }
@@ -1367,7 +1434,7 @@ function flipDispatchAlerts_(items, now) {
 function sendTestFlipAlert_() {
   const ui = tryGetUi_();
   const cfg = getAlertConfig_();
-  if (!cfg.ready) { notify_(ui, 'Flip alert test', 'Phone alerts are not set up or are off. Use Options Validator > Phone Alerts first (the same setup serves Quick, CSP and Flip).'); return; }
+  if (!cfg.ready) { notify_(ui, 'Flip alert test', 'Phone alerts are not set up or are off. Use Quick and Leap > Phone Alerts first (the same setup serves Quick, CSP and Flip).'); return; }
   const r = sendPhoneAlert_(cfg, 'Flip: test', 'Test alert from the Flip tab. A real one looks like:\nBUY APP Jan 2028 $300C | ask 61.40 (spread 1.1%) | size 1 | target 63.7 stop 55.9 (-9.0%) | stock needs +1.9% | P hit 39% edge 4.1 | AUP 85 ADN 20 RSI 33 | score 72', false);
   notify_(ui, 'Flip alert test', r.ok ? 'Sent. ' + r.detail : 'Failed: ' + r.detail);
 }

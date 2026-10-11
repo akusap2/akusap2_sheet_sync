@@ -274,6 +274,7 @@ function cspAddMenu_() {
     .addItem('Run CSP Scan', 'runCspScan')
     .addItem('Promote Research Picks to CSP', 'runCspPromote')
     .addItem('Show / Hide Detail Columns', 'cspToggleDetailColumns_')
+    .addItem('🗂 Update Universe (Universe tab)', 'cspUpdateUniverse')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('📱 CSP Alerts & Schedule')
       .addItem('Send Test CSP Alert', 'sendTestCspAlert_')
@@ -1248,7 +1249,7 @@ function debugCspOneTicker() {
 
 
 /* ============================================================================
- * TELEGRAM ALERTS (same provider setup as Quick: menu Options Validator >
+ * TELEGRAM ALERTS (same provider setup as Quick: menu Quick and Leap >
  * Phone Alerts). One batched message per run. State is only saved when the
  * message actually went out, so a failed send is retried on the next run.
  * ========================================================================== */
@@ -1295,7 +1296,7 @@ function cspDispatchAlerts_(items, now) {
     if (!items || !items.length) return { sent: 0, note: '' };
     if (!cspAlertsOn_()) return { sent: 0, note: 'CSP alerts are switched off (menu: CSP > CSP Alerts & Schedule).' };
     const cfg = getAlertConfig_();
-    if (!cfg.ready) return { sent: 0, note: 'phone alerts are not set up or are off (menu: Options Validator > Phone Alerts).' };
+    if (!cfg.ready) return { sent: 0, note: 'phone alerts are not set up or are off (menu: Quick and Leap > Phone Alerts).' };
 
     const props = PropertiesService.getScriptProperties();
     let state = {};
@@ -1336,7 +1337,7 @@ function cspDispatchAlerts_(items, now) {
 function sendTestCspAlert_() {
   const ui = tryGetUi_();
   const cfg = getAlertConfig_();
-  if (!cfg.ready) { notify_(ui, 'CSP alert test', 'Phone alerts are not set up or are off. Use Options Validator > Phone Alerts first (same Telegram setup serves Quick and CSP).'); return; }
+  if (!cfg.ready) { notify_(ui, 'CSP alert test', 'Phone alerts are not set up or are off. Use Quick and Leap > Phone Alerts first (same Telegram setup serves Quick and CSP).'); return; }
   const r = sendPhoneAlert_(cfg, 'CSP: test', 'Test alert from the CSP tab. A real one looks like:\nSELL KO Nov 20 $70P @ 0.95 (35d, 14.2% ann, delta 0.22, cushion 0.9 sigma, cash $7000). Buy back <= 0.71 (25%) or 0.48 (50%). Score 71', false);
   notify_(ui, 'CSP alert test', r.ok ? 'Sent. ' + r.detail : 'Failed: ' + r.detail);
 }
@@ -1490,6 +1491,7 @@ function cspQualityStock_(f, w, tech, cfg) {
   score = Math.round(score * 10) / 10;
 
   if (!f) fails.push('no fundamentals from Yahoo');
+  if (f && capB == null) fails.push('market cap unknown: cannot confirm large/mega cap');
   if (f && capB != null && capB < P.minCapB) fails.push('market cap $' + Math.round(capB) + 'B < $' + P.minCapB + 'B');
   if (f && f.pm != null && f.pm <= 0) fails.push('not profitable');
   if (f && f.fcf != null && f.fcf <= 0) fails.push('negative free cash flow');
@@ -1607,6 +1609,116 @@ function cspEvaluateTicker_(t, isEtf, ctx) {
   return q;
 }
 
+/* ============================================================================
+ * UNIVERSE: tickers CSP looks at, and the on-demand "Update Universe" button
+ * ========================================================================== */
+
+// Tickers on the Research, Quick and Leap tabs (column found by the "Ticker" header). The numeric quality screen still decides who is kept.
+const CSP_UNIVERSE_TABS = ['Research', 'Quick', 'Leap'];
+// CSP is large / mega cap only. A ticker from those tabs is listed only if the Universe tab (your hand classification, column D of the
+// Quick/Leap block) says "Large/mega". Anything else (mid/small, unclassified, funds) is skipped. These names are never listed, even if classified large:
+const CSP_NEVER = ['IONQ', 'QBTS', 'RGTI', 'ASTS', 'RKLB', 'MARA', 'IREN', 'HUT', 'CLSK', 'RIOT', 'MSTR', 'COIN', 'HOOD', 'SOFI', 'CBRS', 'TEM', 'SMCI', 'LUNR', 'JOBY'];
+function cspReadTickerColumn_(sheetName) {
+  try {
+    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+    if (!sh || sh.getLastRow() < 2) return [];
+    const top = sh.getRange(1, 1, Math.min(5, sh.getLastRow()), sh.getLastColumn()).getValues();
+    let hr = -1, hc = -1;
+    for (let r = 0; r < top.length && hr < 0; r++) for (let c = 0; c < top[r].length; c++) if (String(top[r][c]).trim().toLowerCase() === 'ticker') { hr = r; hc = c; break; }
+    if (hr < 0) return [];
+    const vals = sh.getRange(hr + 2, hc + 1, sh.getLastRow() - hr - 1, 1).getValues();
+    return vals.map(function (v) { return String(v[0] || '').trim().toUpperCase(); }).filter(function (t) { return /^[A-Z.]{1,6}$/.test(t); });
+  } catch (e) { return []; }
+}
+// ticker -> cap tier text from the Universe tab's Quick/Leap block (A:D)
+function cspCapTiers_() {
+  const out = {};
+  try {
+    const u = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Universe');
+    if (!u || u.getLastRow() < 2) return out;
+    u.getRange(2, 1, u.getLastRow() - 1, 4).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) out[t] = String(r[3] || ''); });
+  } catch (e) { /* none */ }
+  return out;
+}
+// Tickers from the Research / Quick / Leap tabs that pass the large/mega filter. skipped (optional array) receives the ones that do not.
+function cspTabTickers_(skipped) {
+  const tiers = cspCapTiers_();
+  const seen = {}, out = [];
+  CSP_UNIVERSE_TABS.forEach(function (n) {
+    cspReadTickerColumn_(n).forEach(function (t) {
+      if (seen[t]) return;
+      seen[t] = true;
+      if (CSP_NEVER.indexOf(t) === -1 && /^Large\/mega/i.test(tiers[t] || '')) out.push(t);
+      else if (skipped) skipped.push(t);
+    });
+  });
+  return out;
+}
+
+// Rewrites the CSP block (columns M-S) of the Universe tab from the lists the promotion really uses. Sheet reads/writes only: no API calls.
+// Sector / Industry / Cap tier you (or an earlier run) already filled for a ticker are kept; new tickers get the built-in sector table,
+// then a sector override, else "unclassified".
+function cspUpdateUniverse() {
+  const ui = tryGetUi_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const uni = ss.getSheetByName('Universe') || ss.insertSheet('Universe');
+  const HEAD = ['CSP Ticker', 'Sector', 'Industry', 'Cap tier (hand classification)', 'Type', 'On CSP tab now', 'Sector source'];
+  const startCol = cspUniverseStartCol_(uni, HEAD[0]);
+  const old = {};
+  if (uni.getLastRow() >= 2) uni.getRange(2, startCol, uni.getLastRow() - 1, HEAD.length).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) old[t] = r; });
+  const left = {};   // the Quick / Leap block (A:C) as a second source of sector / industry
+  if (uni.getLastRow() >= 2) uni.getRange(2, 1, uni.getLastRow() - 1, 4).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) left[t] = r; });
+  const overrides = (typeof loadSectorOverrides_ === 'function') ? loadSectorOverrides_() : {};
+  const onTab = {};
+  cspReadTickerColumn_(CSP_SHEET_NAME).forEach(function (t) { onTab[t] = true; });
+  const list = [];
+  const seen = {};
+  const add = function (t) { if (t && !seen[t]) { seen[t] = true; list.push(t); } };
+  const skipped = [];
+  CSP_STOCK_UNIVERSE.forEach(add); CSP_ETF_UNIVERSE.forEach(add); cspTabTickers_(skipped).forEach(add); Object.keys(onTab).forEach(add);
+  let fresh = 0, unclassified = 0;
+  const rows = list.map(function (t) {
+    const isEtf = !!CSP_ETF_SET[t];
+    const o = old[t];
+    if (o && String(o[1] || '').trim() !== '' && String(o[1]).trim() !== '?' && String(o[1]).trim() !== 'unclassified') return [t, o[1], o[2], o[3], isEtf ? 'ETF' : 'Stock', onTab[t] ? 'Yes' : '', o[6] || ''];
+    let sec = '', ind = '', cap = '', src = '';
+    const ov = overrides[t], st = (typeof STATIC_SECTOR_MAP !== 'undefined') ? STATIC_SECTOR_MAP[t] : null, lf = left[t];
+    if (ov && ov.sector) { sec = ov.sector; ind = ov.industry || ''; src = 'Sector override'; }
+    else if (st) { sec = st.sector; ind = st.industry; src = 'Project STATIC_SECTOR_MAP'; }
+    else if (lf && String(lf[1] || '').trim() !== '') { sec = lf[1]; ind = lf[2]; cap = lf[3]; src = 'Quick/Leap block'; }
+    else if (isEtf) { sec = 'ETF'; src = 'ETF'; }
+    else { sec = 'unclassified'; src = 'unclassified'; unclassified++; }
+    fresh++;
+    return [t, sec, ind, cap || (isEtf ? 'ETF' : 'Large/mega (assumed)'), isEtf ? 'ETF' : 'Stock', onTab[t] ? 'Yes' : '', src];
+  });
+  if (uni.getMaxColumns() < startCol + HEAD.length - 1) uni.insertColumnsAfter(uni.getMaxColumns(), startCol + HEAD.length - 1 - uni.getMaxColumns());
+  const clearRows = Math.max(uni.getMaxRows() - 1, 1);
+  uni.getRange(2, startCol, clearRows, HEAD.length).clearContent();
+  uni.getRange(1, startCol, 1, HEAD.length).setValues([HEAD]);
+  if (rows.length) {
+    if (uni.getMaxRows() < rows.length + 1) uni.insertRowsAfter(uni.getMaxRows(), rows.length + 1 - uni.getMaxRows());
+    uni.getRange(2, startCol, rows.length, HEAD.length).setValues(rows);
+  }
+  notify_(ui, 'CSP universe updated',
+    rows.length + ' tickers written to the Universe tab (columns from ' + startCol + ').\n' +
+    'Sources: built-in stock + ETF lists, the Research / Quick / Leap tabs, and the CSP tab.\n' +
+    'New or re-classified: ' + fresh + (unclassified ? ' (' + unclassified + ' unclassified: type the sector in, it is kept next time)' : '') + '.\n\n' +
+    (skipped.length ? 'Skipped (not classified Large/mega on the Universe tab, or on the never list): ' + skipped.join(', ') + '\n\n' : '') +
+    'This lists who CSP looks at. Who qualifies is still decided by Promote Research Picks to CSP.');
+  return { count: rows.length, fresh: fresh };
+}
+
+// The CSP block starts where its header already is (so moving the block is safe); first-time default is column M (13).
+function cspUniverseStartCol_(uni, header) {
+  try {
+    const w = Math.max(uni.getLastColumn(), 1);
+    const row = uni.getRange(1, 1, 1, w).getValues()[0];
+    for (let i = 0; i < row.length; i++) if (String(row[i]).trim() === header) return i + 1;
+  } catch (e) { /* default below */ }
+  return 13;
+}
+
+
 function runCspPromote() { return cspPromoteFromResearch_({}); }
 function runCspPromoteDryRun() { return cspPromoteFromResearch_({ dryRun: true }); }
 
@@ -1691,6 +1803,7 @@ function cspPromoteCore_(opts) {
   const universe = {};
   CSP_STOCK_UNIVERSE.forEach(function (t) { universe[t] = { isEtf: false }; });
   CSP_ETF_UNIVERSE.forEach(function (t) { universe[t] = { isEtf: true }; });
+  cspTabTickers_().forEach(function (t) { if (!universe[t]) universe[t] = { isEtf: !!CSP_ETF_SET[t] }; });   // Research / Quick / Leap tabs too
   sheetRows.forEach(function (rw) { if (!universe[rw.ticker]) universe[rw.ticker] = { isEtf: rw.isEtf }; });
 
   const slowCache = cspLoadCache_();
