@@ -690,7 +690,7 @@ function flipChooseContract_(cands, spot, cfg) {
     if (extPct > cfg.maxTimeValuePct) fails.push('time value ' + extPct.toFixed(0) + '% > ' + cfg.maxTimeValuePct + '%');
     if (fails.length) {
       const nScore = fails.length * 1000 + spreadPct;
-      if (!nearest || nScore < nearest.score) nearest = { score: nScore, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM-dd-yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
+      if (!nearest || nScore < nearest.score) nearest = { score: nScore, x: x, mid: mid, spreadPct: spreadPct, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM-dd-yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
       fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); rejects[k] = (rejects[k] || 0) + 1; }); if (!why) why = fails[0]; return; }
     const lev = x.delta * spot / mid;
     let decay = null;
@@ -708,7 +708,7 @@ function flipChooseContract_(cands, spot, cfg) {
   });
   if (best) return { ok: true, c: best };
   const top = Object.keys(rejects).sort(function (a, b) { return rejects[b] - rejects[a]; }).slice(0, 2).join('; ');
-  return { ok: false, why: nearest ? 'none of ' + cands.length + ' passed; closest ' + nearest.text : (top || 'no candidates') };
+  return { ok: false, near: nearest ? { strike: nearest.x.strike, expiry: nearest.x.expiry, oi: nearest.x.oi, volume: nearest.x.volume, mid: nearest.mid, spreadPct: nearest.spreadPct } : null, why: nearest ? 'none of ' + cands.length + ' passed; closest ' + nearest.text : (top || 'no candidates') };
 }
 
 // Entry score (0-100) = how good this moment is for a new position. Hard gates are applied by the caller.
@@ -1105,6 +1105,11 @@ function flipProcessCandidate_(rw, env) {
   if (earnDays != null && earnDays <= C.earnBlockDays) return done('SKIP', 'earnings in ' + earnDays + ' day(s): gap and IV-crush risk');
 
   const pick = env.picks[t];
+  if (pick && !pick.ok && pick.near) {   // no contract passed: still show the closest one's strike, expiry, OI and volume so the Why text can be checked
+    const nr = pick.near;
+    res['Strike'] = nr.strike; res['Expiry'] = flipDate_(nr.expiry);
+    res['OI'] = nr.oi != null ? nr.oi : ''; res['VOL'] = nr.volume != null ? nr.volume : '';
+  }
   if (!pick || !pick.ok) return done('SKIP', pick && pick.why ? 'no usable contract: ' + pick.why : 'no contract picked yet (run a full scan during market hours)');
   const base = pick.c;
   const q = env.quotes[base.symbol];
