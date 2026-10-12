@@ -128,7 +128,7 @@ const FLIP_THEME_OF = (function () {
 
 // ---- columns ----------------------------------------------------------------------------------
 // What you SEE, in this order. Everything else stays on the sheet, hidden, and is still computed.
-const FLIP_VISIBLE_HEADERS = ['Ticker', 'Entry Date', 'Entry', 'Qty', 'Strike', 'Expiry', 'Action', 'Score', 'Fit', 'P Hit %', 'Edge Needed',
+const FLIP_VISIBLE_HEADERS = ['Ticker', 'Entry Date', 'Entry', 'Qty', 'Strike', 'Expiry', 'Action', 'Score', 'Fit', 'P Hit %', 'Edge Needed', 'Jay',
   'Price', 'Change', 'Trend', 'Off High %', 'Earn Days', 'Mid', 'Spread %', 'Lev', 'Time Val %', 'Need %', 'Target', 'Stop', 'Size',
   'Days', 'P/L %', 'P/L $', 'Why', 'AUP', 'ADN', 'RSI', 'VW %', 'RVOL', 'OI', 'VOL', 'LastRun'];   // fresh sheets only; see FLIP_FIXED_COLUMNS
 // Typed by you. With Qty filled, Strike / Expiry are YOUR contract and runs never overwrite them.
@@ -140,9 +140,81 @@ const FLIP_HELD_WHEN_OPEN = ['Strike', 'Expiry'];
 // managed names (and says so in the Log), so a moved column can never overwrite other data.
 //   Entry : the price you paid for the option (input)       P/L $ : total dollars on the position (written by the script)
 const FLIP_FIXED_COLUMNS = { 'Entry': 5, 'P/L $': 24 };
-// Change = Price now minus Price at the previous fetch (green up, red down). Previous prices live in a script property.
-const FLIP_CHANGE_FORMAT = '[Green]$#,##0.00;[Red]-$#,##0.00;$0.00';
+// Change = today's move in dollars: Price now minus the previous session's close (green up, red down).
+const FLIP_CHANGE_FORMAT = '$#,##0.00;-$#,##0.00;$0.00';   // colour comes from the conditional rules (dark green #38761d / red #cc0000), not [Green]
 function flipPnlCol_(map) { return (map && map['P/L $']) || 0; }
+
+// ---- Jay column: the paper-entry tier from the external "us-options-runtime" portal (read-only, used with its owner's permission) ----
+// ONE request per scan covers the whole tab (cached 2 min). It is an experimental research-priority grade, NOT a win probability and
+// not an edge: the owner's own docs say it was chosen after looking at history, and no live results exist yet.
+//   "High"/"Medium"/"Low"        = a call is eligible now (fresh, news-screened, qualified contract)
+//   "High (not live)" etc.       = a call fired today but is expired / held for news / has no qualified contract
+//   blank                        = no call today, or the ticker is not in that system's universe
+//   "n/a"                        = the service could not be reached; nothing else in the scan is affected
+const FLIP_JAY_HEADER = 'Jay';
+const FLIP_JAY_URL = 'https://us-options-runtime.onrender.com/api/paper-signals';
+const FLIP_JAY_CACHE_SEC = 120, FLIP_JAY_FAIL_CACHE_SEC = 60;
+const FLIP_JAY_LABEL = { HIGH: 'High', MEDIUM: 'Medium', LOW: 'Low' };
+const FLIP_JAY_RANK = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+
+// What the last lookup saw, shown in the scan summary so a blank column can be told apart from a broken one.
+let FLIP_JAY_META = { src: '', status: '', calls: 0, live: 0, err: '' };
+function flipJayNote_() {
+  const m = FLIP_JAY_META;
+  if (m.src === 'failed') return 'Jay: portal not reachable (' + m.err + ')\n';
+  if (!m.src) return '';
+  return 'Jay: ' + (m.src === 'cache' ? 'cached' : 'fetched') + ' · portal status ' + (m.status || '?') + ' · ' + m.calls + ' call(s) today, ' + m.live + ' eligible now\n';
+}
+
+function flipJayBest_(list) {
+  const o = {};
+  (list || []).forEach(function (s) {
+    const t = String((s && s.ticker) || '').toUpperCase();
+    const c = String((s && s.confidence) || '').toUpperCase();
+    const r = FLIP_JAY_RANK[c];
+    if (t && r && (!o[t] || r > FLIP_JAY_RANK[o[t]])) o[t] = c;
+  });
+  return o;
+}
+
+// Returns { TICKER: 'High' | 'High (not live)' | ... } (empty object = reachable, nothing today) or null when unavailable.
+function flipJayMap_(now) {
+  const day = flipTodayYmd_(now);
+  const key = 'FLIP_JAY_' + day;
+  let cache = null;
+  try {
+    cache = CacheService.getScriptCache();
+    const hit = cache.get(key);
+    if (hit) {
+      const o = JSON.parse(hit);
+      if (o && o._fail) { FLIP_JAY_META = { src: 'failed', status: '', calls: 0, live: 0, err: o._err || 'recent failure, retrying shortly' }; return null; }
+      FLIP_JAY_META = Object.assign({ src: 'cache', err: '' }, o._meta || {});
+      return o;
+    }
+  } catch (e) { cache = null; }
+  let out = null;
+  try {
+    const resp = UrlFetchApp.fetch(FLIP_JAY_URL + '?day=' + encodeURIComponent(day), { muteHttpExceptions: true, headers: { Accept: 'application/json' } });
+    const code = resp.getResponseCode();
+    if (code !== 200) throw new Error('HTTP ' + code);
+    const d = JSON.parse(resp.getContentText());
+    if (!d || !Array.isArray(d.signals) || !Array.isArray(d.valid_now)) throw new Error('unexpected response');
+    if (d.status === 'HISTORICAL_REPLAY') throw new Error('historical replay, not live data');
+    if (d.session && d.session !== day) throw new Error('session ' + d.session + ' is not ' + day);
+    out = { _meta: { status: String(d.status || ''), calls: d.signals.length, live: d.valid_now.length } };
+    FLIP_JAY_META = Object.assign({ src: 'fetched', err: '' }, out._meta);
+    const live = flipJayBest_(d.valid_now), any = flipJayBest_(d.signals);
+    Object.keys(live).forEach(function (t) { out[t] = FLIP_JAY_LABEL[live[t]]; });
+    Object.keys(any).forEach(function (t) { if (!out[t]) out[t] = FLIP_JAY_LABEL[any[t]] + ' (not live)'; });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    logToSheet_('Flip Jay: paper-signal fetch failed (' + msg + '); Jay shows n/a');
+    FLIP_JAY_META = { src: 'failed', status: '', calls: 0, live: 0, err: msg };
+    out = null;
+  }
+  try { if (cache) cache.put(key, JSON.stringify(out === null ? { _fail: 1, _err: FLIP_JAY_META.err } : out), out === null ? FLIP_JAY_FAIL_CACHE_SEC : FLIP_JAY_CACHE_SEC); } catch (e) { /* the cache is optional */ }
+  return out;
+}
 const FLIP_OUTPUT_HEADERS = [
   'Action', 'Score', 'Why', 'Strike', 'Expiry', 'Price', 'Change', 'Trend', 'Off High %', 'Earn Days', 'Mid', 'Spread %', 'Lev', 'Time Val %',
   'AUP', 'ADN', 'RSI', 'VW %', 'RVOL', 'OI', 'VOL', 'Need %', 'P Hit %', 'Edge Needed', 'Target', 'Stop', 'Size', 'Days', 'P/L %', 'LastRun'
@@ -404,9 +476,11 @@ function flipApplyRules_(sheet, map, onlyIfMissing) {
   try {
     const rules = sheet.getConditionalFormatRules();
     const rows = Math.max(sheet.getMaxRows() - 1, 1);
-    const mineCols = ['Earn Days', 'Edge Needed', 'P/L %', 'Days'].filter(function (h) { return map[h]; }).map(function (h) { return map[h]; }).concat(flipPnlCol_(map) ? [flipPnlCol_(map)] : []);
-    const mine = function (r) { return r.getRanges().some(function (x) { return mineCols.some(function (c) { return x.getColumn() <= c && x.getLastColumn() >= c; }); }); };
-    if (onlyIfMissing && rules.some(mine)) return;
+    const mineCols = ['Earn Days', 'Edge Needed', 'P/L %', 'Days', 'Change'].filter(function (h) { return map[h]; }).map(function (h) { return map[h]; }).concat(flipPnlCol_(map) ? [flipPnlCol_(map)] : []);
+    const covers = function (r, c) { return r.getRanges().some(function (x) { return x.getColumn() <= c && x.getLastColumn() >= c; }); };
+    const mine = function (r) { return mineCols.some(function (c) { return covers(r, c); }); };
+    // Skip only when every managed column already has a rule (so a newly managed column, such as Change, still gets its rules).
+    if (onlyIfMissing && mineCols.every(function (c) { return rules.some(function (r) { return covers(r, c); }); })) return;
     const R = function (h) { return sheet.getRange(2, map[h], rows, 1); };
     const add = [];
     if (map['Earn Days']) {
@@ -418,7 +492,7 @@ function flipApplyRules_(sheet, map, onlyIfMissing) {
       add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(5.01, FLIP_CONFIG.maxEdgeNeeded).setBackground('#fff2cc').setRanges([R('Edge Needed')]).build());
       add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(FLIP_CONFIG.maxEdgeNeeded).setBackground('#f4cccc').setRanges([R('Edge Needed')]).build());
     }
-    [map['P/L %'], flipPnlCol_(map)].forEach(function (c) {
+    [map['P/L %'], map['Change'], flipPnlCol_(map)].forEach(function (c) {
       if (!c) return;
       const rg = sheet.getRange(2, c, rows, 1);
       add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([rg]).build());
@@ -1220,9 +1294,8 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const errors = [];
     const stamp = new Date();
     let processed = 0;
-    const alertItems = [], logItems = [], pnlByIdx = {}, sortKeyByIdx = {};
-    let prevPx = {}; const newPx = {};
-    try { prevPx = JSON.parse(props.getProperty('FLIP_PREV_PRICE') || '{}') || {}; } catch (e) { prevPx = {}; }
+    const alertItems = [], logItems = [], pnlByIdx = {}, sortKeyByIdx = {}, jayByIdx = {};
+    const jay = flipJayMap_(now);   // one cached request for the whole tab; null if unreachable (the scan carries on)
     for (let i = 0; i < work.length; i++) {
       if (Date.now() - startMs > budgetMs) { timedOut = true; break; }
       const rw = work[i];
@@ -1230,9 +1303,11 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
       try { res = rw.held ? flipProcessHeld_(rw, env) : flipProcessCandidate_(rw, env); }
       catch (e) { res = { Action: 'WAIT', Why: 'error: ' + (e && e.message ? e.message : e) }; errors.push(rw.ticker + ': ' + (e && e.message ? e.message : e)); }
       res['LastRun'] = stamp;
+      jayByIdx[rw.idx] = jay ? (jay[String(rw.ticker).toUpperCase()] || '') : 'n/a';
+      // Change = today's move in dollars: price now minus the previous session's close (same base as Day %).
       if (typeof res['Price'] === 'number' && res['Price'] > 0) {
-        if (prevPx[rw.ticker] > 0) res['Change'] = flipR2_(res['Price'] - prevPx[rw.ticker]);
-        newPx[rw.ticker] = res['Price'];
+        const pc = env.prevClose[rw.ticker];
+        if (pc > 0) res['Change'] = flipR2_(res['Price'] - pc);
       }
       sortKeyByIdx[rw.idx] = flipSortKey_(res['Action'], res['Score'], res._plPct);
       try { flipBuildAlertItems_(rw, res, alertItems); flipBuildLogItems_(rw, res, env, logItems); } catch (e) { /* alerts and logging never break a scan */ }
@@ -1255,6 +1330,18 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
         sheet.getRange(2, c0, data.length, c1 - c0 + 1).setValues(data.map(function (r) { return r.slice(c0 - 1, c1); }));
         g0 = g1 + 1;
       }
+      // Jay column: rows processed this run get the paper-entry tier (or blank / n/a); other rows keep what is there (formula or value).
+      try {
+        const jc = map[FLIP_JAY_HEADER];
+        if (jc && Object.keys(jayByIdx).length) {
+          const rngJ = sheet.getRange(2, jc, data.length, 1);
+          const fj = rngJ.getFormulas(), vj = rngJ.getValues();
+          rngJ.setValues(data.map(function (r, i) {
+            if (jayByIdx[i] !== undefined) return [jayByIdx[i]];
+            return [fj[i][0] !== '' ? fj[i][0] : vj[i][0]];
+          }));
+        }
+      } catch (e) { logToSheet_('Flip: could not write the Jay column: ' + (e && e.message ? e.message : e)); }
       // P/L $ column: rows processed this run get the dollar P/L (or blank); other rows keep what is there (formula or value).
       try {
         if (!flipPnlCol_(map)) throw new Error('P/L $ column not found (see FLIP_FIXED_COLUMNS)');
@@ -1266,7 +1353,6 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
         }));
       } catch (e) { logToSheet_('Flip: could not write the P/L $ column: ' + (e && e.message ? e.message : e)); }
       if (map['Change']) sheet.getRange(2, map['Change'], data.length, 1).setNumberFormat(FLIP_CHANGE_FORMAT);
-      try { Object.keys(newPx).forEach(function (k) { prevPx[k] = newPx[k]; }); props.setProperty('FLIP_PREV_PRICE', JSON.stringify(prevPx)); } catch (e) { /* too big: skip */ }
       flipColorRows_(sheet, map, data.length);
       flipApplyRules_(sheet, map, true);
       if (full) flipSortRows_(sheet, map, data, sortKeyByIdx);
@@ -1282,7 +1368,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const msg =
       (dryRun ? '(DRY RUN: nothing written)\n' : '') +
       (timedOut ? '⏱️ Stopped at the time limit: ' + processed + ' of ' + work.length + ' rows done. Run again to continue with the stalest rows.\n\n' : '') +
-      'Rows processed: ' + processed + ' of ' + work.length + (full ? '' : ' (quick check)') + ' in ' + sec + 's\n' + alertNote +
+      'Rows processed: ' + processed + ' of ' + work.length + (full ? '' : ' (quick check)') + ' in ' + sec + 's\n' + alertNote + flipJayNote_() +
       order.filter(function (k) { return counts[k]; }).map(function (k) { return k + ': ' + counts[k]; }).join('   ') + '\n' +
       (sess.open ? '' : 'Market is closed: entry signals are evaluated only while it is open.\n') +
       (spyHead ? 'SPY headwind: strong entries are held back.\n' : '') +
