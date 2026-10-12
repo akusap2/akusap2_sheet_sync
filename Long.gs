@@ -86,12 +86,12 @@ const LONG_CONFIG = {
   sleepMs: 100,
   // --- research promotion (universe quality screen) ------------------------------
   promote: {
-    maxStocks: 30, maxEtfs: 8,
+    maxTotal: 30, maxEtfs: 5,     // the tab holds at most maxTotal rows (stocks + ETFs + pinned rows)
+    
     minStockScore: 70, minEtfScore: 60,
     minCapB: 50,             // $50B market cap floor
     minHistoryYears: 4.7,
     minRoePct: 12, minOpmPct: 10,
-    removeAfterMisses: 5,
     timeBudgetMs: 4 * 60 * 1000
   },
   // cspQualityStock_/Etf_ read these two; 100 switches their trend gates off (Long judges trend itself, per row)
@@ -1139,8 +1139,9 @@ function longUniverse_(sheetRows) {
   const u = {};
   LONG_STOCK_UNIVERSE.forEach(function (t) { if (!never[t]) u[t] = { isEtf: false }; });
   LONG_ETF_UNIVERSE.forEach(function (t) { u[t] = { isEtf: true }; });
-  try { if (typeof cspTabTickers_ === 'function') cspTabTickers_().forEach(function (t) { if (!u[t] && !never[t]) u[t] = { isEtf: !!LONG_ETF_SET[t] }; }); } catch (e) { /* optional */ }
-  (sheetRows || []).forEach(function (rw) { if (!u[rw.ticker]) u[rw.ticker] = { isEtf: rw.isEtf }; });
+  // Only the Long lists above plus rows you pinned (Qty filled or Ticker cell colored). The Research / Quick / Leap tabs are NOT used: they hold
+  // high-volatility names that do not fit "comfortable to hold for years".
+  (sheetRows || []).forEach(function (rw) { if (!u[rw.ticker] && (rw.held || rw.colored)) u[rw.ticker] = { isEtf: rw.isEtf }; });
   return u;
 }
 
@@ -1282,24 +1283,32 @@ function longPromoteCore_(opts) {
     return { complete: false, scored: Object.keys(evals).length, total: names.length };
   }
 
-  const rank = function (isEtf, maxN) {
-    return Object.keys(evals).map(function (t) { return evals[t]; }).filter(function (q) { return q.isEtf === isEtf && q.qualifies; })
-      .sort(function (a, b) { return b.score - a.score; }).slice(0, maxN);
-  };
-  const rs = rank(false, P.maxStocks), re = rank(true, P.maxEtfs);
+  // Pinned rows (Qty filled = you hold it, or Ticker cell colored) always stay and use up slots. The rest of the 30 goes to the best-scoring
+  // qualifying names (at most maxEtfs ETFs). Every other unpinned row is removed: this is what keeps the tab at 30.
+  const pinned = {};
+  sheetRows.forEach(function (rw) { if (rw.held || rw.colored) pinned[rw.ticker] = true; });
+  const slots = Math.max(0, P.maxTotal - Object.keys(pinned).length);
+  const ranked = Object.keys(evals).map(function (t) { return evals[t]; }).filter(function (q) { return q.qualifies && !pinned[q.ticker]; })
+    .sort(function (a, b) { return b.score - a.score; });
   const chosen = {};
-  rs.concat(re).forEach(function (q) { chosen[q.ticker] = q; });
+  let nEtf = 0, nStock = 0;
+  ranked.forEach(function (q) {
+    if (Object.keys(chosen).length >= slots) return;
+    if (q.isEtf) { if (nEtf >= P.maxEtfs) return; nEtf++; } else nStock++;
+    chosen[q.ticker] = q;
+  });
+  const rs = { length: nStock }, re = { length: nEtf };
 
   const props = PropertiesService.getScriptProperties();
-  let misses = {};
-  try { misses = JSON.parse(props.getProperty('LONG_PROMO_MISS') || '{}'); } catch (e) { misses = {}; }
   const toAdd = Object.keys(chosen).filter(function (t) { return !onSheet[t]; });
   const toRemove = [], keptHeld = [];
   sheetRows.forEach(function (rw) {
-    if (rw.source !== 'Research') return;
-    if (chosen[rw.ticker]) { misses[rw.ticker] = 0; return; }
-    misses[rw.ticker] = (misses[rw.ticker] || 0) + 1;
-    if (misses[rw.ticker] >= P.removeAfterMisses) { if (rw.held || rw.colored) keptHeld.push(rw.ticker); else toRemove.push(rw); }
+    if (chosen[rw.ticker]) return;
+    if (pinned[rw.ticker]) { if (!(evals[rw.ticker] && evals[rw.ticker].qualifies)) keptHeld.push(rw.ticker); return; }
+    const q = evals[rw.ticker];
+    // A failed data fetch is not a verdict: keep the row until it can be scored.
+    if (q && q.fails.some(function (f) { return /^error|no fundamentals|no 5-year|no daily/.test(f); })) return;
+    toRemove.push(rw);
   });
 
   if (!opts.dryRun) {
@@ -1308,7 +1317,7 @@ function longPromoteCore_(opts) {
       sheetRows.forEach(function (rw) { const q = evals[rw.ticker]; if (q) col[rw.idx][0] = q.score; });
       sheet.getRange(2, map['Quality'], col.length, 1).setValues(col);
     }
-    toRemove.sort(function (a, b) { return b.idx - a.idx; }).forEach(function (rw) { sheet.deleteRow(rw.idx + 2); delete misses[rw.ticker]; });
+    toRemove.sort(function (a, b) { return b.idx - a.idx; }).forEach(function (rw) { sheet.deleteRow(rw.idx + 2); });
     if (toAdd.length) {
       const tickCol = sheet.getRange(2, map['Ticker'], Math.max(sheet.getMaxRows() - 1, 1), 1).getValues();
       let lastTicker = 1;
@@ -1325,7 +1334,6 @@ function longPromoteCore_(opts) {
       sheet.getRange(lastTicker + 1, 1, out.length, w2).setValues(out);
       longFormatSheet_(sheet);
     }
-    props.setProperty('LONG_PROMO_MISS', JSON.stringify(misses));
   }
 
   const failCounts = {};
@@ -1339,9 +1347,9 @@ function longPromoteCore_(opts) {
   notify_(ui, 'Long research promotion',
     (opts.dryRun ? '(DRY RUN: nothing written)\n' : '') +
     'Scored ' + names.length + ' tickers in ' + Math.round((Date.now() - start) / 1000) + 's.\n' +
-    'Qualified and kept: ' + rs.length + ' stocks (max ' + P.maxStocks + '), ' + re.length + ' ETFs (max ' + P.maxEtfs + ').\n' +
+    'Kept on the tab: ' + rs.length + ' stocks + ' + re.length + ' ETFs (max ' + P.maxEtfs + ') + ' + Object.keys(pinned).length + ' pinned = at most ' + P.maxTotal + '.\n' +
     'Added: ' + (toAdd.length ? toAdd.join(', ') : 'none') + '\n' +
-    'Removed (out of the list ' + P.removeAfterMisses + '+ runs): ' + (toRemove.length ? toRemove.map(function (r) { return r.ticker; }).join(', ') : 'none') + '\n' +
+    'Removed (not in the top ' + P.maxTotal + '): ' + (toRemove.length ? toRemove.map(function (r) { return r.ticker; }).join(', ') : 'none') + '\n' +
     (keptHeld.length ? 'Kept despite dropping out (held position or colored cell): ' + keptHeld.join(', ') + '\n' : '') +
     (topFails ? 'Most common reasons for rejection: ' + topFails : ''));
   return { complete: true, added: toAdd, removed: toRemove.map(function (r) { return r.ticker; }), chosen: Object.keys(chosen) };
