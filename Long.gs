@@ -86,7 +86,7 @@ const LONG_CONFIG = {
   sleepMs: 100,
   // --- research promotion (universe quality screen) ------------------------------
   promote: {
-    maxStocks: 40, maxEtfs: 8,
+    maxStocks: 30, maxEtfs: 8,
     minStockScore: 70, minEtfScore: 60,
     minCapB: 50,             // $50B market cap floor
     minHistoryYears: 4.7,
@@ -103,7 +103,8 @@ const LONG_CONFIG = {
 };
 
 // Starter list for a brand-new tab.
-const LONG_STARTER_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'V', 'MA', 'COST', 'WMT', 'JPM', 'KO', 'PEP', 'PG', 'JNJ', 'HD', 'LIN', 'UNP', 'SPGI', 'ISRG', 'SPY', 'QQQ'];
+const LONG_STARTER_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'V', 'MA', 'COST', 'WMT', 'JPM', 'KO', 'PEP', 'PG', 'JNJ', 'HD', 'LIN', 'UNP', 'SPGI', 'ISRG', 'SPY', 'QQQ',
+  'LLY', 'AVGO', 'MCO', 'ICE', 'ADP', 'SHW', 'ORLY', 'TJX', 'ITW', 'CB'];
 
 // Research universe. Own literal lists (not shared constants) so file load order never matters. From general knowledge of large,
 // long-record, wide-moat businesses — NOT a rating. The numeric screen (market cap >= $50B, returns, margins, 5-year record) decides who
@@ -1190,13 +1191,13 @@ function longUpdateUniverse() {
   return { count: rows.length, fresh: fresh };
 }
 
-// The Long block starts where its header already is (so moving the block is safe); first-time default is column U (21).
+// The Long block starts where its header already is (so moving the block is safe); first-time default is column AC (29), right of the Flip block (T:AA).
 function longUniverseStartCol_(uni, header) {
   try {
     const row = uni.getRange(1, 1, 1, Math.max(uni.getLastColumn(), 1)).getValues()[0];
     for (let i = 0; i < row.length; i++) if (String(row[i]).trim() === header) return i + 1;
   } catch (e) { /* default below */ }
-  return 21;
+  return 29;
 }
 
 // Wrapper: logs STARTED / COMPLETE / NOT COMPLETE to ScriptLog (a fresh run first wipes old ScriptLog rows, as the CSP promotion does).
