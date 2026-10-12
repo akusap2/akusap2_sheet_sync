@@ -192,8 +192,9 @@ const CSP_PNL_COLUMN = 25;
 // Entry sits in this fixed COLUMN NUMBER (5 = E) when its header cell holds your own formula (any header text that is not a script header).
 // Nothing is added for it and row 1 is never written. If the header says exactly Entry, the name is used instead.
 const CSP_FIXED_COLUMNS = { 'Entry': 5 };
-// Change = Price now minus Price at the previous fetch (green up, red down); previous prices live in a script property.
-const CSP_CHANGE_FORMAT = '[Green]$#,##0.00;[Red]-$#,##0.00;$0.00';
+// Change = today's move in dollars: the live quote's price minus the previous session's close (dark green up, red down; blank when the
+// quote is not available). Colour comes from cspApplyChangeRules_, not from the number format.
+const CSP_CHANGE_FORMAT = '$#,##0.00;-$#,##0.00;$0.00';
 // PNL follows the formula column sitting right before Why (so deleting/moving columns does not break it); CSP_PNL_COLUMN is the fallback.
 function cspPnlCol_(map) {
   if (!map) return CSP_PNL_COLUMN;
@@ -355,6 +356,8 @@ function cspHeaderMap_(sheet) {
     });
   } catch (e) { /* fall back to the positions below */ }
   if (!map['PNL'] && sumF) map['PNL'] = sumF;
+  // A SUMPRODUCT header IS the Entry column. It wins over any stray plain-text "Entry" header further right (that one is empty).
+  if (entryF) map['Entry'] = entryF;
   Object.keys(CSP_FIXED_COLUMNS).forEach(function (name) {
     if (map[name]) return;
     const c = (name === 'Entry' && entryF) ? entryF : CSP_FIXED_COLUMNS[name];
@@ -459,6 +462,22 @@ function cspApplyEarnRules_(sheet, map, onlyIfMissing) {
   } catch (e) { logToSheet_('CSP: could not apply Earn Days colours: ' + (e && e.message ? e.message : e)); }
 }
 
+// Change colours (conditional formatting): dark green when positive (readable, same green as the Flip tab), red when negative.
+// onlyIfMissing = true is the cheap self-heal check used by every scan.
+function cspApplyChangeRules_(sheet, map, onlyIfMissing) {
+  try {
+    const col = map['Change'];
+    if (!col) return;
+    const rules = sheet.getConditionalFormatRules();
+    const mine = function (r) { return r.getRanges().some(function (x) { return x.getColumn() <= col && x.getLastColumn() >= col; }); };
+    if (onlyIfMissing && rules.some(mine)) return;
+    const rng = sheet.getRange(2, col, Math.max(sheet.getMaxRows() - 1, 1), 1);
+    const neg = SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([rng]).build();
+    const pos = SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(0).setFontColor('#38761d').setRanges([rng]).build();
+    sheet.setConditionalFormatRules(rules.filter(function (r) { return !mine(r); }).concat([neg, pos]));
+  } catch (e) { logToSheet_('CSP: could not apply Change colours: ' + (e && e.message ? e.message : e)); }
+}
+
 function cspFormatSheet_(sheet) {
   const map = cspHeaderMap_(sheet);
   const maxRows = Math.max(sheet.getMaxRows() - 1, 1);
@@ -486,6 +505,7 @@ function cspFormatSheet_(sheet) {
   });
   fmt('Quality', '0.0');
   cspApplyEarnRules_(sheet, map, false);
+  cspApplyChangeRules_(sheet, map, false);
   sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
 }
 
@@ -829,22 +849,33 @@ function cspProcessRow_(inp, ctx) {
   const cfg = CSP_CONFIG;
   let action = 'WAIT', why = [];
 
-  if (inp.holdCells && inp.openStrike == null) {
-    out.Action = 'FILL IN'; out.Score = '';
-    out.Why = 'Open Qty is set but Strike, Expiry or Entry (premium received) is missing: enter them (Strike and Expiry are never overwritten while Open Qty is filled)';
-    out.SortKey = 2900; return out;
+  // Open Qty is set but the position is not complete yet: fill in the stock data anyway (so you can watch it), flag what is missing.
+  const incomplete = !!(inp.holdCells && inp.openStrike == null);
+  const missing = [];
+  if (incomplete) {
+    if (inp.pStrike == null) missing.push('Strike');
+    if (!inp.pExpiry) missing.push('Expiry');
+    if (!(inp.pCredit > 0)) missing.push('Entry (premium received)');
   }
+  const fillMsg = 'Open Qty is set but ' + (missing.length ? missing.join(', ') : 'part of the position') + ' is missing: enter it (Strike and Expiry are never overwritten while Open Qty is filled). Stock data on this row is live.';
   const tech = cspFetchTech_(t, ctx);
-  if (!tech) { out.Action = 'SKIP'; out.Why = 'no daily price history from Yahoo'; return out; }
+  if (!tech) {
+    if (incomplete) { out.Action = 'FILL IN'; out.Score = ''; out.Why = fillMsg + ' (no daily price history from Yahoo)'; out.SortKey = 2900; return out; }
+    out.Action = 'SKIP'; out.Why = 'no daily price history from Yahoo'; return out;
+  }
 
   // Live spot: Tasty equity quote first, last close otherwise.
-  let spot = null;
+  let spot = null, dayChg = null;
   if (ctx.token) {
-    try { const q = fetchTastyEquityQuote_(t, ctx.token); if (q && q.price != null) spot = q.price; } catch (e) { /* fall back */ }
+    try {
+      const q = fetchTastyEquityQuote_(t, ctx.token);
+      if (q && q.price != null) { spot = q.price; if (typeof q.change === 'number' && isFinite(q.change)) dayChg = q.change; }   // change = price - previous close
+    } catch (e) { /* fall back */ }
   }
   if (spot == null) spot = tech.price;
 
   out.Price = spot;
+  if (dayChg != null) out.Change = round2_(dayChg);   // today's $ move; blank when the live quote has no previous close
   const offHigh = tech.hi52 ? (1 - spot / tech.hi52) * 100 : null;
   const vs200 = tech.ma200 ? (spot / tech.ma200 - 1) * 100 : null;
   const vs50 = tech.ma50 ? (spot / tech.ma50 - 1) * 100 : null;
@@ -856,6 +887,23 @@ function cspProcessRow_(inp, ctx) {
   const earnDays = earnDate ? cspDaysBetween_(now, earnDate) : null;
   out['Next Earnings'] = isEtf ? 'ETF' : (earnDate || ''); out['Earn Days'] = earnDays == null ? '' : earnDays;
   out['IV Rank'] = ctx.ivRanks[t] != null ? ctx.ivRanks[t] : '';
+
+  if (incomplete) {
+    out.Action = 'FILL IN'; out.Score = ''; out.Why = fillMsg; out.SortKey = 2900;
+    // If the contract itself is already typed (Strike and Expiry), show its days left and live mark so progress is visible.
+    if (inp.pStrike != null && inp.pExpiry) {
+      try {
+        const dte0 = cspDaysBetween_(now, inp.pExpiry);
+        out.DTE = dte0; out['Open DTE'] = dte0;
+        if (inp.openDate) out['Open Held'] = cspDaysBetween_(inp.openDate, now);
+        let mark0 = null;
+        if (ctx.token) { const q0 = fetchTastyTradeQuote_(buildOccSymbol_(t, inp.pExpiry, inp.pStrike, 'P'), ctx.token); if (q0) mark0 = q0.mark; }
+        if (mark0 == null) { const y0 = fetchYahooQuote_(t, inp.pExpiry, inp.pStrike, 'P'); if (y0) mark0 = y0.mark; }
+        if (mark0 != null) out['Open Mark'] = mark0;
+      } catch (e) { /* contract detail is optional */ }
+    }
+    return out;
+  }
 
   // ----- open position tracker (independent of the proposal) -----
   let openAction = '';
@@ -1061,6 +1109,7 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
       openStrike: complete ? oStrike : null, openExpiry: complete ? oExpiry : null,
       openCredit: complete ? oCredit : null, openDate: map['Open Date'] ? cspParseDate_(r[map['Open Date'] - 1]) : null,
       openQty: qty || 1,
+      pStrike: oStrike, pExpiry: oExpiry, pCredit: oCredit,   // raw typed values, used only to say what is missing on an incomplete row
       type: map['Type'] ? String(r[map['Type'] - 1] || '').trim().toUpperCase() : '',
       lastRun: r[map['LastRun'] - 1] instanceof Date ? r[map['LastRun'] - 1].getTime() : 0
     });
@@ -1108,8 +1157,6 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
   const lastRunStamp = new Date();
   const pnlByIdx = {};
   let alertItems = [];
-  let prevPx = {}; const newPx = {};
-  try { prevPx = JSON.parse(PropertiesService.getScriptProperties().getProperty('CSP_PREV_PRICE') || '{}') || {}; } catch (e) { prevPx = {}; }
 
   for (let i = 0; i < work.length; i++) {
     if (Date.now() - startMs > budgetMs) { timedOut = true; break; }
@@ -1122,10 +1169,6 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
       errors.push(rw.ticker + ': ' + (e && e.message ? e.message : e));
     }
     res.LastRun = lastRunStamp;
-    if (typeof res.Price === 'number' && res.Price > 0) {
-      if (prevPx[rw.ticker] > 0) res.Change = round2_(res.Price - prevPx[rw.ticker]);
-      newPx[rw.ticker] = res.Price;
-    }
     try { alertItems = alertItems.concat(cspBuildAlertItems_(rw, res)); } catch (e) { /* never let alert building break a scan */ }
     if (res._openWhy) res.Why = 'OPEN PUT: ' + res._openWhy + (res.Why ? ' | ' + res.Why : '');
     const row = data[rw.idx];
@@ -1170,12 +1213,12 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
       rng.setValues(col);
     } catch (e) { logToSheet_('CSP: could not write the PNL column: ' + (e && e.message ? e.message : e)); }
     if (map['Change']) sheet.getRange(2, map['Change'], data.length, 1).setNumberFormat(CSP_CHANGE_FORMAT);
-    try { Object.keys(newPx).forEach(function (k) { prevPx[k] = newPx[k]; }); PropertiesService.getScriptProperties().setProperty('CSP_PREV_PRICE', JSON.stringify(prevPx)); } catch (e) { /* too big: skip */ }
     cspColorRows_(sheet, map, data.length);
     // One-time carry-over of premium typed in Mid before the Entry column existed (see the input reader above).
     entryFixes.forEach(function (f) { sheet.getRange(f.row, f.col).setValue(f.value); });
     if (!entryMigrated && !timedOut) PropertiesService.getScriptProperties().setProperty('CSP_ENTRY_MIGRATED', '1');
     cspApplyEarnRules_(sheet, map, true);
+    cspApplyChangeRules_(sheet, map, true);
     // Sort whole rows (inputs travel with their outputs): take-profit, review, SELL, WAIT, SKIP.
     if (map['SortKey']) {
       sheet.getRange(2, 1, data.length, width).sort({ column: map['SortKey'], ascending: false });
