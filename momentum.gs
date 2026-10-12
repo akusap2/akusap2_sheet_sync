@@ -1437,7 +1437,6 @@ function onOpen() {
     .addSeparator()
     .addItem('🚀 Run Daily Pipeline (Research + Promote)', 'runDailyPipeline')
     .addItem('🛡️ Run Hedge Analysis', 'runHedgeAnalysis')
-    .addItem('🔬 Run Deep Dive Scan', 'runDeepDiveScan')
     .addSeparator()
     .addSubMenu(ui.createMenu('➕ More')
       .addItem('🔎 Run Daily Research (alone)', 'runDailyResearch')
@@ -1476,9 +1475,16 @@ function onOpen() {
       .addItem('Best-OI Raw Expiration Dates (one ticker)', 'debugBestOiExpirationDates')
       .addItem('Validate & Update + Sort (stops before highlight)', 'validateAndUpdateDryRun')
       .addSeparator()
-      .addItem('DeepDive: Raw Chain (one expiration)', 'debugFetchRawChainForExpiry')
       .addItem('Research: Dry Run (no writes)', 'runDailyResearchDryRun')
       .addItem('Research: Promote Dry Run (no writes)', 'promoteResearchPicksForTabDryRun'))
+    .addToUi();
+
+  // Deep Dive has its own top-level menu (separate from Quick and Leap).
+  ui.createMenu('🔬 Deep Dive')
+    .addItem('🔬 Run Deep Dive Scan', 'runDeepDiveScan')
+    .addSeparator()
+    .addSubMenu(ui.createMenu('🔍 Deep Dive Debug')
+      .addItem('Raw Chain (one expiration)', 'debugFetchRawChainForExpiry'))
     .addToUi();
 }
 
