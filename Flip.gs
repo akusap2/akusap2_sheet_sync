@@ -90,7 +90,13 @@ const FLIP_CONFIG = {
 };
 
 // Your entry trigger and exit rules come from INTRADAY_SIGNAL (Momentum.gs); Flip overrides only what it must.
-const FLIP_SIGNAL = Object.assign({}, INTRADAY_SIGNAL, { exitMinProfitPct: 1.5, bounceLane: true });
+// Built on first use, NOT at file load: a top-level reference to INTRADAY_SIGNAL (momentum.gs) throws "INTRADAY_SIGNAL is not defined" whenever
+// Apps Script loads this file before momentum.gs (file order in the editor decides that).
+let FLIP_SIGNAL_CACHE_ = null;
+function flipSignal_() {
+  if (!FLIP_SIGNAL_CACHE_) FLIP_SIGNAL_CACHE_ = Object.assign({}, INTRADAY_SIGNAL, { exitMinProfitPct: 1.5, bounceLane: true });
+  return FLIP_SIGNAL_CACHE_;
+}
 
 // Looked at by the promotion; the numbers decide who is kept. Liquid, large names with enough daily range to flip.
 const FLIP_UNIVERSE = [
@@ -1261,7 +1267,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const ivMap = sess.open ? fetchIntradayMap_(withSpy) : {};
     const spy = ivMap['SPY'] || null;
     const spyHead = !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp);
-    const env = { now: now, sess: sess, closeMin: closeMin, S: FLIP_SIGNAL, spyHead: spyHead, feat: feat, prevClose: prevClose, daily: daily, ivFresh: {},
+    const env = { now: now, sess: sess, closeMin: closeMin, S: flipSignal_(), spyHead: spyHead, feat: feat, prevClose: prevClose, daily: daily, ivFresh: {},
       picks: {}, quotes: {}, ctx: ctx, full: full, open: [], todayYmd: todayYmd };
     tickers.forEach(function (t) { env.ivFresh[t] = flipFreshIv_(ivMap[t], env); });
 
@@ -2047,7 +2053,7 @@ function debugFlipOneTicker() {
   const daily = flipGetDaily_([t], ctx);
   const ivMap = sess.open ? fetchIntradayMap_([t, 'SPY']) : {};
   const spy = ivMap['SPY'] || null;
-  const env = { now: now, sess: sess, closeMin: US_MARKET_EARLY_CLOSES[todayYmd] ? 210 : 390, S: FLIP_SIGNAL,
+  const env = { now: now, sess: sess, closeMin: US_MARKET_EARLY_CLOSES[todayYmd] ? 210 : 390, S: flipSignal_(),
     spyHead: !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp),
     feat: feat, prevClose: prevClose, daily: daily, ivFresh: {}, picks: {}, quotes: {}, ctx: ctx, full: true, open: [], todayYmd: todayYmd };
   env.ivFresh[t] = flipFreshIv_(ivMap[t], env);
