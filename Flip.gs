@@ -675,6 +675,7 @@ function flipChooseContract_(cands, spot, cfg) {
   cfg = cfg || FLIP_CONFIG;
   let best = null, why = '';
   const rejects = {};
+  let nearest = null;   // the contract that came closest to passing, so the SKIP reason shows real numbers
   cands.forEach(function (x) {
     if (!(x.bid > 0) || !(x.ask > 0) || x.ask < x.bid) { rejects['no two-sided quote'] = (rejects['no two-sided quote'] || 0) + 1; return; }
     const mid = (x.bid + x.ask) / 2;
@@ -687,7 +688,10 @@ function flipChooseContract_(cands, spot, cfg) {
     if (x.oi != null && x.oi < cfg.minOi) fails.push('OI ' + x.oi + ' < ' + cfg.minOi);
     if (mid < cfg.minMid) fails.push('price under $' + cfg.minMid);
     if (extPct > cfg.maxTimeValuePct) fails.push('time value ' + extPct.toFixed(0) + '% > ' + cfg.maxTimeValuePct + '%');
-    if (fails.length) { fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); rejects[k] = (rejects[k] || 0) + 1; }); if (!why) why = fails[0]; return; }
+    if (fails.length) {
+      const nScore = fails.length * 1000 + spreadPct;
+      if (!nearest || nScore < nearest.score) nearest = { score: nScore, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM-dd-yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
+      fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); rejects[k] = (rejects[k] || 0) + 1; }); if (!why) why = fails[0]; return; }
     const lev = x.delta * spot / mid;
     let decay = null;
     if (x.iv != null && typeof blackScholesOneDayTheta_ === 'function') {
@@ -704,7 +708,7 @@ function flipChooseContract_(cands, spot, cfg) {
   });
   if (best) return { ok: true, c: best };
   const top = Object.keys(rejects).sort(function (a, b) { return rejects[b] - rejects[a]; }).slice(0, 2).join('; ');
-  return { ok: false, why: top || 'no candidates' };
+  return { ok: false, why: nearest ? 'none of ' + cands.length + ' passed; closest ' + nearest.text : (top || 'no candidates') };
 }
 
 // Entry score (0-100) = how good this moment is for a new position. Hard gates are applied by the caller.
