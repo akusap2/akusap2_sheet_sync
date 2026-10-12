@@ -1190,6 +1190,10 @@ const QUICK_SCHEDULE = {
   dailyRuntimeCapMin: 75         // stop starting heavy jobs after this many trigger-minutes today (Google allows 90 on gmail.com accounts)
 };
 const QUICK_SCHEDULE_TICK_FN = 'quickScheduleTick_';
+// MASTER SWITCH for everything automatic on Quick and Leap. false = no schedule (an installed trigger deletes itself on its next tick),
+// no Start Quick Schedule, and no Telegram/phone alerts from Quick or Leap (scheduled OR manual runs). Menu runs of Quick/Leap still work on demand.
+// CSP, Flip and Long have their own schedules and alerts and are NOT affected. Set to true to bring the old behaviour back.
+const QUICK_LEAP_AUTOMATION = false;
 // Handler names of every trigger this project has ever installed for scheduling; all are removed on Start / Stop.
 const OLD_SCHEDULE_HANDLERS = ['scheduledDispatcher_', 'signalWatchTick_', 'quickScheduleTick_'];
 
@@ -1214,6 +1218,7 @@ function scheduledRuntimeTodayMs_(props, now) {
 const HEARTBEAT_MIN_MINUTES_AFTER_OPEN = 16;
 const HEARTBEAT_MAX_ATTEMPTS = 3;
 function maybeSendDailyHeartbeat_(props, now, sess) {
+  if (!QUICK_LEAP_AUTOMATION) return;
   try {
     if (!sess.open || sess.minutesSinceOpen < HEARTBEAT_MIN_MINUTES_AFTER_OPEN) return;
     const cfg = getAlertConfig_();
@@ -1239,6 +1244,7 @@ function maybeSendDailyHeartbeat_(props, now, sess) {
 }
 
 function quickScheduleTick_() {
+  if (!QUICK_LEAP_AUTOMATION) { try { removeScheduleTriggersQuiet_(); } catch (e) { /* retried next tick */ } return; }   // switched off: remove the trigger and stop
   const t0 = Date.now();
   let lock = null;
   let heartbeatCtx = null;
@@ -1327,6 +1333,11 @@ function removeScheduleTriggersQuiet_() {
 
 function startQuickSchedule_() {
   const ui = tryGetUi_();
+  if (!QUICK_LEAP_AUTOMATION) {
+    const m = 'Quick/Leap automation is switched off (QUICK_LEAP_AUTOMATION = false at the top of the schedule section in momentum.gs). Nothing was scheduled. Run Quick and Leap from the menu on demand.';
+    if (ui) ui.alert(m); else logToSheet_(m);
+    return;
+  }
   const Q = QUICK_SCHEDULE;
   if (!SpreadsheetApp.getActiveSpreadsheet().getSheetByName(Q.tab)) {
     const m = 'No tab named "' + Q.tab + '" found, so nothing was scheduled.';
@@ -6799,6 +6810,7 @@ function alertLine_(level, ticker, strike, expiryText, iv, meta, fz, why) {
 // Batches this run's green rows into ONE push. A row is sent when it is new, when it rises from get-ready to ENTRY,
 // or again after ALERT_CFG.repeatMin minutes. State is only updated if the push actually went out.
 function dispatchEntryAlerts_(tab, items, now) {
+  if (!QUICK_LEAP_AUTOMATION) return;   // Quick/Leap phone alerts are off
   try {
     if (!items || !items.length) return;
     const cfg = getAlertConfig_();
@@ -6907,6 +6919,7 @@ function fetchOptionQuotesMap_(occSymbols) {
 }
 
 function signalWatchTick_() {
+  if (!QUICK_LEAP_AUTOMATION) return;
   try {
     const now = new Date();
     const sess = marketSessionAt_(now);
