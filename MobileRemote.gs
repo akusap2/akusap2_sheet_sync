@@ -23,11 +23,12 @@
  *
  * SCOPE: only functions already built to run with no interactive UI (they
  * use tryGetUi_() internally, same as the existing scheduled-run
- * dispatcher) are wired up here — Validate & Update (Quick, Leap), the daily
- * pipeline (Research + Promote, then it stops), Start/Stop Quick Schedule,
- * Scan Chain by Delta/OI (Quick, Leap), Deep Dive and Hedge. There is no
- * Risky tab any more. Place Trades is deliberately NOT exposed here — it
- * executes real trades, and a home-screen icon is too easy to tap by accident.
+ * dispatcher) are wired up here: every Flip, CSP and Long menu action that does not
+ * ask you to type something (scan, promote, update universe, stats, grading,
+ * alerts, schedules, dry runs), plus Daily Research, Deep Dive and Hedge.
+ * Quick and Leap actions were removed (no longer used). The one-ticker debug
+ * tools are NOT here because they ask for a ticker in a pop-up. Place Trades is
+ * deliberately NOT exposed here: it executes real trades, and a home-screen icon is too easy to tap by accident.
  *
  * DEEP DIVE SCAN: runs off whatever ticker and settings are already in the
  * DeepDive sheet's row 2 (no input field on this page) — update those
@@ -46,17 +47,48 @@
 // (shown at the bottom of every page) after redeploying — the single
 // fastest way to confirm the live web app actually matches what's in the
 // editor, rather than guessing based on symptoms.
-const MOBILE_REMOTE_VERSION = 'v10';
+const MOBILE_REMOTE_VERSION = 'v12';
 
 const MOBILE_REMOTE_ACTIONS = {
-  'validate-quick': { label: 'Validate & Update \u2014 Quick', run: function () { return runValidateForSheet_('Quick'); } },
-  'validate-leap': { label: 'Validate & Update \u2014 Leap', run: function () { return runValidateForSheet_('Leap'); } },
-  'pipeline': { label: 'Run Daily Pipeline (Research + Promote)', run: function () { return runDailyPipelineForRemote_(); } },
-  'research': { label: 'Run Daily Research only', run: function () { return runResearchForRemote_(); } },
-  'schedule-start': { label: 'Start Quick Schedule (alerts + auto-run)', run: function () { return runScheduleActionForRemote_(startQuickSchedule_); } },
-  'schedule-stop': { label: 'Stop Quick Schedule', run: function () { return runScheduleActionForRemote_(stopQuickSchedule_); } },
-  'scan-quick': { label: 'Scan Chain by Delta/OI \u2014 Quick', run: function () { return runScanForSheet_('Quick'); } },
-  'scan-leap': { label: 'Scan Chain by Delta/OI \u2014 Leap', run: function () { return runScanForSheet_('Leap'); } },
+  // ---- Flip ----
+  'flip-scan': { label: 'Run Flip Scan', run: function () { return runLoggedForRemote_(runFlipScan); } },
+  'flip-promote': { label: 'Promote Research Picks to Flip', run: function () { return runLoggedForRemote_(runFlipPromote); } },
+  'flip-universe': { label: 'Update Flip Universe', run: function () { return runLoggedForRemote_(flipUpdateUniverse); } },
+  'flip-stats': { label: 'Build Flip Stats', run: function () { return runLoggedForRemote_(flipBuildStats); } },
+  'flip-grade': { label: 'Grade Past Flip Signals', run: function () { return runLoggedForRemote_(flipGradeSignals); } },
+  'flip-alert-test': { label: 'Send Test Flip Alert', run: function () { return runLoggedForRemote_(sendTestFlipAlert_); } },
+  'flip-alert-toggle': { label: 'Turn Flip Alerts On / Off', run: function () { return runLoggedForRemote_(toggleFlipAlerts_); } },
+  'flip-sched-start': { label: 'Start Flip Schedule', run: function () { return runLoggedForRemote_(startFlipSchedule_); } },
+  'flip-sched-stop': { label: 'Stop Flip Schedule', run: function () { return runLoggedForRemote_(stopFlipSchedule_); } },
+  'flip-sched-status': { label: 'Flip Schedule Status', run: function () { return runLoggedForRemote_(flipScheduleStatus_); } },
+  'flip-scan-dry': { label: 'Flip Scan Dry Run (no writes)', run: function () { return runLoggedForRemote_(runFlipScanDryRun); } },
+  'flip-promote-dry': { label: 'Flip Promote Dry Run (no writes)', run: function () { return runLoggedForRemote_(runFlipPromoteDryRun); } },
+  // ---- CSP ----
+  'csp-scan': { label: 'Run CSP Scan', run: function () { return runLoggedForRemote_(runCspScan); } },
+  'csp-promote': { label: 'Promote Research Picks to CSP', run: function () { return runLoggedForRemote_(runCspPromote); } },
+  'csp-universe': { label: 'Update CSP Universe', run: function () { return runLoggedForRemote_(cspUpdateUniverse); } },
+  'csp-detail': { label: 'Show / Hide CSP Detail Columns', run: function () { return runLoggedForRemote_(cspToggleDetailColumns_, 'Detail columns on the CSP tab were toggled (shown if they were hidden, hidden if they were shown).'); } },
+  'csp-alert-test': { label: 'Send Test CSP Alert', run: function () { return runLoggedForRemote_(sendTestCspAlert_); } },
+  'csp-alert-toggle': { label: 'Turn CSP Alerts On / Off', run: function () { return runLoggedForRemote_(toggleCspAlerts_); } },
+  'csp-sched-start': { label: 'Start CSP Schedule', run: function () { return runLoggedForRemote_(startCspSchedule_); } },
+  'csp-sched-stop': { label: 'Stop CSP Schedule', run: function () { return runLoggedForRemote_(stopCspSchedule_); } },
+  'csp-sched-status': { label: 'CSP Schedule Status', run: function () { return runLoggedForRemote_(cspScheduleStatus_); } },
+  'csp-scan-dry': { label: 'CSP Scan Dry Run (no writes)', run: function () { return runLoggedForRemote_(runCspScanDryRun); } },
+  'csp-promote-dry': { label: 'CSP Promote Dry Run (no writes)', run: function () { return runLoggedForRemote_(runCspPromoteDryRun); } },
+  // ---- Long ----
+  'long-scan': { label: 'Run Long Scan', run: function () { return runLoggedForRemote_(runLongScan); } },
+  'long-promote': { label: 'Promote Research Picks to Long', run: function () { return runLoggedForRemote_(runLongPromote); } },
+  'long-universe': { label: 'Update Long Universe', run: function () { return runLoggedForRemote_(longUpdateUniverse); } },
+  'long-detail': { label: 'Show / Hide Long Detail Columns', run: function () { return runLoggedForRemote_(longToggleDetailColumns_, 'Detail columns on the Long tab were toggled (shown if they were hidden, hidden if they were shown).'); } },
+  'long-alert-test': { label: 'Send Test Long Alert', run: function () { return runLoggedForRemote_(sendTestLongAlert_); } },
+  'long-alert-toggle': { label: 'Turn Long Alerts On / Off', run: function () { return runLoggedForRemote_(toggleLongAlerts_); } },
+  'long-sched-start': { label: 'Start Long Schedule', run: function () { return runLoggedForRemote_(startLongSchedule_); } },
+  'long-sched-stop': { label: 'Stop Long Schedule', run: function () { return runLoggedForRemote_(stopLongSchedule_); } },
+  'long-sched-status': { label: 'Long Schedule Status', run: function () { return runLoggedForRemote_(longScheduleStatus_); } },
+  'long-scan-dry': { label: 'Long Scan Dry Run (no writes)', run: function () { return runLoggedForRemote_(runLongScanDryRun); } },
+  'long-promote-dry': { label: 'Long Promote Dry Run (no writes)', run: function () { return runLoggedForRemote_(runLongPromoteDryRun); } },
+  // ---- Other ----
+  'research': { label: 'Run Daily Research', run: function () { return runResearchForRemote_(); } },
   'deepdive': { label: 'Run Deep Dive Scan', run: function () { return runDeepDiveScanSafe_(); } },
   'hedge': { label: 'Run Hedge Analysis', run: function () { return runHedgeForRemote_(); } }
 };
@@ -81,20 +113,14 @@ function getLatestLogText_(sinceTimeMs) {
   }).join('\n\n');
 }
 
-function runValidateForSheet_(sheetName) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-  if (!sheet) return 'Sheet "' + sheetName + '" not found.';
+// Runs one menu function with no arguments (so it sees no Sheets UI and writes its summary to the ScriptLog), then reads that
+// summary back for the phone. fallbackText is shown when the function writes nothing to the log.
+function runLoggedForRemote_(fn, fallbackText) {
   const startTimeMs = new Date().getTime();
-  validateAndUpdate(sheet);
-  return getLatestLogText_(startTimeMs);
-}
-
-function runScanForSheet_(sheetName) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-  if (!sheet) return 'Sheet "' + sheetName + '" not found.';
-  const startTimeMs = new Date().getTime();
-  scanOptionChainForBestOi(sheet);
-  return getLatestLogText_(startTimeMs);
+  fn();
+  const text = getLatestLogText_(startTimeMs);
+  if (fallbackText && text.indexOf('(No new ScriptLog entries') === 0) return fallbackText;
+  return text;
 }
 
 function runHedgeForRemote_() {
@@ -106,28 +132,6 @@ function runHedgeForRemote_() {
 function runResearchForRemote_() {
   const startTimeMs = new Date().getTime();
   runDailyResearch();
-  return getLatestLogText_(startTimeMs);
-}
-
-// Unlike every other action here, the pipeline outlives this single
-// trigger call — it self-schedules across several more runs over
-// (sometimes many) minutes via its own separate trigger. Reporting back
-// via getLatestLogText_ the way other actions do would show "completed"
-// after just the first partial stage, which would be misleading — so
-// this returns a fixed, honest "started" message instead of waiting for
-// or implying a finished result.
-function runDailyPipelineForRemote_() {
-  runDailyPipeline();
-  return 'Daily Pipeline started \u2014 Research, then Promote, then it stops (Best Open Interest is run manually). ' +
-    'It runs in stages over several minutes and keeps going in the background even after this page shows complete. ' +
-    'Starting it cleared the old ScriptLog rows; check the ScriptLog tab for the final summary once it finishes.';
-}
-
-// Start/Stop Quick Schedule use tryGetUi_() and write their confirmation to the ScriptLog when no Sheets UI is attached
-// (always the case here), so the generic log read-back is exactly the message the sheet menu would have shown as a pop-up.
-function runScheduleActionForRemote_(fn) {
-  const startTimeMs = new Date().getTime();
-  fn();
   return getLatestLogText_(startTimeMs);
 }
 
@@ -264,11 +268,16 @@ function escapeHtml_(text) {
 
 function renderHomePage_(baseUrl) {
   const groups = [
-    { title: 'Validate & Update', keys: ['validate-quick', 'validate-leap'] },
-    { title: 'Daily Pipeline', keys: ['pipeline', 'research'] },
-    { title: 'Quick Schedule', keys: ['schedule-start', 'schedule-stop'] },
-    { title: 'Scans', keys: ['scan-quick', 'scan-leap', 'deepdive'] },
-    { title: 'Hedge', keys: ['hedge'] }
+    { title: 'Flip', keys: ['flip-scan', 'flip-promote', 'flip-universe', 'flip-stats', 'flip-grade'] },
+    { title: 'Flip Alerts & Schedule', keys: ['flip-alert-test', 'flip-alert-toggle', 'flip-sched-start', 'flip-sched-stop', 'flip-sched-status'] },
+    { title: 'Flip Dry Runs', keys: ['flip-scan-dry', 'flip-promote-dry'] },
+    { title: 'CSP', keys: ['csp-scan', 'csp-promote', 'csp-universe', 'csp-detail'] },
+    { title: 'CSP Alerts & Schedule', keys: ['csp-alert-test', 'csp-alert-toggle', 'csp-sched-start', 'csp-sched-stop', 'csp-sched-status'] },
+    { title: 'CSP Dry Runs', keys: ['csp-scan-dry', 'csp-promote-dry'] },
+    { title: 'Long', keys: ['long-scan', 'long-promote', 'long-universe', 'long-detail'] },
+    { title: 'Long Alerts & Schedule', keys: ['long-alert-test', 'long-alert-toggle', 'long-sched-start', 'long-sched-stop', 'long-sched-status'] },
+    { title: 'Long Dry Runs', keys: ['long-scan-dry', 'long-promote-dry'] },
+    { title: 'Other', keys: ['research', 'deepdive', 'hedge'] }
   ];
 
   const sections = groups.map(function (g) {
@@ -291,7 +300,7 @@ function renderHomePage_(baseUrl) {
     '<h1>Options Validator Remote <span class="version-badge">' + MOBILE_REMOTE_VERSION + '</span></h1>' +
     statusBanner +
     sections +
-    '<p class="hint">Tapping a button starts the run in the background and confirms immediately \u2014 refresh or reopen this page any time to check on it. Deep Dive runs off whatever ticker/settings are already in the DeepDive sheet. Place Trades is not available here.</p>' +
+    '<p class="hint">Tapping a button starts the run in the background and confirms immediately \u2014 refresh or reopen this page any time to check on it. Deep Dive runs off whatever ticker/settings are already in the DeepDive sheet. The one-ticker debug tools and Place Trades are not available here.</p>' +
     '</body></html>';
 }
 
