@@ -1359,7 +1359,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
       if (map['Change']) sheet.getRange(2, map['Change'], data.length, 1).setNumberFormat(FLIP_CHANGE_FORMAT);
       flipColorRows_(sheet, map, data.length);
       flipApplyRules_(sheet, map, true);
-      if (full) flipSortRows_(sheet, map, data, sortKeyByIdx);
+      if (full) flipSortRows_(sheet, map, data, sortKeyByIdx, jayByIdx);
       flipCacheFlush_(pending);
       if (logItems.length) flipAppendLog_(logItems, now);
     }
@@ -1394,14 +1394,21 @@ function flipColorRows_(sheet, map, n) {
 }
 
 
-// Orders the rows (STOP / SELL first, then HOLD, BUY, READY, BLOCKED, WAIT, SKIP) without a SortKey column on the sheet:
+// Orders the rows by Jay tier (High > Medium > Low > none), then within each tier (STOP / SELL first, then HOLD, BUY, READY, BLOCKED, WAIT, SKIP) without a SortKey column on the sheet:
 // a temporary column carries the keys for the sort and is deleted straight after. Rows keep their inputs and formulas.
-function flipSortRows_(sheet, map, data, keys) {
+function flipSortRows_(sheet, map, data, keys, jayByIdx) {
   const n = data.length;
   if (n < 2) return;
   const a = map['Action'] - 1, sc = map['Score'] - 1;
+  // Jay tier comes first (High, then Medium, then Low, then no tier); the existing Action/Score order breaks ties inside each tier.
+  const jc = map['Jay'] ? map['Jay'] - 1 : -1;
+  const jayTier = function (i, r) {
+    const v = String((jayByIdx && jayByIdx[i] !== undefined) ? jayByIdx[i] : (jc >= 0 ? r[jc] : '')).toLowerCase();
+    return v.indexOf('high') === 0 ? 3 : (v.indexOf('medium') === 0 ? 2 : (v.indexOf('low') === 0 ? 1 : 0));
+  };
   const col = data.map(function (r, i) {
-    return [keys[i] !== undefined ? keys[i] : flipSortKey_(String(r[a] || ''), flipNum_(r[sc]) || 0, 0)];
+    const k = keys[i] !== undefined ? keys[i] : flipSortKey_(String(r[a] || ''), flipNum_(r[sc]) || 0, 0);
+    return [jayTier(i, r) * 100000 + k];
   });
   const lastC = sheet.getLastColumn();
   sheet.insertColumnAfter(lastC);
