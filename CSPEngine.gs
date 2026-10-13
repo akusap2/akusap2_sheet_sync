@@ -962,7 +962,7 @@ function cspProcessRow_(inp, ctx) {
     out['Open Action'] = oa.action ? (oa.action) : '';
     out._openWhy = oa.why; out._openPl = pl; openAction = oa.action;
     // The row now describes the put you hold: Strike / Expiry / Mid stay as typed, the rest is live data for that contract.
-    out.Action = oa.action || 'HOLD'; out.Score = ''; out.DTE = dteLeft;
+    out.Action = oa.action || 'HOLD'; out.DTE = dteLeft;
     try {
       if (ctx.token) {
         const occ = occUsed || buildOccSymbol_(t, inp.openExpiry, inp.openStrike, 'P');
@@ -1008,6 +1008,19 @@ function cspProcessRow_(inp, ctx) {
         }
       }
     } catch (e) { /* optional */ }
+    // Score for a put you hold: the same 0-100 scoring a new put gets, applied to the position as it stands today (not an entry signal).
+    // Annualized is on your credit (needs Open Date; neutral when missing); Cushion uses the live put, or the credit-based estimate when there is no quote.
+    try {
+      out.Score = cspScore_({
+        annualized: out['Annualized %'] != null && out['Annualized %'] !== '' ? out['Annualized %'] : 15,
+        ivRank: ctx.ivRanks[t] != null ? ctx.ivRanks[t] : null,
+        cushionEm: out['Cushion EM'] != null && out['Cushion EM'] !== '' ? out['Cushion EM'] : null,
+        vs50: vs50, vs200: vs200, offHigh: offHigh,
+        spreadPct: out['Spread %'] != null && out['Spread %'] !== '' ? out['Spread %'] : null,
+        oi: out.OI != null && out.OI !== '' ? out.OI : null,
+        earnGapDays: isEtf ? 30 : (earnDays != null ? earnDays - dteLeft : null)
+      });
+    } catch (e) { out.Score = ''; }
     if (out.Mid !== undefined && out.Mid !== '' && inp.openCredit > 0) out.PNL = Math.round((inp.openCredit - out.Mid) * 100) / 100;
     out.Why = [(earnDays != null && earnDays <= dteLeft) ? 'earnings in ' + earnDays + ' days, inside this put\'s life' : '',
       mark == null ? 'NO LIVE QUOTE' + (quoteWhy ? ': ' + quoteWhy : '') : '', quoteNote, estNote].filter(function (z) { return z; }).join(' | ');

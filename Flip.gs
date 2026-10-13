@@ -1090,6 +1090,19 @@ function flipProcessHeld_(rw, env) {
   const exit = (iv && plPct != null) ? evaluateQuickExit_(iv, plPct, env.S) : { exit: false, fading: false };
   const act = flipHeldAction_({ plPct: plPct, days: days, stopPct: stopPct, stopPrice: rw.entry * (1 - stopPct / 100), exit: exit, rsi: iv ? iv.rsi1m : null, earnDays: earnDays }, C);
   res['Action'] = act.action; res['Why'] = act.why; res._held = true; res._plPct = plPct;
+  // Score for a position you hold: the same 0-100 scoring a new entry gets, applied to the setup as it stands today (not an entry signal).
+  try {
+    if (f && price && mid) {
+      const intrinsic = Math.max(price - rw.strike, 0);
+      const extPct = mid > 0 ? (mid - intrinsic) / mid * 100 : null;
+      const trendOk = !!(iv && iv.aroonUp >= env.S.trendAupMin && iv.aroonDown <= env.S.trendAdnMax);
+      const ev = (iv && geo) ? evaluateEntryLevel_(iv, env.S, env.spyHead, geo.need) : { level: null, bounce: null };
+      const offH = res['Off High %'] !== undefined && res['Off High %'] !== '' ? res['Off High %'] : null;
+      res['Score'] = flipScore_({ level: ev.level, bounce: !!ev.bounce, trendOk: trendOk, priceAbove20: price > f.sma20, slopeUp: f.slopeUp, rs5: f.rs5,
+        offHigh: offH, spreadPct: res['Spread %'] !== undefined && res['Spread %'] !== '' ? res['Spread %'] : null, delta: q ? q.delta : null, extPct: extPct,
+        oi: q && q.openInterest != null ? q.openInterest : null, edgeNeeded: geo ? geo.edgeNeeded : null, earnDays: earnDays });
+    }
+  } catch (e) { /* score is informational */ }
   return res;
 }
 

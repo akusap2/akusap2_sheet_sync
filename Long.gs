@@ -876,6 +876,11 @@ function longProcessRow_(inp, ctx) {
         ivPercent: tech.hv20, bidAskSpreadPct: m.spreadPct, ivRank: ivr, daysToCatalyst: earnDays, momentumPercent: tech.ret5, trendPercent: vs20 });
       if (rk) { out.Risk = rk.risk; out['Risk 10%'] = rk.tierProbabilities[0] * 100; out['Risk 30%'] = rk.tierProbabilities[2] * 100; }
     }
+    // Score for a position you hold: the same 0-100 scoring a new candidate gets, applied to the position as it stands today (not an entry signal).
+    try {
+      out.Score = longScore_({ quality: inp.quality, vs200: vs200, x50: x50, rsi: tech.rsi, offHigh: offHigh, ivr: ivr, carry: m.carry, delta: c.delta,
+        upside: upside, ret21: tech.ret21, rs: rs }).score;
+    } catch (e) { /* score is informational */ }
     out.SortKey = longSortKey_(ha.action, null, pl);
     return out;
   }
