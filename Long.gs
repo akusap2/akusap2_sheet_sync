@@ -147,12 +147,12 @@ const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w Hig
   'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
 // Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
 const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
-// Columns you fill with your own sheet formulas (Entry, P/L $): the scan reads Entry's value but NEVER writes or clears either one.
-// P/L $ is still computed in memory for the Action and alerts; the formula owns the cell.
+// Headers you replaced with your own total formula in row 1 (Entry: SUMPRODUCT, P/L $: SUM). Setup never adds these headers back;
+// the scan finds the columns by position instead (see longHeaderMap_) and keeps writing P/L $ per row.
 const LONG_FORMULA_HEADERS = ['P/L $', 'Entry'];
 const LONG_HEADERS = LONG_VISIBLE_HEADERS.concat(LONG_DETAIL_HEADERS).concat(LONG_EXTRA_HEADERS.filter(function (h) { return LONG_VISIBLE_HEADERS.indexOf(h) === -1; }));   // Quality is visible, Source / Type hidden
 // Columns the scan writes (everything except your inputs and the promote-managed ones).
-const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1 && LONG_FORMULA_HEADERS.indexOf(h) === -1; });
+const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1; });
 
 
 /* ============================================================================
@@ -227,9 +227,11 @@ function longHeaderMap_(sheet) {
   const row = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
   const map = {};
   row.forEach(function (h, i) { const k = String(h || '').trim(); if (k && map[k] == null) map[k] = i + 1; });
-  // Entry (and P/L $) can be your own formula columns whose header cell shows a number or total instead of the name.
-  // Entry is then the column right after "Entry Date"; P/L $ is never needed because the scan never writes it.
+  // Entry and P/L $ headers may be replaced by your own total formulas (the cell shows a number, not the name): find them by position.
+  // Entry is the column right after "Entry Date".
   if (map['Entry'] == null && map['Entry Date'] != null) map['Entry'] = map['Entry Date'] + 1;
+  // P/L $ sits between Days and Why; the scan writes the per-row value there (your row-1 formula can total it).
+  if (map['P/L $'] == null && map['Days'] != null && map['Why'] === map['Days'] + 2) map['P/L $'] = map['Days'] + 1;
   return map;
 }
 
