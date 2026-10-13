@@ -147,9 +147,12 @@ const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w Hig
   'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
 // Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
 const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
+// Columns you fill with your own sheet formulas (Entry, P/L $): the scan reads Entry's value but NEVER writes or clears either one.
+// P/L $ is still computed in memory for the Action and alerts; the formula owns the cell.
+const LONG_FORMULA_HEADERS = ['P/L $', 'Entry'];
 const LONG_HEADERS = LONG_VISIBLE_HEADERS.concat(LONG_DETAIL_HEADERS).concat(LONG_EXTRA_HEADERS.filter(function (h) { return LONG_VISIBLE_HEADERS.indexOf(h) === -1; }));   // Quality is visible, Source / Type hidden
 // Columns the scan writes (everything except your inputs and the promote-managed ones).
-const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1; });
+const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1 && LONG_FORMULA_HEADERS.indexOf(h) === -1; });
 
 
 /* ============================================================================
@@ -216,7 +219,7 @@ function runLongPromoteDryRun() { return longPromoteFromResearch_({ dryRun: true
 
 
 /* ============================================================================
- * SHEET HELPERS (plain headers: no formula-header handling — Entry is a normal input column here)
+ * SHEET HELPERS (Entry and P/L $ may be your own formula columns; see longHeaderMap_)
  * ========================================================================== */
 
 function longHeaderMap_(sheet) {
@@ -224,6 +227,9 @@ function longHeaderMap_(sheet) {
   const row = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
   const map = {};
   row.forEach(function (h, i) { const k = String(h || '').trim(); if (k && map[k] == null) map[k] = i + 1; });
+  // Entry (and P/L $) can be your own formula columns whose header cell shows a number or total instead of the name.
+  // Entry is then the column right after "Entry Date"; P/L $ is never needed because the scan never writes it.
+  if (map['Entry'] == null && map['Entry Date'] != null) map['Entry'] = map['Entry Date'] + 1;
   return map;
 }
 
@@ -237,6 +243,7 @@ function longEnsureHeaders_(sheet) {
     let next = existing.length;
     while (next > 0 && existing[next - 1] === '') next--;
     LONG_HEADERS.forEach(function (h) {
+      if (LONG_FORMULA_HEADERS.indexOf(h) !== -1) return;   // your formula columns: never add them back
       if (existing.indexOf(h) === -1) { next++; sheet.getRange(1, next).setValue(h); existing[next - 1] = h; }
     });
   }
@@ -303,6 +310,7 @@ function longFormatSheet_(sheet) {
   LONG_INPUT_HEADERS.concat(LONG_HELD_WHEN_OPEN).forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
   LONG_OUTPUT_HEADERS.forEach(function (h) { if (map[h] && LONG_HELD_WHEN_OPEN.indexOf(h) === -1) sheet.getRange(1, map[h]).setBackground('#d9ead3'); });
   LONG_EXTRA_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#cfe2f3'); });
+  LONG_FORMULA_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
   longApplyChangeRules_(sheet, map, false);
   sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
 }
@@ -570,6 +578,28 @@ function longQuoteContract_(ticker, expiry, strike, ctx, now) {
     bid: md ? md.bid : null, ask: md ? md.ask : null, delta: md ? md.delta : null, oi: md ? md.oi : null, volume: md ? md.volume : null };
 }
 
+
+// Only runs when a held contract has no usable quote: asks the chain why (expiry not listed? strike not listed? just no quote yet?).
+function longExplainMissingQuote_(ticker, expiry, strike, ctx, now) {
+  if (!ctx.token) return 'no TastyTrade token';
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain || !chain.length) return 'no option chain returned for ' + ticker;
+  const want = longYmd_(expiry);
+  const exp = chain.filter(function (e) { return longYmd_(e.date) === want; })[0];
+  if (!exp) {
+    const near = chain.map(function (e) { return { d: longYmd_(e.date), gap: Math.abs(e.date.getTime() - expiry.getTime()) }; })
+      .sort(function (a, b) { return a.gap - b.gap; }).slice(0, 3).map(function (x) { return x.d; });
+    return 'expiry ' + want + ' is not listed (nearest: ' + near.join(', ') + ') - check the Expiry cell';
+  }
+  const hit = exp.strikes.filter(function (s) { return Math.abs(s.strike - strike) < 0.001 && s.callSymbol; })[0];
+  if (!hit) {
+    const near = exp.strikes.filter(function (s) { return s.callSymbol; })
+      .sort(function (a, b) { return Math.abs(a.strike - strike) - Math.abs(b.strike - strike); }).slice(0, 3).map(function (s) { return s.strike; });
+    return 'strike ' + strike + ' is not listed for ' + want + ' (nearest: ' + near.join(', ') + ') - check the Strike cell';
+  }
+  return 'contract is listed but TastyTrade returned no bid/ask yet';
+}
+
 // Full pick from the Tasty chain: the expiries nearest the target DTE, the strikes nearest 84% of spot, one batched quote call.
 function longPickContract_(ticker, spot, ctx) {
   const K = LONG_CONFIG.contract, now = ctx.now;
@@ -711,9 +741,11 @@ function longProcessRow_(inp, ctx) {
       } catch (e) { /* leave null */ }
       if (mark != null) m = longContractMetrics_({ bid: mark, ask: mark, delta: c.delta, strike: c.strike, dte: c.dte }, spot);
     }
+    let noQuoteWhy = '';
+    if (mark == null) { try { noQuoteWhy = longExplainMissingQuote_(t, inp.openExpiry, inp.openStrike, ctx, now); } catch (e) { noQuoteWhy = 'no quote for this contract'; } }
     const pl = (mark != null && inp.openEntry > 0) ? (mark / inp.openEntry - 1) * 100 : null;
     const ha = longHeldAction_({ dte: c.dte, pl: pl, spot: spot, tech: tech, upside: upside, quality: inp.quality, isEtf: isEtf, carry: m.carry }, cfg);
-    out.Action = ha.action; out.Why = 'HELD: ' + ha.why;
+    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '');
     out.Strike = inp.openStrike; out.Expiry = inp.openExpiry; out.DTE = c.dte;
     if (mark != null) out.Mid = mark;
     if (c.delta != null) out.Delta = c.delta;
@@ -790,7 +822,7 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
   data.forEach(function (r, i) {
     const t = String(r[map['Ticker'] - 1] || '').trim().toUpperCase();
     if (!t) return;
-    const num = function (h) { const v = r[map[h] - 1]; const n = (v === '' || v == null) ? null : parseFloat(v); return isNaN(n) ? null : n; };
+    const num = function (h) { const v = r[map[h] - 1]; const n = (v === '' || v == null) ? null : (typeof v === 'number' ? v : parseFloat(String(v).replace(/[$,%\s]/g, ''))); return isNaN(n) ? null : n; };
     const qty = num('Qty');
     const holdCells = qty != null && qty > 0;
     const oStrike = holdCells ? num('Strike') : null;
@@ -885,7 +917,15 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
 
 function longParseDate_(v) {
   if (v == null || v === '') return null;
-  if (longIsDate_(v)) return v;
+  if (longIsDate_(v)) {
+    // A date cell is midnight in the SPREADSHEET's time zone, which can differ from the script's: midnight GMT is the previous evening
+    // in New York, so Dec 15 became Dec 14 and no contract matched. Take the calendar day as the sheet shows it and pin it to noon.
+    try {
+      const sheetTz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      const p = Utilities.formatDate(v, sheetTz, 'yyyy-MM-dd').split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12, 0, 0);
+    } catch (e) { return v; }
+  }
   const d = new Date(String(v));
   return isNaN(d.getTime()) ? null : d;
 }
