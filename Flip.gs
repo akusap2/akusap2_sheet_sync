@@ -294,7 +294,8 @@ function flipAddMenu_() {
       .addSeparator()
       .addItem('▶ Start Flip Schedule (every 5 min, market hours)', 'startFlipSchedule_')
       .addItem('■ Stop Flip Schedule', 'stopFlipSchedule_')
-      .addItem('Schedule Status', 'flipScheduleStatus_'))
+      .addItem('Schedule Status', 'flipScheduleStatus_')
+      .addItem('Clear Stuck Run', 'flipClearStuckRun_'))
     .addSubMenu(ui.createMenu('🔍 Flip Debug')
       .addItem('One Ticker (full decision trail)', 'debugFlipOneTicker')
       .addItem('Scan Dry Run (no writes)', 'runFlipScanDryRun')
@@ -1224,8 +1225,20 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
   const sheet = ss.getSheetByName(FLIP_SHEET_NAME);
   if (!sheet) { notify_(ui, 'Flip', 'No "' + FLIP_SHEET_NAME + '" tab. Run setupFlip once from the Apps Script editor.'); return null; }
   const props = PropertiesService.getScriptProperties();
-  const running = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10);
-  if (running && Date.now() - running < 10 * 60000) { notify_(ui, 'Flip', 'A Flip run is already in progress. Try again in a minute.'); return null; }
+  // One run at a time. A flag older than 7 minutes is a crashed run (Apps Script stops any run at 6), so it is ignored.
+  // A manual run that finds a run in progress waits for it (up to 2 minutes, inside this run's own time budget) instead of giving up.
+  const stillRunning = function () { const t0 = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10); return (t0 && Date.now() - t0 < FLIP_STALE_RUN_MS) ? t0 : 0; };
+  let blockedBy = stillRunning();
+  if (blockedBy && !(opts && opts.quiet)) {
+    const waitUntil = Date.now() + 120000;
+    while (blockedBy && Date.now() < waitUntil) { Utilities.sleep(5000); blockedBy = stillRunning(); }
+  }
+  if (blockedBy) {
+    const secAgo = Math.round((Date.now() - blockedBy) / 1000);
+    notify_(ui, 'Flip', 'A Flip run (' + (props.getProperty('FLIP_RUNNING_SRC') || 'unknown') + ') started ' + secAgo + 's ago and is still going. ' +
+      (opts && opts.quiet ? '' : 'Waited 2 minutes for it. ') + 'If it never finishes, use 🔁 Flip > Alerts & Schedule > Clear Stuck Run.');
+    return null;
+  }
 
   const map = flipEnsureHeaders_(sheet);
   const lastRow = sheet.getLastRow();
@@ -1236,6 +1249,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
   if (!rows.length) { notify_(ui, 'Flip', 'No tickers found in column A.'); return null; }
 
   props.setProperty('FLIP_RUNNING', String(Date.now()));
+  props.setProperty('FLIP_RUNNING_SRC', (opts && opts.quiet) ? 'scheduled' : 'manual');
   try {
     const cache = flipCacheLoad_();
     const pending = {};
@@ -1568,6 +1582,7 @@ function toggleFlipAlerts_() {
  * ========================================================================== */
 
 const FLIP_TICK_FN = 'flipScheduledTick_';
+const FLIP_STALE_RUN_MS = 7 * 60000;   // Apps Script stops every run at 6 minutes, so a longer-lived flag is a crashed run
 
 function flipEtParts_(now) {
   const tz = 'America/New_York';
@@ -1594,6 +1609,14 @@ function startFlipSchedule_() {
 
 function stopFlipSchedule_() { notify_(tryGetUi_(), 'Flip schedule', 'Stopped (' + flipRemoveTriggers_() + ' trigger(s) removed).'); }
 
+// Removes the "run in progress" flag. Only needed if a run crashed and the message keeps appearing for more than 7 minutes.
+function flipClearStuckRun_() {
+  const props = PropertiesService.getScriptProperties();
+  const t0 = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10);
+  props.deleteProperty('FLIP_RUNNING'); props.deleteProperty('FLIP_RUNNING_SRC');
+  notify_(tryGetUi_(), 'Flip', t0 ? 'Cleared a run flag that was ' + Math.round((Date.now() - t0) / 1000) + 's old. If a run really is still going, wait for it before starting another.' : 'No run was marked in progress.');
+}
+
 function flipScheduleStatus_() {
   const props = PropertiesService.getScriptProperties();
   const n = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === FLIP_TICK_FN; }).length;
@@ -1613,7 +1636,7 @@ function flipScheduledTick_() {
   const inMarket = p.hhmm >= S.startHHmm && p.hhmm <= S.endHHmm;
   const props = PropertiesService.getScriptProperties();
   const running = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10);
-  if (running && Date.now() - running < 10 * 60000) return;
+  if (running && Date.now() - running < FLIP_STALE_RUN_MS) return;
   const mark = function (k) { props.setProperty(k, p.ymd); };
 
   if (!inMarket) {
