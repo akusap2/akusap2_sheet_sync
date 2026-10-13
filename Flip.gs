@@ -1,776 +1,24 @@
 /* ============================================================================
- * FlipEngine.gs — "Flip" tab: short-hold trades in deep in-the-money calls (stock proxies)
+ * LONG — deep in-the-money LEAP calls as a stock substitute on moat companies
+ * (replaces the Leap tab; same objective)
  * ----------------------------------------------------------------------------
- * OBJECTIVE (same as Quick): take a small profit on the option premium fast.
- *   +3% within about 5 trading days (+1.5% if it is the same day), then get out. If it has
- *   not worked by day 7 cut it loose; no position is carried past day 10.
+ * Objective: own a solid, moat business through a 1-2 year call (delta about 0.85) for far less capital than 100
+ * shares, hold it for a long time, take profit when it is good, leave on a trend break, and if the premium is likely
+ * to drop in the next month, wait for the dip.
  *
- * WHAT IS DIFFERENT FROM QUICK (built from the Results log, see claude/flip_tab_proposal):
- *   1. EXPECTANCY, NOT WIN RATE. Every row shows what the trade costs you in skill:
- *      Need % (stock move for the target after the spread), P Hit % (chance the target is hit
- *      before the stop on a random walk) and Edge Needed (points of win rate above random you
- *      must deliver to break even). A small target with a wide stop wins often and loses big;
- *      on a random walk that nets to about zero before the spread.
- *   2. EVERY ROW HAS A STOP. Stop = 1 daily ATR of the stock, converted to option %, clamped
- *      to 6-14%. Plus a time-stop at day 7 and a hard cut at day 10.
- *   3. PORTFOLIO GUARDS. BLOCKED when: too many open positions, too many in one theme, too many
- *      entries today, or the open book is already down more than the limit.
- *   4. STOCK-PROXY CONTRACT RULE. Delta >= 0.75, spread <= 1.5%, time value capped. Among the
- *      contracts that pass, the one with the lowest friction (spread + decay) per unit of
- *      leverage wins.
- *   5. FALLING-KNIFE FILTER. Stocks more than 40% under their 52-week high are SKIP.
- *   6. SELF-GRADING. Every BUY / READY signal is logged (FlipLog) and graded 1-10 days later
- *      against daily highs/lows, independent of what you did. FlipStats compares the
- *      hit rate with the P Hit % the sheet predicted, counts open positions in the win
- *      rate, and shows concentration, hold times and per-ticker results.
+ * Apps Script only — no Cloud Function redeploy. Reuses from other files (called at run time, never at load time):
+ *   momentum.gs: Tasty/Yahoo fetchers, getSlowCached_, computeLeapPremiumLoss_, sendPhoneAlert_, notify_, logToSheet_
+ *   CSPEngine.gs: cspSma_/cspRsi_/cspHv_, cspFetchIvRanks_, quality scoring (cspQualityStock_ / cspQualityEtf_), cspLin_
  *
- * ENTRY TRIGGER stays your method: 5-minute Aroon up/down trend + 1-minute RSI dip near 30 and
- * turning up (reuses evaluateEntryLevel_ / evaluateQuickExit_ from Momentum.gs). Exits reuse
- * your RSI 65+ rule.
- *
- * SEPARATE FROM QUICK/LEAP/CSP: own tab, own universe + promotion (Fit), own cache sheet
- * (FlipCache), own log (FlipLog), own stats (FlipStats), own trigger, own alert state.
- * Quick is untouched. Shares only Yahoo/Tasty/Cloud Function rate limits and the Telegram setup.
- *
- * SETUP (once): run  setupFlip  from the Apps Script editor (creates the tab + "🔁 Flip" menu).
- * Apps Script only — NO Cloud Function redeploy (uses the existing intraday, daily and option
- * quote endpoints).
- *
- * RE-USES (from the other files): getTastyTradeAccessToken_, fetchTastyOptionChainNested_,
- * fetchTastyMarketDataBatch_, fetchIntradayMap_, fetchOptionQuotesMap_, evaluateEntryLevel_,
- * evaluateQuickExit_, INTRADAY_SIGNAL, marketSessionAt_, sendPhoneAlert_, getAlertConfig_,
- * getCloudFunctionUrl_, getCloudFunctionSharedSecret_, fetchFinnhubNextEarnings_,
- * fetchYahooNextEarnings_, getFinnhubApiKey_, impliedVolatilityBisection_,
- * blackScholesDelta_, blackScholesPrice_, buildOccSymbol_, normCdf_, logToSheet_, notify_,
- * tryGetUi_, round2_, isPlausible_.
+ * Nothing here is backtested. Thresholds are starting values (LONG_CONFIG). Needs a TastyTrade token for option
+ * data (delta, bid/ask, open interest): without it every row says so and is SKIP.
  * ========================================================================== */
 
-const FLIP_SHEET_NAME = 'Flip';
-const FLIP_CACHE_SHEET = 'FlipCache';
-const FLIP_LOG_SHEET = 'FlipLog';
-const FLIP_STATS_SHEET = 'FlipStats';
-const FLIP_RESULTS_SHEET = 'Results';
-const FLIP_QUICK_SHEET = 'Quick';
+const LONG_SHEET_NAME = 'Long';
+const LONG_CACHE_SHEET_NAME = 'LongCache';   // its own cache sheet, like CSPCache, so no other tab's runs get slower
 
-const FLIP_CONFIG = {
-  // --- contract: a stock proxy, not a lottery ticket ------------------------------------------
-  minDte: 150, maxDte: 520, targetDte: 300,
-  minDelta: 0.75,
-  maxSpreadPct: 1.5,          // option bid/ask gap as % of mid (the same cap your Quick signals use)
-  minOi: 100,
-  minMid: 5,
-  maxTimeValuePct: 30,        // time value as % of the option price
-  decayDays: 2,               // expected hold used when pricing decay into friction
-  // --- exits ----------------------------------------------------------------------------------
-  targetPct: 3,               // net of the selling spread
-  sameDayTargetPct: 1.5,
-  horizonDays: 5,             // "within about 5 trading days"
-  stopAtrMult: 1.0,           // stop distance = this x daily ATR% of the stock (in stock terms)
-  stopMinPct: 6, stopMaxPct: 14,   // option % bounds on the stop
-  timeStopDays: 7, hardStaleDays: 10, timeStopMinGainPct: 1.5,
-  // --- entry gates ----------------------------------------------------------------------------
-  maxOffHighPct: 40,          // falling-knife filter: more than this % under the 52-week high -> SKIP
-  minAtrPct: 1.8, maxAtrPct: 9,
-  minPrice: 20,
-  earnBlockDays: 3,           // earnings inside this many days -> SKIP (gap risk, IV crush)
-  maxEdgeNeeded: 10,          // points of win rate above random needed; above this -> WAIT
-  scoreBuy: 60, scoreReady: 45,
-  // --- portfolio guards -----------------------------------------------------------------------
-  maxOpen: 6, maxPerTheme: 2, maxNewPerDay: 3,
-  maxOpenLossPct: 10,         // open book down more than this % of invested -> no new entries
-  riskPerTradeUsd: 500,       // size column: contracts so that the stop costs about this much
-  // --- promotion ------------------------------------------------------------------------------
-  promote: { maxKeep: 30, minFit: 60, minDollarVolM: 1000, removeAfterMisses: 5, timeBudgetMs: 4 * 60 * 1000, probeMaxAgeDays: 4 },
-  // --- runtime --------------------------------------------------------------------------------
-  timeBudgetMs: 4.5 * 60 * 1000, sleepMs: 60,
-  // --- schedule (US/Eastern) ------------------------------------------------------------------
-  schedule: { startHHmm: '09:35', endHHmm: '15:55', fullScanEveryMin: 30, gradeAfterHHmm: '16:10' },
-  alerts: { buyRepeatMin: 120, exitRepeatMin: 60, readyRepeatMin: 240, alertReady: false },
-  logCooldownMin: 60
-};
-
-// Your entry trigger and exit rules come from INTRADAY_SIGNAL (Momentum.gs); Flip overrides only what it must.
-// Built on first use, NOT at file load: a top-level reference to INTRADAY_SIGNAL (momentum.gs) throws "INTRADAY_SIGNAL is not defined" whenever
-// Apps Script loads this file before momentum.gs (file order in the editor decides that).
-let FLIP_SIGNAL_CACHE_ = null;
-function flipSignal_() {
-  if (!FLIP_SIGNAL_CACHE_) FLIP_SIGNAL_CACHE_ = Object.assign({}, INTRADAY_SIGNAL, { exitMinProfitPct: 1.5, bounceLane: true });
-  return FLIP_SIGNAL_CACHE_;
-}
-
-// Looked at by the promotion; the numbers decide who is kept. Liquid, large names with enough daily range to flip.
-const FLIP_UNIVERSE = [
-  'NVDA', 'AMD', 'AVGO', 'MRVL', 'MU', 'ARM', 'TSM', 'ANET', 'CRDO', 'SMCI', 'AMAT', 'LRCX', 'KLAC', 'QCOM', 'INTC', 'DELL',
-  'VRT', 'CEG', 'VST', 'GEV', 'PWR', 'ETN', 'NRG',
-  'MSFT', 'ORCL', 'CRM', 'NOW', 'SNOW', 'DDOG', 'CRWD', 'PANW', 'ZS', 'NET', 'MDB', 'ADBE', 'INTU', 'APP', 'PLTR', 'TEAM', 'OKTA', 'SHOP', 'SNPS', 'CDNS',
-  'META', 'GOOGL', 'AMZN', 'AAPL', 'NFLX', 'UBER', 'DASH', 'ABNB', 'SPOT', 'BKNG', 'RDDT',
-  'TSLA', 'COIN', 'HOOD', 'MSTR', 'MARA', 'IREN', 'HUT',
-  'ASTS', 'RKLB', 'IONQ', 'QBTS', 'RGTI', 'TEM', 'CBRS',
-  'LLY', 'ISRG', 'DHR', 'REGN', 'VRTX', 'UNH', 'ABBV', 'TMO', 'MRNA', 'HUM',
-  'JPM', 'GS', 'MS', 'V', 'MA', 'SCHW', 'SOFI',
-  'BA', 'GE', 'CAT', 'DE', 'FDX', 'LULU', 'NKE', 'SBUX', 'CMG', 'HD', 'WMT', 'COST', 'MCD',
-  'XOM', 'CVX', 'FCX', 'MP', 'FN', 'KLAC', 'ACN', 'IBM', 'CSCO'
-].filter(function (t, i, a) { return a.indexOf(t) === i; });
-
-// Theme = what moves together. Used by the guard that limits positions per theme.
-const FLIP_THEME_GROUPS = {
-  'AI chips': ['NVDA', 'AMD', 'AVGO', 'MRVL', 'MU', 'ARM', 'TSM', 'ANET', 'CRDO', 'SMCI', 'AMAT', 'LRCX', 'KLAC', 'QCOM', 'INTC', 'DELL', 'FN', 'CBRS'],
-  'AI power': ['VRT', 'CEG', 'VST', 'GEV', 'PWR', 'ETN', 'NRG'],
-  'Software': ['MSFT', 'ORCL', 'CRM', 'NOW', 'SNOW', 'DDOG', 'CRWD', 'PANW', 'ZS', 'NET', 'MDB', 'ADBE', 'INTU', 'APP', 'PLTR', 'TEAM', 'OKTA', 'SHOP', 'SNPS', 'CDNS', 'ACN', 'IBM', 'CSCO'],
-  'Internet': ['META', 'GOOGL', 'AMZN', 'AAPL', 'NFLX', 'UBER', 'DASH', 'ABNB', 'SPOT', 'BKNG', 'RDDT'],
-  'EV / autos': ['TSLA'],
-  'Crypto-linked': ['COIN', 'HOOD', 'MSTR', 'MARA', 'IREN', 'HUT', 'RIOT', 'CLSK', 'BITO'],
-  'Space / quantum / spec': ['ASTS', 'RKLB', 'IONQ', 'QBTS', 'RGTI', 'TEM', 'JOBY', 'LUNR'],
-  'Healthcare': ['LLY', 'ISRG', 'DHR', 'REGN', 'VRTX', 'UNH', 'ABBV', 'TMO', 'MRNA', 'HUM'],
-  'Financials': ['JPM', 'GS', 'MS', 'V', 'MA', 'SCHW', 'SOFI'],
-  'Industrial / consumer': ['BA', 'GE', 'CAT', 'DE', 'FDX', 'LULU', 'NKE', 'SBUX', 'CMG', 'HD', 'WMT', 'COST', 'MCD'],
-  'Energy / materials': ['XOM', 'CVX', 'FCX', 'MP']
-};
-const FLIP_THEME_OF = (function () {
-  const o = {};
-  Object.keys(FLIP_THEME_GROUPS).forEach(function (g) { FLIP_THEME_GROUPS[g].forEach(function (t) { o[t] = g; }); });
-  return o;
-})();
-
-// ---- columns ----------------------------------------------------------------------------------
-// What you SEE, in this order. Everything else stays on the sheet, hidden, and is still computed.
-const FLIP_VISIBLE_HEADERS = ['Ticker', 'Entry Date', 'Entry', 'Qty', 'Strike', 'Expiry', 'Action', 'Score', 'Fit', 'P Hit %', 'Edge Needed', 'Jay',
-  'Price', 'Change', 'Trend', 'Off High %', 'Earn Days', 'Mid', 'Spread %', 'Lev', 'Time Val %', 'Need %', 'Target', 'Stop', 'Size',
-  'Days', 'P/L %', 'P/L $', 'Why', 'AUP', 'ADN', 'RSI', 'VW %', 'RVOL', 'OI', 'VOL', 'LastRun'];   // fresh sheets only; see FLIP_FIXED_COLUMNS
-// Typed by you. With Qty filled, Strike / Expiry are YOUR contract and runs never overwrite them.
-const FLIP_INPUT_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry'];
-const FLIP_HELD_WHEN_OPEN = ['Strike', 'Expiry'];
-// Two columns hold YOUR formula in the header cell (a sum of Entry, a sum of P/L $), so they cannot be found by header text.
-// They are found by COLUMN NUMBER instead, only when no header with that exact name exists. Current layout: Entry = E (5), P/L $ = W (23).
-// If you move either column, change the number here. The script refuses to write into a column whose header is one of its own
-// managed names (and says so in the Log), so a moved column can never overwrite other data.
-//   Entry : the price you paid for the option (input)       P/L $ : total dollars on the position (written by the script)
-const FLIP_FIXED_COLUMNS = { 'Entry': 5, 'P/L $': 24 };
-// Change = today's move in dollars: Price now minus the previous session's close (green up, red down).
-const FLIP_CHANGE_FORMAT = '$#,##0.00;-$#,##0.00;$0.00';   // colour comes from the conditional rules (dark green #38761d / red #cc0000), not [Green]
-function flipPnlCol_(map) { return (map && map['P/L $']) || 0; }
-
-// ---- Jay column: the paper-entry tier from the external "us-options-runtime" portal (read-only, used with its owner's permission) ----
-// ONE request per scan covers the whole tab (cached 2 min). It is an experimental research-priority grade, NOT a win probability and
-// not an edge: the owner's own docs say it was chosen after looking at history, and no live results exist yet.
-//   "High"/"Medium"/"Low"        = a call is eligible now (fresh, news-screened, qualified contract)
-//   "High (not live)" etc.       = a call fired today but is expired / held for news / has no qualified contract
-//   blank                        = no call today, or the ticker is not in that system's universe
-//   "n/a"                        = the service could not be reached; nothing else in the scan is affected
-const FLIP_JAY_HEADER = 'Jay';
-const FLIP_JAY_URL = 'https://us-options-runtime.onrender.com/api/paper-signals';
-const FLIP_JAY_CACHE_SEC = 120, FLIP_JAY_FAIL_CACHE_SEC = 60;
-const FLIP_JAY_LABEL = { HIGH: 'High', MEDIUM: 'Medium', LOW: 'Low' };
-const FLIP_JAY_RANK = { HIGH: 3, MEDIUM: 2, LOW: 1 };
-
-// What the last lookup saw, shown in the scan summary so a blank column can be told apart from a broken one.
-let FLIP_JAY_META = { src: '', status: '', calls: 0, live: 0, err: '' };
-function flipJayNote_() {
-  const m = FLIP_JAY_META;
-  if (m.src === 'failed') return 'Jay: portal not reachable (' + m.err + ')\n';
-  if (!m.src) return '';
-  return 'Jay: ' + (m.src === 'cache' ? 'cached' : 'fetched') + ' · portal status ' + (m.status || '?') + ' · ' + m.calls + ' call(s) today, ' + m.live + ' eligible now\n';
-}
-
-function flipJayBest_(list) {
-  const o = {};
-  (list || []).forEach(function (s) {
-    const t = String((s && s.ticker) || '').toUpperCase();
-    const c = String((s && s.confidence) || '').toUpperCase();
-    const r = FLIP_JAY_RANK[c];
-    if (t && r && (!o[t] || r > FLIP_JAY_RANK[o[t]])) o[t] = c;
-  });
-  return o;
-}
-
-// Returns { TICKER: 'High' | 'High (not live)' | ... } (empty object = reachable, nothing today) or null when unavailable.
-function flipJayMap_(now) {
-  const day = flipTodayYmd_(now);
-  const key = 'FLIP_JAY_' + day;
-  let cache = null;
-  try {
-    cache = CacheService.getScriptCache();
-    const hit = cache.get(key);
-    if (hit) {
-      const o = JSON.parse(hit);
-      if (o && o._fail) { FLIP_JAY_META = { src: 'failed', status: '', calls: 0, live: 0, err: o._err || 'recent failure, retrying shortly' }; return null; }
-      FLIP_JAY_META = Object.assign({ src: 'cache', err: '' }, o._meta || {});
-      return o;
-    }
-  } catch (e) { cache = null; }
-  let out = null;
-  try {
-    const resp = UrlFetchApp.fetch(FLIP_JAY_URL + '?day=' + encodeURIComponent(day), { muteHttpExceptions: true, headers: { Accept: 'application/json' } });
-    const code = resp.getResponseCode();
-    if (code !== 200) throw new Error('HTTP ' + code);
-    const d = JSON.parse(resp.getContentText());
-    if (!d || !Array.isArray(d.signals) || !Array.isArray(d.valid_now)) throw new Error('unexpected response');
-    if (d.status === 'HISTORICAL_REPLAY') throw new Error('historical replay, not live data');
-    if (d.session && d.session !== day) throw new Error('session ' + d.session + ' is not ' + day);
-    out = { _meta: { status: String(d.status || ''), calls: d.signals.length, live: d.valid_now.length } };
-    FLIP_JAY_META = Object.assign({ src: 'fetched', err: '' }, out._meta);
-    const live = flipJayBest_(d.valid_now), any = flipJayBest_(d.signals);
-    Object.keys(live).forEach(function (t) { out[t] = FLIP_JAY_LABEL[live[t]]; });
-    Object.keys(any).forEach(function (t) { if (!out[t]) out[t] = FLIP_JAY_LABEL[any[t]] + ' (not live)'; });
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    logToSheet_('Flip Jay: paper-signal fetch failed (' + msg + '); Jay shows n/a');
-    FLIP_JAY_META = { src: 'failed', status: '', calls: 0, live: 0, err: msg };
-    out = null;
-  }
-  try { if (cache) cache.put(key, JSON.stringify(out === null ? { _fail: 1, _err: FLIP_JAY_META.err } : out), out === null ? FLIP_JAY_FAIL_CACHE_SEC : FLIP_JAY_CACHE_SEC); } catch (e) { /* the cache is optional */ }
-  return out;
-}
-const FLIP_OUTPUT_HEADERS = [
-  'Action', 'Score', 'Why', 'Strike', 'Expiry', 'Price', 'Change', 'Trend', 'Off High %', 'Earn Days', 'Mid', 'Spread %', 'Lev', 'Time Val %',
-  'AUP', 'ADN', 'RSI', 'VW %', 'RVOL', 'OI', 'VOL', 'Need %', 'P Hit %', 'Edge Needed', 'Target', 'Stop', 'Size', 'Days', 'P/L %', 'LastRun'
-];
-// Only the columns above are on the sheet. Values such as Day %, ATR %, Delta, Bid/Ask, OI, Theme are still computed for the decision
-// and the alert text, they just are not written anywhere, and the script never adds a column that is not listed here.
-const FLIP_EXTRA_HEADERS = ['Fit'];
-const FLIP_HEADERS = (function () {
-  const all = FLIP_INPUT_HEADERS.concat(FLIP_OUTPUT_HEADERS).concat(FLIP_EXTRA_HEADERS);
-  const seen = {};
-  return FLIP_VISIBLE_HEADERS.concat(all).filter(function (h) { if (seen[h]) return false; seen[h] = true; return true; });
-})();
-const FLIP_HEADER_SET = (function () { const o = {}; FLIP_HEADERS.forEach(function (h) { o[h] = true; }); return o; })();
-const FLIP_LOG_HEADERS = ['Time', 'Ticker', 'Signal', 'Stock', 'Strike', 'Expiry', 'Option', 'Delta', 'Lev', 'Spread %', 'Need %', 'Stop Dist %',
-  'P Hit %', 'Edge Needed', 'Score', 'AUP', 'ADN', 'RSI', 'VW %', 'RVOL', 'Off High %', 'Trend', 'Earn Days',
-  'Outcome', 'Days', 'MFE %', 'MAE %', 'Graded', 'Note'];
-
-
-/* ============================================================================
- * SETUP + MENU
- * ========================================================================== */
-
-// Run ONCE from the Apps Script editor.
-function setupFlip() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(FLIP_SHEET_NAME);
-  const isNew = !sheet;
-  if (isNew) sheet = ss.insertSheet(FLIP_SHEET_NAME);
-  const map = flipEnsureHeaders_(sheet);
-  if (isNew) {
-    // Seed with the names you already trade; the promotion adds and retires others.
-    const seed = ['TSLA', 'APP', 'ARM', 'ORCL', 'VRT', 'CEG', 'MRVL', 'ANET', 'NVDA', 'AMD', 'AVGO', 'META'];
-    const rows = seed.map(function (t) {
-      const row = new Array(FLIP_HEADERS.length).fill('');
-      row[map['Ticker'] - 1] = t;
-      return row;
-    });
-    sheet.getRange(2, 1, rows.length, FLIP_HEADERS.length).setValues(rows);
-  }
-  flipEnsureSheet_(FLIP_LOG_SHEET, FLIP_LOG_HEADERS);
-  flipFormatSheet_(sheet);
-  flipApplyVisibility_(sheet, false);
-
-  const triggers = ScriptApp.getProjectTriggers();
-  if (!triggers.some(function (t) { return t.getHandlerFunction() === 'flipAddMenu_'; })) ScriptApp.newTrigger('flipAddMenu_').forSpreadsheet(ss).onOpen().create();
-  try { flipAddMenu_(); } catch (e) { /* no UI in some contexts */ }
-
-  notify_(tryGetUi_(), 'Flip set up',
-    (isNew ? 'Created the Flip tab with a starter list.\n' : 'Flip tab already existed: headers checked, your data untouched.\n') +
-    'Menu "🔁 Flip" appears after you reload the sheet.\n\n' +
-    'Next:\n  1. 🔁 Flip > Promote Research Picks\n  2. 🔁 Flip > Run Flip Scan (during market hours the first scan also picks each ticker\'s contract)\n' +
-    '  3. 🔁 Flip > Alerts & Schedule > Start Flip Schedule\n\n' +
-    'When you buy: type Qty, Entry Date, Entry (price paid), Strike and Expiry. When you sell: log it in Results as usual and clear Qty.');
-}
-
-function flipAddMenu_() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('🔁 Flip')
-    .addItem('Run Flip Scan', 'runFlipScan')
-    .addItem('Promote Research Picks to Flip', 'runFlipPromote')
-    .addItem('🗂 Update Universe (Universe tab)', 'flipUpdateUniverse')
-    .addSeparator()
-    .addItem('Build Stats (FlipStats tab)', 'flipBuildStats')
-    .addItem('Grade Past Signals', 'flipGradeSignals')
-    .addSeparator()
-    .addSubMenu(ui.createMenu('📱 Alerts & Schedule')
-      .addItem('Send Test Flip Alert', 'sendTestFlipAlert_')
-      .addItem('Turn Flip Alerts On / Off', 'toggleFlipAlerts_')
-      .addSeparator()
-      .addItem('▶ Start Flip Schedule (every 5 min, market hours)', 'startFlipSchedule_')
-      .addItem('■ Stop Flip Schedule', 'stopFlipSchedule_')
-      .addItem('Schedule Status', 'flipScheduleStatus_'))
-    .addSubMenu(ui.createMenu('🔍 Flip Debug')
-      .addItem('One Ticker (full decision trail)', 'debugFlipOneTicker')
-      .addItem('Scan Dry Run (no writes)', 'runFlipScanDryRun')
-      .addItem('Promote Dry Run (no writes)', 'runFlipPromoteDryRun'))
-    .addToUi();
-}
-
-// Rewrites the Flip block (columns U-AB) of the Universe tab from the lists the promotion really uses (built-in list + Quick + Research
-// + Flip tab + Results history). Sheet reads/writes only: no API calls. Sector / Industry / Cap tier already filled for a ticker are kept.
-function flipUpdateUniverse() {
-  const ui = tryGetUi_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const uni = ss.getSheetByName('Universe') || ss.insertSheet('Universe');
-  const HEAD = ['Flip Ticker', 'Sector', 'Industry', 'Cap tier (hand classification)', 'Theme (position-limit group)', 'On Flip tab now', 'Open position now', 'Sector source'];
-  let startCol = 21;
-  try {
-    const row = uni.getRange(1, 1, 1, Math.max(uni.getLastColumn(), 1)).getValues()[0];
-    for (let i = 0; i < row.length; i++) if (String(row[i]).trim() === HEAD[0]) { startCol = i + 1; break; }
-  } catch (e) { /* default */ }
-  const old = {}, left = {};
-  if (uni.getLastRow() >= 2) {
-    uni.getRange(2, startCol, uni.getLastRow() - 1, HEAD.length).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) old[t] = r; });
-    uni.getRange(2, 1, uni.getLastRow() - 1, 4).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) left[t] = r; });
-  }
-  const overrides = (typeof loadSectorOverrides_ === 'function') ? loadSectorOverrides_() : {};
-  // Flip tab: which tickers are on it, and which have an open position (Qty filled).
-  const onTab = {}, held = {};
-  const flipSheet = ss.getSheetByName(FLIP_SHEET_NAME);
-  if (flipSheet && flipSheet.getLastRow() >= 2) {
-    const map = flipHeaderMap_(flipSheet);
-    const data = flipSheet.getRange(2, 1, flipSheet.getLastRow() - 1, flipSheet.getLastColumn()).getValues();
-    data.forEach(function (r) {
-      const t = String(r[(map['Ticker'] || 1) - 1] || '').trim().toUpperCase();
-      if (!t) return;
-      onTab[t] = true;
-      const q = map['Qty'] ? parseFloat(r[map['Qty'] - 1]) : NaN;
-      if (q > 0) held[t] = true;
-    });
-  }
-  const list = [], seen = {};
-  const add = function (t) { if (t && !seen[t] && t !== 'SPY') { seen[t] = true; list.push(t); } };
-  FLIP_UNIVERSE.forEach(add);
-  flipReadTickerColumn_(FLIP_QUICK_SHEET).forEach(add); flipReadTickerColumn_('Research').forEach(add);
-  Object.keys(onTab).forEach(add); Object.keys(flipResultsByTicker_()).forEach(add);
-  let fresh = 0, unclassified = 0;
-  const rows = list.map(function (t) {
-    const o = old[t], theme = FLIP_THEME_OF[t] || '';
-    if (o && String(o[1] || '').trim() !== '' && String(o[1]).trim() !== '?' && String(o[1]).trim() !== 'unclassified') return [t, o[1], o[2], o[3], theme, onTab[t] ? 'Yes' : '', held[t] ? 'Yes' : '', o[7] || ''];
-    let sec = '', ind = '', cap = '', src = '';
-    const ov = overrides[t], st = (typeof STATIC_SECTOR_MAP !== 'undefined') ? STATIC_SECTOR_MAP[t] : null, lf = left[t];
-    if (ov && ov.sector) { sec = ov.sector; ind = ov.industry || ''; src = 'Sector override'; }
-    else if (st) { sec = st.sector; ind = st.industry; src = 'Project STATIC_SECTOR_MAP'; }
-    else if (lf && String(lf[1] || '').trim() !== '') { sec = lf[1]; ind = lf[2]; cap = lf[3]; src = 'Quick/Leap block'; }
-    else { sec = 'unclassified'; src = 'unclassified'; unclassified++; }
-    fresh++;
-    return [t, sec, ind, cap || 'Large/mega (assumed)', theme, onTab[t] ? 'Yes' : '', held[t] ? 'Yes' : '', src];
-  });
-  if (uni.getMaxColumns() < startCol + HEAD.length - 1) uni.insertColumnsAfter(uni.getMaxColumns(), startCol + HEAD.length - 1 - uni.getMaxColumns());
-  uni.getRange(2, startCol, Math.max(uni.getMaxRows() - 1, 1), HEAD.length).clearContent();
-  uni.getRange(1, startCol, 1, HEAD.length).setValues([HEAD]);
-  if (rows.length) {
-    if (uni.getMaxRows() < rows.length + 1) uni.insertRowsAfter(uni.getMaxRows(), rows.length + 1 - uni.getMaxRows());
-    uni.getRange(2, startCol, rows.length, HEAD.length).setValues(rows);
-  }
-  notify_(ui, 'Flip universe updated',
-    rows.length + ' tickers written to the Universe tab (columns from ' + startCol + ').\n' +
-    'Sources: built-in Flip list, the Quick and Research tabs, the Flip tab, and your Results history.\n' +
-    'New or re-classified: ' + fresh + (unclassified ? ' (' + unclassified + ' unclassified: type the sector in, it is kept next time)' : '') + '.\n\n' +
-    'This lists who Flip looks at. Who is kept on the Flip tab is still decided by Promote Research Picks to Flip.');
-  return { count: rows.length, fresh: fresh };
-}
-
-
-function runFlipScanDryRun() { return runFlipScan(null, true); }
-function runFlipPromoteDryRun() { return flipPromote_({ dryRun: true }); }
-
-
-/* ============================================================================
- * SHEET HELPERS
- * ========================================================================== */
-
-function flipEnsureSheet_(name, headers) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  if (sh.getLastRow() < 1) {
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
-    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
-  }
-  return sh;
-}
-
-// Adds any missing header at the end. Existing columns, order and data stay.
-function flipEnsureHeaders_(sheet) {
-  const lastCol = Math.max(sheet.getLastColumn(), 1);
-  const existing = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h || '').trim(); });
-  const hasAny = existing.some(function (h) { return h !== ''; });
-  if (!hasAny) {
-    sheet.getRange(1, 1, 1, FLIP_HEADERS.length).setValues([FLIP_HEADERS]);
-  } else {
-    let next = existing.length;
-    while (next > 0 && existing[next - 1] === '') next--;
-    FLIP_HEADERS.forEach(function (h) {
-      // Entry / P/L $ live in fixed columns whose header is your own formula: never add a second copy of them.
-      if (FLIP_FIXED_COLUMNS[h]) return;   // (flipHeaderMap_ maps them by column number, or logs why it cannot)
-      if (existing.indexOf(h) === -1) { next++; sheet.getRange(1, next).setValue(h); existing[next - 1] = h; }
-    });
-  }
-  sheet.setFrozenRows(1);
-  sheet.setFrozenColumns(1);
-  return flipHeaderMap_(sheet);
-}
-
-function flipHeaderMap_(sheet) {
-  const lastCol = sheet.getLastColumn();
-  const row = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-  const map = {};
-  row.forEach(function (h, i) { const k = String(h || '').trim(); if (k && map[k] == null) map[k] = i + 1; });
-  // Your formula headers are found by what they contain, so moving columns never matters: a header formula starting with SUMPRODUCT is
-  // Entry, one starting with SUM( is P/L $ (Sheets rewrites the cell references itself when you move a column).
-  let entryF = 0, sumF = 0;
-  try {
-    sheet.getRange(1, 1, 1, lastCol).getFormulas()[0].forEach(function (f, i) {
-      if (!entryF && /^=\s*sumproduct\s*\(/i.test(f)) entryF = i + 1;
-      else if (!sumF && /^=\s*sum\s*\(/i.test(f)) sumF = i + 1;
-    });
-  } catch (e) { /* fall back to the positions below */ }
-  // Fixed-position columns (header cell holds your own formula): used only when that name is not on the sheet.
-  Object.keys(FLIP_FIXED_COLUMNS).forEach(function (name) {
-    if (map[name]) return;
-    let c = FLIP_FIXED_COLUMNS[name];
-    if (name === 'Entry' && entryF) c = entryF;
-    if (name === 'P/L $' && sumF) c = sumF;
-    if (name === 'P/L $' && !sumF && map['Why'] > 1) {   // follows your formula column when it sits right before Why, so moving columns does not break it
-      const lt = String(row[map['Why'] - 2] == null ? '' : row[map['Why'] - 2]).trim();
-      if (lt !== '' && !FLIP_HEADER_SET[lt]) c = map['Why'] - 1;
-    }
-    const t = c <= lastCol ? String(row[c - 1] == null ? '' : row[c - 1]).trim() : '';
-    if (t !== '' && !FLIP_HEADER_SET[t]) map[name] = c;
-    else logFlipFixedOnce_(name, c, t);
-  });
-  return map;
-}
-function logFlipFixedOnce_(name, c, t) {
-  try {
-    const k = 'FLIP_FIXED_WARN_' + name;
-    const p = PropertiesService.getScriptProperties();
-    if (p.getProperty(k) === String(c) + t) return;
-    p.setProperty(k, String(c) + t);
-    logToSheet_('Flip: column ' + c + ' should hold the "' + name + '" column (FLIP_FIXED_COLUMNS) but its header is ' + (t === '' ? 'empty' : '"' + t + '"') + '. Nothing is written there; fix the number in FLIP_FIXED_COLUMNS.');
-  } catch (e) { /* diagnostics only */ }
-}
-
-function flipApplyVisibility_(sheet, showAll) {
-  const map = flipHeaderMap_(sheet);
-  const last = sheet.getLastColumn();
-  if (last < 1) return;
-  sheet.showColumns(1, last);
-  if (showAll) return;
-  const vis = {};
-  FLIP_VISIBLE_HEADERS.forEach(function (h) { vis[h] = true; });
-  const hide = [];
-  for (let c = 0; c < last; c++) hide.push(false);
-  Object.keys(map).forEach(function (h) { if (!vis[h]) hide[map[h] - 1] = true; });
-  Object.keys(FLIP_FIXED_COLUMNS).forEach(function (h) { if (map[h] && map[h] <= last) hide[map[h] - 1] = false; });   // Entry and P/L $ stay visible
-  for (let c = 0; c < last; c++) {
-    if (!hide[c]) continue;
-    let e = c;
-    while (e + 1 < last && hide[e + 1]) e++;
-    sheet.hideColumns(c + 1, e - c + 1);
-    c = e;
-  }
-}
-
-function flipToggleDetailColumns_() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(FLIP_SHEET_NAME);
-  if (!sheet) return;
-  const map = flipHeaderMap_(sheet);
-  const hidden = map['Bid'] ? sheet.isColumnHiddenByUser(map['Bid']) : false;
-  flipApplyVisibility_(sheet, hidden);
-}
-
-// Colours that stay right as values change (conditional formatting): Earn Days red 0-3 (blocked), orange 4-10;
-// Edge Needed green <= 5, orange <= 10, red above; P/L % red when negative.
-function flipApplyRules_(sheet, map, onlyIfMissing) {
-  try {
-    const rules = sheet.getConditionalFormatRules();
-    const rows = Math.max(sheet.getMaxRows() - 1, 1);
-    const mineCols = ['Earn Days', 'Edge Needed', 'P/L %', 'Days', 'Change'].filter(function (h) { return map[h]; }).map(function (h) { return map[h]; }).concat(flipPnlCol_(map) ? [flipPnlCol_(map)] : []);
-    const covers = function (r, c) { return r.getRanges().some(function (x) { return x.getColumn() <= c && x.getLastColumn() >= c; }); };
-    const mine = function (r) { return mineCols.some(function (c) { return covers(r, c); }); };
-    // Skip only when every managed column already has a rule (so a newly managed column, such as Change, still gets its rules).
-    if (onlyIfMissing && mineCols.every(function (c) { return rules.some(function (r) { return covers(r, c); }); })) return;
-    const R = function (h) { return sheet.getRange(2, map[h], rows, 1); };
-    const add = [];
-    if (map['Earn Days']) {
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(0, FLIP_CONFIG.earnBlockDays).setBackground('#f4cccc').setFontColor('#990000').setBold(true).setRanges([R('Earn Days')]).build());
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(FLIP_CONFIG.earnBlockDays + 1, 10).setBackground('#fce5cd').setRanges([R('Earn Days')]).build());
-    }
-    if (map['Edge Needed']) {
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberLessThanOrEqualTo(5).setBackground('#d9ead3').setRanges([R('Edge Needed')]).build());
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(5.01, FLIP_CONFIG.maxEdgeNeeded).setBackground('#fff2cc').setRanges([R('Edge Needed')]).build());
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(FLIP_CONFIG.maxEdgeNeeded).setBackground('#f4cccc').setRanges([R('Edge Needed')]).build());
-    }
-    [map['P/L %'], map['Change'], flipPnlCol_(map)].forEach(function (c) {
-      if (!c) return;
-      const rg = sheet.getRange(2, c, rows, 1);
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([rg]).build());
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(0).setFontColor('#38761d').setRanges([rg]).build());
-    });
-    if (map['Days']) {
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThanOrEqualTo(FLIP_CONFIG.hardStaleDays).setBackground('#f4cccc').setBold(true).setRanges([R('Days')]).build());
-      add.push(SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(FLIP_CONFIG.timeStopDays, FLIP_CONFIG.hardStaleDays - 1).setBackground('#fce5cd').setRanges([R('Days')]).build());
-    }
-    sheet.setConditionalFormatRules(rules.filter(function (r) { return !mine(r); }).concat(add));
-  } catch (e) { logToSheet_('Flip: could not apply colour rules: ' + (e && e.message ? e.message : e)); }
-}
-
-function flipFormatSheet_(sheet) {
-  const map = flipHeaderMap_(sheet);
-  const maxRows = Math.max(sheet.getMaxRows() - 1, 1);
-  function fmt(h, f) { if (map[h]) sheet.getRange(2, map[h], maxRows, 1).setNumberFormat(f); }
-  ['Entry', 'Strike', 'Price', 'Bid', 'Ask', 'Mid', 'Target', 'Stop', 'Open Mark'].forEach(function (h) { fmt(h, '$#,##0.00'); });
-  ['Risk $'].forEach(function (h) { fmt(h, '$#,##0'); });
-  if (flipPnlCol_(map)) sheet.getRange(2, flipPnlCol_(map), maxRows, 1).setNumberFormat('$#,##0;-$#,##0;$0');
-  fmt('Change', FLIP_CHANGE_FORMAT);
-  ['Entry Date', 'Expiry', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });
-  fmt('LastRun', 'yyyy-mm-dd hh:mm');
-  ['Off High %', 'T200 %', 'SMA20 %', 'RS5 %', 'ATR %', 'Sigma Day %', 'Spread %', 'Time Val %', 'Decay %/d', 'IV', 'VW %', 'Need %', 'P Hit %', 'BE Win %',
-    'Edge Needed', 'Stop %', 'P/L %', 'Day %', 'Fit', 'Lev', 'Score', 'RVOL', 'Delta', 'AUP', 'ADN', 'RSI'].forEach(function (h) { fmt(h, '0.0'); });
-  FLIP_INPUT_HEADERS.concat(FLIP_HELD_WHEN_OPEN).forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
-  FLIP_OUTPUT_HEADERS.forEach(function (h) { if (map[h] && FLIP_HELD_WHEN_OPEN.indexOf(h) === -1) sheet.getRange(1, map[h]).setBackground('#d9ead3'); });
-  FLIP_EXTRA_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#cfe2f3'); });
-  flipApplyRules_(sheet, map, false);
-  sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
-}
-
-
-/* ============================================================================
- * PURE FUNCTIONS (no Apps Script services — unit-testable)
- * ========================================================================== */
-
-function flipClamp_(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
-// 0 at `zero`, 1 at `full`, linear between (works for either direction).
-function flipLin_(v, zero, full) {
-  if (v == null || !isFinite(v)) return 0;
-  return flipClamp_((v - zero) / (full - zero), 0, 1);
-}
-function flipNum_(v) { if (v === '' || v == null) return null; const n = parseFloat(v); return isNaN(n) ? null : n; }
-function flipR1_(v) { return v == null || !isFinite(v) ? '' : Math.round(v * 10) / 10; }
-function flipR2_(v) { return v == null || !isFinite(v) ? '' : Math.round(v * 100) / 100; }
-
-function flipSma_(arr, n) {
-  if (!arr || arr.length < n) return null;
-  let s = 0;
-  for (let i = arr.length - n; i < arr.length; i++) s += arr[i];
-  return s / n;
-}
-
-// Wilder 14-day ATR as % of the last close. bars: [{h,l,c}]
-function flipAtrPct_(bars, period) {
-  period = period || 14;
-  if (!bars || bars.length < period + 1) return null;
-  const tr = [];
-  for (let i = 1; i < bars.length; i++) {
-    const pc = bars[i - 1].c;
-    tr.push(Math.max(bars[i].h - bars[i].l, Math.abs(bars[i].h - pc), Math.abs(bars[i].l - pc)));
-  }
-  let atr = 0;
-  for (let i = 0; i < period; i++) atr += tr[i];
-  atr /= period;
-  for (let i = period; i < tr.length; i++) atr = (atr * (period - 1) + tr[i]) / period;
-  const last = bars[bars.length - 1].c;
-  return last > 0 ? atr / last * 100 : null;
-}
-
-// Standard deviation of daily log returns (percent) over the last n closes.
-function flipSigmaDay_(closes, n) {
-  n = n || 20;
-  if (!closes || closes.length < n + 1) return null;
-  const r = [];
-  for (let i = closes.length - n; i < closes.length; i++) if (closes[i - 1] > 0 && closes[i] > 0) r.push(Math.log(closes[i] / closes[i - 1]));
-  if (r.length < 8) return null;
-  const m = r.reduce(function (a, b) { return a + b; }, 0) / r.length;
-  const v = r.reduce(function (a, b) { return a + (b - m) * (b - m); }, 0) / (r.length - 1);
-  return Math.sqrt(v) * 100;
-}
-
-function flipRetPct_(closes, days) {
-  if (!closes || closes.length <= days) return null;
-  const a = closes[closes.length - 1 - days], b = closes[closes.length - 1];
-  return a > 0 ? (b / a - 1) * 100 : null;
-}
-
-// Daily-bar features. bars: [{h,l,c}] oldest first; spyBars same shape (for relative strength) or null.
-function flipFeatures_(bars, spyBars) {
-  if (!bars || bars.length < 22) return null;
-  const closes = bars.map(function (b) { return b.c; });
-  const price = closes[closes.length - 1];
-  const sma20 = flipSma_(closes, 20);
-  const sma20Prev = closes.length >= 25 ? flipSma_(closes.slice(0, closes.length - 5), 20) : null;
-  const ret5 = flipRetPct_(closes, 5);
-  const spyRet5 = spyBars && spyBars.length > 6 ? flipRetPct_(spyBars.map(function (b) { return b.c; }), 5) : null;
-  const slopeUp = sma20Prev != null ? sma20 > sma20Prev : null;
-  const above = sma20 != null ? price > sma20 : null;
-  let trend = 'Mixed';
-  if (above && slopeUp) trend = 'Up';
-  else if (!above && slopeUp === false) trend = 'Down';
-  else if (!above && slopeUp) trend = 'Pullback';
-  const prev = closes[closes.length - 2];
-  return {
-    price: price, sma20: sma20, sma20Pct: sma20 ? (price / sma20 - 1) * 100 : null, slopeUp: slopeUp, trend: trend,
-    atrPct: flipAtrPct_(bars), sigmaDay: flipSigmaDay_(closes, 20), ret5: ret5, rs5: (ret5 != null && spyRet5 != null) ? ret5 - spyRet5 : null,
-    dayPct: prev > 0 ? (price / prev - 1) * 100 : null, high3m: Math.max.apply(null, bars.map(function (b) { return b.h; }))
-  };
-}
-
-// Probability a driftless random walk (daily sigma, percent) exits a corridor through the top / bottom within `days`.
-// Start at 0, top barrier +a, bottom barrier -b (percent of the stock price). Exact Fourier series for Brownian motion;
-// as days -> infinity top = b/(a+b). Ignores gaps, drift, and IV changes.
-function flipHitProb_(a, b, sigma, days) {
-  if (!(a > 0) || !(b > 0) || !(sigma > 0) || !(days > 0)) return null;
-  const w = a + b;
-  const top = b / w, bot = a / w;
-  let sumTop = 0, sumBot = 0;
-  for (let n = 1; n <= 80; n++) {
-    const e = Math.exp(-n * n * Math.PI * Math.PI * sigma * sigma * days / (2 * w * w));
-    if (e < 1e-9 && n > 3) break;
-    const sgn = (n % 2 === 0) ? 1 : -1;   // (-1)^n
-    sumTop += (2 * sgn / (n * Math.PI)) * Math.sin(n * Math.PI * b / w) * e;
-    sumBot += (2 * sgn / (n * Math.PI)) * Math.sin(n * Math.PI * a / w) * e;
-  }
-  const pTop = flipClamp_(top + sumTop, 0, 1), pBot = flipClamp_(bot + sumBot, 0, 1);
-  return { pTop: pTop, pBot: pBot, pNeither: Math.max(0, 1 - pTop - pBot) };
-}
-
-// Everything the row shows about the trade geometry, for one contract.
-//   lev = delta x stock / option price (option % move per 1% stock move)
-//   need = stock move that earns the target after the spread
-//   stop = clamp(1 ATR in option terms); stopDist = that in stock terms
-function flipTradeGeometry_(c, stock, atrPct, sigmaDay, cfg) {
-  cfg = cfg || FLIP_CONFIG;
-  if (!c || !(c.mid > 0) || !(c.delta > 0) || !(stock > 0) || !(atrPct > 0)) return null;
-  const lev = c.delta * stock / c.mid;
-  const spread = c.spreadPct != null ? c.spreadPct : 0;
-  const need = (cfg.targetPct + spread) / lev;
-  const stopOpt = flipClamp_(lev * atrPct * cfg.stopAtrMult, cfg.stopMinPct, cfg.stopMaxPct);
-  const stopDist = stopOpt / lev;
-  const sig = sigmaDay > 0 ? sigmaDay : atrPct / 1.25;
-  const hp = flipHitProb_(need, stopDist, sig, cfg.horizonDays);
-  if (!hp) return null;
-  const lossPct = stopOpt + spread;
-  const be = lossPct / (cfg.targetPct + lossPct);
-  const decided = hp.pTop + hp.pBot;
-  const condWin = decided > 0 ? hp.pTop / decided : 0;
-  return {
-    lev: lev, need: need, stopOpt: stopOpt, stopDist: stopDist, pHit: hp.pTop, pStop: hp.pBot, pNeither: hp.pNeither,
-    be: be, condWin: condWin, edgeNeeded: (be - condWin) * 100,
-    targetPrice: c.mid * (1 + (cfg.targetPct + spread) / 100), stopPrice: c.mid * (1 - stopOpt / 100)
-  };
-}
-
-// Contracts so that the stop costs about riskUsd (1 contract minimum).
-function flipSize_(mid, stopOptPct, riskUsd) {
-  if (!(mid > 0) || !(stopOptPct > 0)) return null;
-  return Math.max(1, Math.floor(riskUsd / (mid * 100 * stopOptPct / 100)));
-}
-
-// Weekdays between two dates (entry day = 0). Exchange holidays are ignored.
-function flipTradingDays_(from, to) {
-  if (!from || !to) return null;
-  const a = new Date(from.getFullYear(), from.getMonth(), from.getDate()), b = new Date(to.getFullYear(), to.getMonth(), to.getDate());
-  if (b < a) return 0;
-  let n = 0;
-  const d = new Date(a.getTime());
-  while (d < b) { d.setDate(d.getDate() + 1); const w = d.getDay(); if (w !== 0 && w !== 6) n++; }
-  return n;
-}
-
-function flipThemeOf_(ticker) { return FLIP_THEME_OF[ticker] || 'Other'; }
-
-// Chooses the cheapest-to-hold contract among those that pass the stock-proxy rule.
-// cands: [{strike, bid, ask, delta, oi, volume, dte, symbol, expiry}]; returns { ok, c } or { ok:false, why }.
-function flipChooseContract_(cands, spot, cfg) {
-  cfg = cfg || FLIP_CONFIG;
-  let best = null, why = '';
-  const rejects = {};
-  let nearest = null;   // the contract that came closest to passing, so the SKIP reason shows real numbers
-  cands.forEach(function (x) {
-    if (!(x.bid > 0) || !(x.ask > 0) || x.ask < x.bid) { rejects['no two-sided quote'] = (rejects['no two-sided quote'] || 0) + 1; return; }
-    const mid = (x.bid + x.ask) / 2;
-    const spreadPct = (x.ask - x.bid) / mid * 100;
-    const intrinsic = Math.max(spot - x.strike, 0);
-    const extPct = (mid - intrinsic) / mid * 100;
-    const fails = [];
-    if (!(x.delta >= cfg.minDelta)) fails.push('delta ' + (x.delta != null ? x.delta.toFixed(2) : '?') + ' < ' + cfg.minDelta);
-    if (spreadPct > cfg.maxSpreadPct) fails.push('spread ' + spreadPct.toFixed(1) + '% > ' + cfg.maxSpreadPct + '%');
-    if (x.oi != null && x.oi < cfg.minOi) fails.push('OI ' + x.oi + ' < ' + cfg.minOi);
-    if (mid < cfg.minMid) fails.push('price under $' + cfg.minMid);
-    if (extPct > cfg.maxTimeValuePct) fails.push('time value ' + extPct.toFixed(0) + '% > ' + cfg.maxTimeValuePct + '%');
-    if (fails.length) {
-      const nScore = fails.length * 1000 + spreadPct;
-      if (!nearest || nScore < nearest.score) nearest = { score: nScore, x: x, mid: mid, spreadPct: spreadPct, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM-dd-yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
-      fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); rejects[k] = (rejects[k] || 0) + 1; }); if (!why) why = fails[0]; return; }
-    const lev = x.delta * spot / mid;
-    let decay = null;
-    if (x.iv != null && typeof blackScholesOneDayTheta_ === 'function') {
-      const th = blackScholesOneDayTheta_(spot, x.strike, x.dte, x.iv, 'C');
-      if (th != null) decay = Math.abs(th) / mid * 100;
-    }
-    if (decay == null) decay = extPct / Math.max(x.dte, 30) * 1.3;   // rough fallback: time value fades roughly linearly, a bit faster near expiry
-    const friction = (spreadPct + cfg.decayDays * decay) / lev;
-    const row = {
-      strike: x.strike, expiry: x.expiry, dte: x.dte, symbol: x.symbol, bid: x.bid, ask: x.ask, mid: mid, delta: x.delta, oi: x.oi, volume: x.volume,
-      iv: x.iv, spreadPct: spreadPct, extPct: extPct, lev: lev, decayPct: decay, friction: friction
-    };
-    if (!best || friction < best.friction || (friction === best.friction && (row.oi || 0) > (best.oi || 0))) best = row;
-  });
-  if (best) return { ok: true, c: best };
-  const top = Object.keys(rejects).sort(function (a, b) { return rejects[b] - rejects[a]; }).slice(0, 2).join('; ');
-  return { ok: false, near: nearest ? { strike: nearest.x.strike, expiry: nearest.x.expiry, oi: nearest.x.oi, volume: nearest.x.volume, mid: nearest.mid, spreadPct: nearest.spreadPct } : null, why: nearest ? 'none of ' + cands.length + ' passed; closest ' + nearest.text : (top || 'no candidates') };
-}
-
-// Entry score (0-100) = how good this moment is for a new position. Hard gates are applied by the caller.
-//   trigger 35, daily structure 25, contract 20, cost geometry 15, earnings 5.
-function flipScore_(m) {
-  const trig = m.level === 'strong' ? 35 : (m.level === 'light' ? (m.bounce ? 18 : 20) : (m.trendOk ? 8 : 0));
-  const struct = (m.priceAbove20 ? 8 : 0) + (m.slopeUp ? 5 : 0) + (m.rs5 != null && m.rs5 >= 0 ? 4 : 0) + 8 * flipLin_(m.offHigh, 40, 10);
-  const contract = 8 * flipLin_(m.spreadPct, 1.5, 0.4) + 4 * flipLin_(m.delta, 0.75, 0.9) + 4 * flipLin_(m.extPct, 30, 8) + 4 * flipLin_(m.oi, 100, 1000);
-  const geom = 15 * flipLin_(m.edgeNeeded, 10, 2);
-  const earn = m.earnDays == null ? 2.5 : 5 * flipLin_(m.earnDays, 4, 10);
-  return Math.round(trig + struct + contract + geom + earn);
-}
-
-// Action for a row you HOLD. pl = % vs your Entry at the bid. Returns { action, why }.
-function flipHeldAction_(h, cfg) {
-  cfg = cfg || FLIP_CONFIG;
-  const money = h.plPct != null ? (h.plPct >= 0 ? '+' : '') + h.plPct.toFixed(1) + '%' : 'no quote';
-  const base = money + ', day ' + h.days;
-  if (h.plPct == null) return { action: 'REVIEW', why: 'no option quote (check Strike / Expiry): ' + base };
-  if (h.stopPct != null && h.plPct <= -h.stopPct) return { action: 'STOP', why: 'down ' + money + ', past the stop (-' + h.stopPct.toFixed(1) + '%): get out, ' + base };
-  if (h.days >= cfg.hardStaleDays && h.plPct < cfg.targetPct) return { action: 'TIME-STOP', why: 'day ' + h.days + ' (max ' + cfg.hardStaleDays + '): close it, ' + money };
-  if (h.plPct >= cfg.targetPct) return { action: 'SELL', why: 'target reached ' + money + ' (net of the selling spread)' };
-  if (h.exit && h.exit.exit) return { action: 'SELL', why: 'up ' + money + ' and RSI ' + h.rsi + (h.exit.fading ? ' with momentum fading' : ' is high') + ': your exit rule' };
-  if (h.days >= cfg.timeStopDays && h.plPct < cfg.timeStopMinGainPct) return { action: 'TIME-STOP', why: 'day ' + h.days + ' and never reached +' + cfg.timeStopMinGainPct + '%: cut it loose, ' + money };
-  if (h.earnDays != null && h.earnDays <= cfg.earnBlockDays) return { action: 'REVIEW', why: 'earnings in ' + h.earnDays + ' day(s): gap risk, ' + base };
-  return { action: 'HOLD', why: base + (h.stopPrice ? ', stop $' + h.stopPrice.toFixed(2) : '') };
-}
-
-// Portfolio guard. open: [{ticker, theme, plUsd, cost, entryDate}], returns { blocked, why }.
-function flipPortfolioGuard_(open, theme, todayYmd, cfg) {
-  cfg = cfg || FLIP_CONFIG;
-  if (open.length >= cfg.maxOpen) return { blocked: true, why: open.length + ' open positions (limit ' + cfg.maxOpen + ')' };
-  if (theme && theme !== 'Other') {
-    const same = open.filter(function (o) { return o.theme === theme; }).length;
-    if (same >= cfg.maxPerTheme) return { blocked: true, why: same + ' open in ' + theme + ' (limit ' + cfg.maxPerTheme + ')' };
-  }
-  const today = open.filter(function (o) { return o.entryYmd === todayYmd; }).length;
-  if (today >= cfg.maxNewPerDay) return { blocked: true, why: today + ' entries today (limit ' + cfg.maxNewPerDay + ')' };
-  let cost = 0, pl = 0;
-  open.forEach(function (o) { cost += o.cost || 0; pl += o.plUsd || 0; });
-  if (cost > 0 && pl / cost * 100 <= -cfg.maxOpenLossPct) return { blocked: true, why: 'open book is ' + (pl / cost * 100).toFixed(1) + '% (limit -' + cfg.maxOpenLossPct + '%)' };
-  return { blocked: false, why: '' };
-}
-
-function flipSortKey_(action, score, plPct) {
-  const base = { 'STOP': 9000, 'TIME-STOP': 8900, 'SELL': 8800, 'REVIEW': 8700, 'FILL IN': 8600, 'HOLD': 8000, 'BUY': 7000, 'READY': 6000, 'BLOCKED': 5000, 'WAIT': 4000, 'SKIP': 1000 }[action] || 0;
-  return base + (score || 0) + (action === 'STOP' || action === 'TIME-STOP' ? Math.max(0, -(plPct || 0)) : 0);
-}
-
-
-/* ============================================================================
- * CACHE SHEET (own sheet so Quick/Leap runs never read Flip data)
- * ========================================================================== */
-
-function flipCacheLoad_() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(FLIP_CACHE_SHEET);
+function longLoadCache_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LONG_CACHE_SHEET_NAME);
   const cache = {};
   if (!sheet) return cache;
   const lastRow = sheet.getLastRow();
@@ -782,560 +30,978 @@ function flipCacheLoad_() {
   return cache;
 }
 
-function flipCacheFlush_(pending) {
+function longFlushCache_(pending) {
   const keys = Object.keys(pending);
   if (!keys.length) return 0;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(FLIP_CACHE_SHEET);
-  if (!sheet) { sheet = ss.insertSheet(FLIP_CACHE_SHEET); try { sheet.hideSheet(); } catch (e) { /* ignore */ } }
+  let sheet = ss.getSheetByName(LONG_CACHE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LONG_CACHE_SHEET_NAME);
+    try { sheet.hideSheet(); } catch (e) { /* ignore */ }
+  }
   const existing = {};
   const lastRow = sheet.getLastRow();
   if (lastRow >= 1) sheet.getRange(1, 1, lastRow, 2).getValues().forEach(function (row) { if (row[0]) existing[row[0]] = row[1]; });
   keys.forEach(function (k) { existing[k] = pending[k]; });
-  // drop entries older than 14 days so the sheet cannot grow without bound
-  const cutoff = Date.now() - 14 * 86400000;
+  // Contract picks and daily technicals older than 3 days are useless: drop them so the sheet does not grow forever.
+  const cutoff = Date.now() - 3 * 86400000;
   const rows = [];
   Object.keys(existing).forEach(function (k) {
-    let keep = true;
-    try { const o = JSON.parse(existing[k]); if (o && o.d && Date.parse(o.d + 'T12:00:00Z') < cutoff) keep = false; } catch (e) { keep = false; }
-    if (keep) rows.push([k, existing[k]]);
+    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH|LONGTECH2)_/.test(k)) {
+      try { const d = JSON.parse(existing[k]).date; if (new Date(d + 'T00:00:00').getTime() < cutoff) return; } catch (e) { return; }
+    }
+    rows.push([k, existing[k]]);
   });
   sheet.clearContents();
   if (rows.length) sheet.getRange(1, 1, rows.length, 2).setValues(rows);
   return keys.length;
 }
 
-function flipTodayYmd_(now) { return Utilities.formatDate(now || new Date(), 'America/New_York', 'yyyy-MM-dd'); }
+const LONG_CONFIG = {
+  // --- contract ------------------------------------------------------------
+  contract: {
+    minDte: 400, maxDte: 730, targetDte: 540,
+    minDelta: 0.80, maxDelta: 0.92, targetDelta: 0.85,
+    maxSpreadPct: null,      // bid-ask gap is NOT a criterion any more (set a number such as 2 to bring the gate back); Spread % is still shown
+    minOi: 50,               // LEAP chains are thin
+    minMid: 1,
+    maxCarryPct: 8,          // extrinsic value per year as % of the stock price
+    expiriesToTry: 2, strikesPerExpiry: 10,
+    failCacheMin: 180        // a real "no usable contract" is remembered this long before the chain is downloaded again
+  },
+  // --- entry ---------------------------------------------------------------
+  entry: {
+    strongMaxOffHigh: 15, strongMaxRsi: 45,
+    lightMaxOffHigh: 25, lightMaxRsi: 55,
+    maxIvr: 40,
+    bounceMaxOffHigh: 35, bounceMinPct: 50, bounceMinFallPct: 8, bounceMinLowAgeDays: 40,   // READY only, never BUY
+    skipOffHigh: 35,
+    riskGate: 30,            // Risk = chance the premium is down 20%+ in 30 days (computeLeapPremiumLoss_)
+    scoreBuy: 65, scoreReady: 50,
+    qualityFloor: 65, qualityFloorEtf: 55,
+    regimeGate: true         // SPY under its 200-day: no new BUY (a would-be BUY is shown as READY). Set false to turn off.
+  },
+  // --- exits (held positions) -------------------------------------------------
+  exits: { trendBandPct: 3, takeProfitPct: 50, rollDte: 180, reviewCarryPct: 12 },
+  // --- runtime ---------------------------------------------------------------
+  timeBudgetMs: 4.5 * 60 * 1000,
+  sleepMs: 100,
+  // --- research promotion (universe quality screen) ------------------------------
+  promote: {
+    maxTotal: 30, maxEtfs: 5,     // the tab holds at most maxTotal rows (stocks + ETFs + pinned rows)
+    
+    minStockScore: 70, minEtfScore: 60,
+    minCapB: 50,             // $50B market cap floor
+    minHistoryYears: 4.7,
+    minRoePct: 12, minOpmPct: 10,
+    timeBudgetMs: 4 * 60 * 1000
+  },
+  // cspQualityStock_/Etf_ read these two; 100 switches their trend gates off (Long judges trend itself, per row)
+  maxBelow200Pct: 100, maxDrawdownPct: 100,
+  // --- alerts ----------------------------------------------------------------
+  alerts: { exitRepeatHours: 12, rollRepeatHours: 24, tpRepeatHours: 24, reviewRepeatHours: 24, buyRepeatHours: 24 },
+  // --- schedule (US/Eastern) -------------------------------------------------
+  schedule: { startHHmm: '09:45', endHHmm: '15:55' }
+};
 
-// Cached value if it is at most maxAgeDays old (0 = today only), else null.
-function flipCacheGet_(cache, key, maxAgeDays, now) {
-  const e = cache[key];
-  if (!e || !e.d) return null;
-  const age = Math.floor((Date.parse(flipTodayYmd_(now) + 'T12:00:00Z') - Date.parse(e.d + 'T12:00:00Z')) / 86400000);
-  return age <= maxAgeDays ? e.v : null;
+// Starter list for a brand-new tab.
+const LONG_STARTER_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'V', 'MA', 'COST', 'WMT', 'JPM', 'KO', 'PEP', 'PG', 'JNJ', 'HD', 'LIN', 'UNP', 'SPGI', 'ISRG', 'SPY', 'QQQ',
+  'LLY', 'AVGO', 'MCO', 'ICE', 'ADP', 'SHW', 'ORLY', 'TJX', 'ITW', 'CB'];
+
+// Research universe. Own literal lists (not shared constants) so file load order never matters. From general knowledge of large,
+// long-record, wide-moat businesses — NOT a rating. The numeric screen (market cap >= $50B, returns, margins, 5-year record) decides who
+// qualifies; this list only decides who gets looked at. Add or remove freely.
+const LONG_STOCK_UNIVERSE = [
+  // Technology
+  'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'AVGO', 'ORCL', 'ADBE', 'CRM', 'CSCO', 'TXN', 'QCOM', 'INTU', 'NOW',
+  'ACN', 'IBM', 'AMAT', 'LRCX', 'KLAC', 'SNPS', 'CDNS', 'ADI', 'TSM', 'ASML', 'FICO', 'ROP', 'ADSK',
+  // Financials
+  'JPM', 'V', 'MA', 'AXP', 'BLK', 'SPGI', 'MCO', 'ICE', 'CME', 'MS', 'GS', 'SCHW', 'CB', 'MMC', 'AON', 'PGR', 'TRV', 'MSCI', 'VRSK',
+  // Healthcare
+  'JNJ', 'UNH', 'LLY', 'ABBV', 'MRK', 'TMO', 'DHR', 'ABT', 'ISRG', 'SYK', 'BSX', 'MDT', 'ZTS', 'VRTX', 'REGN', 'AMGN', 'IDXX', 'ELV', 'CI',
+  // Consumer
+  'WMT', 'COST', 'PG', 'KO', 'PEP', 'MDLZ', 'CL', 'PM', 'HSY', 'HD', 'LOW', 'MCD', 'NKE', 'SBUX', 'TJX', 'BKNG', 'CMG', 'ORLY', 'AZO', 'ROST', 'MNST',
+  // Industrials / Materials / Energy / Utilities / Comm
+  'UNP', 'CAT', 'DE', 'HON', 'GE', 'RTX', 'LMT', 'ETN', 'ITW', 'WM', 'RSG', 'ADP', 'LIN', 'SHW', 'APD', 'ECL', 'NOC', 'GD', 'CTAS', 'CPRT',
+  'XOM', 'CVX', 'NEE', 'DUK', 'SO', 'DIS', 'TMUS', 'NFLX', 'PLD', 'AMT', 'EQIX'
+];
+
+// Broad-market and large-sector ETFs with deep option markets (LEAP strikes exist and are reasonably liquid).
+const LONG_ETF_UNIVERSE = ['SPY', 'VOO', 'IVV', 'QQQ', 'DIA', 'VTI', 'RSP', 'VUG', 'VIG', 'SCHD', 'XLK', 'XLV', 'XLF', 'XLI', 'XLY', 'XLP', 'SMH', 'VGT'];
+const LONG_ETF_SET = (function () { const o = {}; LONG_ETF_UNIVERSE.forEach(function (t) { o[t] = true; }); return o; })();
+
+// Never listed even if a source tab has them (shared with CSP when it is loaded).
+function longNever_() {
+  return (typeof CSP_NEVER !== 'undefined') ? CSP_NEVER : [];
 }
-function flipCachePut_(cache, pending, key, value, now) {
-  const rec = { d: flipTodayYmd_(now), v: value };
-  cache[key] = rec;
-  pending[key] = JSON.stringify(rec);
+
+/* ----------------------------------------------------------------------------
+ * COLUMNS
+ * ---------------------------------------------------------------------------- */
+
+const LONG_INPUT_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry'];            // yours
+const LONG_HELD_WHEN_OPEN = ['Strike', 'Expiry'];                                // your entries while Qty is filled: never overwritten
+const LONG_EXTRA_HEADERS = ['Quality', 'Source', 'Type'];                        // written by Promote, not by the scan
+const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality',
+  'Earn Days', 'IV Rank', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
+  'Days', 'P/L $', 'Why', 'LastRun'];
+const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20', 'RS vs SPY %', 'Ret 1M %',
+  'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
+// Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
+const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
+// Headers you replaced with your own total formula in row 1 (Entry: SUMPRODUCT, P/L $: SUM). Setup never adds these headers back;
+// the scan finds the columns by position instead (see longHeaderMap_) and keeps writing P/L $ per row.
+const LONG_FORMULA_HEADERS = ['P/L $', 'Entry'];
+const LONG_HEADERS = LONG_VISIBLE_HEADERS.concat(LONG_DETAIL_HEADERS).concat(LONG_EXTRA_HEADERS.filter(function (h) { return LONG_VISIBLE_HEADERS.indexOf(h) === -1; }));   // Quality is visible, Source / Type hidden
+// Columns the scan writes (everything except your inputs and the promote-managed ones).
+const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1; });
+
+
+/* ============================================================================
+ * SETUP + MENU
+ * ========================================================================== */
+
+// Run ONCE from the Apps Script editor.
+function setupLong() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(LONG_SHEET_NAME);
+  const isNew = !sheet;
+  if (isNew) sheet = ss.insertSheet(LONG_SHEET_NAME);
+  const map = longEnsureHeaders_(sheet);
+  if (isNew) {
+    const rows = LONG_STARTER_TICKERS.map(function (t) {
+      const row = new Array(LONG_HEADERS.length).fill('');
+      row[map['Ticker'] - 1] = t;
+      return row;
+    });
+    sheet.getRange(2, 1, rows.length, LONG_HEADERS.length).setValues(rows);
+  }
+  longFormatSheet_(sheet);
+  longApplyVisibility_(sheet, false);
+
+  const triggers = ScriptApp.getProjectTriggers();
+  if (!triggers.some(function (t) { return t.getHandlerFunction() === 'longAddMenu_'; })) {
+    ScriptApp.newTrigger('longAddMenu_').forSpreadsheet(ss).onOpen().create();
+  }
+  try { longAddMenu_(); } catch (e) { /* no UI in some contexts; menu appears on next open */ }
+
+  notify_(tryGetUi_(), 'Long set up',
+    (isNew ? 'Created the Long tab with ' + LONG_STARTER_TICKERS.length + ' starter tickers.\n' : 'Long tab already existed: headers checked, your data untouched.\n') +
+    'Menu "📈 Long" appears after you reload the sheet.\n\n' +
+    'Next:\n  1. 📈 Long > Promote Research Picks to Long (adds quality names and ETFs)\n  2. 📈 Long > Run Long Scan\n' +
+    '  3. 📈 Long > Long Alerts & Schedule > Start Long Schedule (hourly checks + Telegram alerts)\n\n' +
+    'Type your LEAP into Qty, Entry Date, Entry (premium paid per share), Strike, Expiry. The rest fills in.');
+}
+
+function longAddMenu_() {
+  SpreadsheetApp.getUi()
+    .createMenu('📈 Long')
+    .addItem('Run Long Scan', 'runLongScan')
+    .addItem('Promote Research Picks to Long', 'runLongPromote')
+    .addItem('Show / Hide Detail Columns', 'longToggleDetailColumns_')
+    .addItem('🗂 Update Universe (Universe tab)', 'longUpdateUniverse')
+    .addSeparator()
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('📱 Long Alerts & Schedule')
+      .addItem('Send Test Long Alert', 'sendTestLongAlert_')
+      .addItem('Turn Long Alerts On / Off', 'toggleLongAlerts_')
+      .addSeparator()
+      .addItem('▶ Start Long Schedule (hourly, market hours)', 'startLongSchedule_')
+      .addItem('■ Stop Long Schedule', 'stopLongSchedule_')
+      .addItem('Schedule Status', 'longScheduleStatus_'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Long Debug')
+      .addItem('One Ticker (full decision trail)', 'debugLongOneTicker')
+      .addItem('Scan Dry Run (no writes)', 'runLongScanDryRun')
+      .addItem('Promote Dry Run (no writes)', 'runLongPromoteDryRun'))
+    .addToUi();
+}
+
+function runLongScanDryRun() { return runLongScan(null, true); }
+function runLongPromote() { return longPromoteFromResearch_({}); }
+function runLongPromoteDryRun() { return longPromoteFromResearch_({ dryRun: true }); }
+
+
+/* ============================================================================
+ * SHEET HELPERS (Entry and P/L $ may be your own formula columns; see longHeaderMap_)
+ * ========================================================================== */
+
+function longHeaderMap_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const row = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const map = {};
+  row.forEach(function (h, i) { const k = String(h || '').trim(); if (k && map[k] == null) map[k] = i + 1; });
+  // Entry and P/L $ headers may be replaced by your own total formulas (the cell shows a number, not the name): find them by position.
+  // Entry is the column right after "Entry Date".
+  if (map['Entry'] == null && map['Entry Date'] != null) map['Entry'] = map['Entry Date'] + 1;
+  // P/L $ sits between Days and Why; the scan writes the per-row value there (your row-1 formula can total it).
+  if (map['P/L $'] == null && map['Days'] != null && map['Why'] === map['Days'] + 2) map['P/L $'] = map['Days'] + 1;
+  return map;
+}
+
+// Adds any missing header at the end. Existing columns, order and data stay.
+function longEnsureHeaders_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const existing = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h || '').trim(); });
+  if (!existing.some(function (h) { return h !== ''; })) {
+    sheet.getRange(1, 1, 1, LONG_HEADERS.length).setValues([LONG_HEADERS]);
+  } else {
+    let next = existing.length;
+    while (next > 0 && existing[next - 1] === '') next--;
+    LONG_HEADERS.forEach(function (h) {
+      if (LONG_FORMULA_HEADERS.indexOf(h) !== -1) return;   // your formula columns: never add them back
+      if (existing.indexOf(h) === -1) { next++; sheet.getRange(1, next).setValue(h); existing[next - 1] = h; }
+    });
+  }
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(1);
+  return longHeaderMap_(sheet);
+}
+
+function longApplyVisibility_(sheet, showAll) {
+  const map = longHeaderMap_(sheet);
+  const last = sheet.getLastColumn();
+  if (last < 1) return;
+  sheet.showColumns(1, last);
+  if (showAll) return;
+  const vis = {};
+  LONG_VISIBLE_HEADERS.forEach(function (h) { vis[h] = true; });
+  const hide = [];
+  for (let c = 1; c <= last; c++) hide.push(false);
+  Object.keys(map).forEach(function (h) { if (!vis[h]) hide[map[h] - 1] = true; });
+  for (let c = 0; c < last; c++) {
+    if (!hide[c]) continue;
+    let e = c;
+    while (e + 1 < last && hide[e + 1]) e++;
+    sheet.hideColumns(c + 1, e - c + 1);
+    c = e;
+  }
+}
+
+function longToggleDetailColumns_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LONG_SHEET_NAME);
+  if (!sheet) return;
+  const map = longHeaderMap_(sheet);
+  const hidden = map['DTE'] ? sheet.isColumnHiddenByUser(map['DTE']) : false;
+  longApplyVisibility_(sheet, hidden);
+}
+
+// Change colours (conditional formatting, so they stay right): dark green positive, red negative.
+function longApplyChangeRules_(sheet, map, onlyIfMissing) {
+  try {
+    const col = map['Change'];
+    if (!col) return;
+    const rules = sheet.getConditionalFormatRules();
+    const mine = function (r) { return r.getRanges().some(function (x) { return x.getColumn() <= col && x.getLastColumn() >= col; }); };
+    if (onlyIfMissing && rules.some(mine)) return;
+    const rng = sheet.getRange(2, col, Math.max(sheet.getMaxRows() - 1, 1), 1);
+    const neg = SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([rng]).build();
+    const pos = SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(0).setFontColor('#38761d').setRanges([rng]).build();
+    sheet.setConditionalFormatRules(rules.filter(function (r) { return !mine(r); }).concat([neg, pos]));
+  } catch (e) { logToSheet_('Long: could not apply Change colours: ' + (e && e.message ? e.message : e)); }
+}
+
+function longFormatSheet_(sheet) {
+  const map = longHeaderMap_(sheet);
+  const maxRows = Math.max(sheet.getMaxRows() - 1, 1);
+  function fmt(h, f) { if (map[h]) sheet.getRange(2, map[h], maxRows, 1).setNumberFormat(f); }
+  ['Entry', 'Price', 'Strike', 'Mid', 'Bid', 'Ask', '52w High', '52w Low', 'Analyst', 'Extrinsic $'].forEach(function (h) { fmt(h, '$#,##0.00'); });
+  fmt('Change', '$#,##0.00;-$#,##0.00;$0.00');
+  fmt('Stock Equiv $', '$#,##0'); fmt('Capital Saved $', '$#,##0'); fmt('P/L $', '$#,##0;-$#,##0;$0');
+  ['Entry Date', 'Expiry', 'Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });
+  fmt('LastRun', 'yyyy-mm-dd hh:mm');
+  ['Off High %', 'T200 %', 'X50 %', 'RS vs SPY %', 'Ret 1M %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RS vs SPY %', 'Ret 1M %', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality']
+    .forEach(function (h) { fmt(h, '0.0'); });
+  ['Score', 'Delta', 'Lev'].forEach(function (h) { fmt(h, '0.00'); });
+  LONG_INPUT_HEADERS.concat(LONG_HELD_WHEN_OPEN).forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
+  LONG_OUTPUT_HEADERS.forEach(function (h) { if (map[h] && LONG_HELD_WHEN_OPEN.indexOf(h) === -1) sheet.getRange(1, map[h]).setBackground('#d9ead3'); });
+  LONG_EXTRA_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#cfe2f3'); });
+  LONG_FORMULA_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
+  longApplyChangeRules_(sheet, map, false);
+  sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
 }
 
 
 /* ============================================================================
- * DATA FETCHERS (all batched: one request per chunk, not per ticker)
+ * PURE FUNCTIONS (no Apps Script services except Utilities.formatDate in text helpers — unit-testable)
  * ========================================================================== */
 
-function flipParseChart_(text) {
-  try {
-    const json = JSON.parse(text);
-    const r = json.chart && json.chart.result && json.chart.result[0];
-    if (!r || !r.timestamp || !r.indicators || !r.indicators.quote || !r.indicators.quote[0]) return null;
-    const q = r.indicators.quote[0], ts = r.timestamp, bars = [];
-    for (let i = 0; i < ts.length; i++) {
-      const h = q.high ? q.high[i] : null, l = q.low ? q.low[i] : null, c = q.close ? q.close[i] : null;
-      if (h == null || l == null || c == null) continue;
-      const v = q.volume && q.volume[i] != null ? q.volume[i] : 0;
-      bars.push([Utilities.formatDate(new Date(ts[i] * 1000), 'America/New_York', 'yyyy-MM-dd'), Math.round(h * 100) / 100, Math.round(l * 100) / 100, Math.round(c * 100) / 100, v]);
-    }
-    return bars.length ? bars : null;
-  } catch (e) { return null; }
+function longLin_(v, zero, full) {
+  if (v == null || isNaN(v)) return 0.5;                 // missing input: half credit, never zero
+  const x = (v - zero) / (full - zero);
+  return x < 0 ? 0 : (x > 1 ? 1 : x);
+}
+function longRound_(v, d) { const p = Math.pow(10, d == null ? 1 : d); return Math.round(v * p) / p; }
+function longFmtDate_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), 'MMM-dd-yyyy'); }
+function longYmd_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd'); }
+function longIsDate_(v) { return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime()); }
+function longDaysBetween_(from, to) { return Math.round((to.getTime() - from.getTime()) / 86400000); }
+
+// dates: 'yyyy-MM-dd' per bar (exchange date), closes: matching closes. todayYmd: a bar dated today is still forming and is dropped.
+// Returns small JSON (cacheable) or null. Needs 201+ completed closes (200-day average and yesterday's 200-day average).
+function longTechFromBars_(dates, closes, todayYmd) {
+  if (!dates || !closes || dates.length !== closes.length) return null;
+  let n = closes.length;
+  if (n && dates[n - 1] === todayYmd) n--;
+  const c = closes.slice(0, n);
+  if (c.length < 201) return null;
+  const last = c[c.length - 1];
+  const prev = c.slice(0, -1);
+  const yr = c.slice(-252);
+  const hi52 = Math.max.apply(null, yr), lo52 = Math.min.apply(null, yr);
+  // Bounce: lowest close of the last 120 sessions, how long ago, how much of the fall from the 52w high has been regained.
+  const w = c.slice(-120);
+  let lowV = w[0], lowI = 0;
+  for (let i = 1; i < w.length; i++) if (w[i] <= lowV) { lowV = w[i]; lowI = i; }
+  const fall = hi52 > 0 ? (hi52 - lowV) / hi52 * 100 : null;
+  const bounce = (hi52 > lowV) ? (last - lowV) / (hi52 - lowV) * 100 : null;
+  return {
+    asOf: dates[n - 1], price: last, c2: prev[prev.length - 1],
+    ma20: cspSma_(c, 20), ma50: cspSma_(c, 50), ma200: cspSma_(c, 200), prevMa200: cspSma_(prev, 200),
+    hi52: hi52, lo52: lo52, rsi: cspRsi_(c, 14), hv20: cspHv_(c, 20),
+    ret5: c.length > 5 ? (last / c[c.length - 6] - 1) * 100 : null,
+    ret21: c.length > 21 ? (last / c[c.length - 22] - 1) * 100 : null,
+    ret63: c.length > 63 ? (last / c[c.length - 64] - 1) * 100 : null,
+    ret126: c.length > 126 ? (last / c[c.length - 127] - 1) * 100 : null,
+    fall: fall, bounce: bounce, lowAge: w.length - 1 - lowI, n: c.length
+  };
 }
 
-// Daily bars for many tickers in parallel (UrlFetchApp.fetchAll, chunks of 20). Returns { T: [[date,h,l,c,v], ...] }.
-function flipFetchBars_(tickers, range) {
+// Metrics of one call contract. c = { bid, ask, delta, oi, strike, dte }.
+function longContractMetrics_(c, spot) {
+  const two = c.bid != null && c.ask != null && c.bid > 0 && c.ask >= c.bid;
+  const mid = two ? (c.bid + c.ask) / 2 : null;
+  const spreadPct = (two && mid > 0) ? (c.ask - c.bid) / mid * 100 : null;
+  const intrinsic = Math.max(0, spot - c.strike);
+  const extrinsic = mid != null ? mid - intrinsic : null;
+  const carry = (extrinsic != null && c.dte > 0) ? extrinsic / spot * 100 / (c.dte / 365) : null;
+  const breakeven = extrinsic != null ? extrinsic / spot * 100 : null;
+  const lev = (mid != null && mid > 0 && c.delta != null) ? c.delta * spot / mid : null;
+  return { mid: mid, spreadPct: spreadPct, intrinsic: intrinsic, extrinsic: extrinsic, carry: carry, breakeven: breakeven, lev: lev };
+}
+
+// Picks the cheapest-to-hold contract that passes every gate. cands: [{expiry:Date, dte, strike, bid, ask, delta, oi}].
+// Returns { ok:true, pick, m } or { ok:false, near, why } where near is the closest candidate (fewest failures, then tightest spread as a tiebreak).
+function longChooseContract_(cands, spot, cfg) {
+  const K = cfg.contract;
+  let best = null, nearest = null;
+  cands.forEach(function (c) {
+    const m = longContractMetrics_(c, spot);
+    const f = [];
+    if (m.mid == null) f.push('no two-sided quote');
+    if (c.delta == null) f.push('no delta');
+    else if (c.delta < K.minDelta || c.delta > K.maxDelta) f.push('delta ' + longRound_(c.delta, 2) + ' outside ' + K.minDelta + '-' + K.maxDelta);
+    if (c.dte < K.minDte || c.dte > K.maxDte) f.push(c.dte + 'd outside ' + K.minDte + '-' + K.maxDte);
+    if (K.maxSpreadPct != null && m.spreadPct != null && m.spreadPct > K.maxSpreadPct) f.push('spread ' + longRound_(m.spreadPct, 1) + '% > ' + K.maxSpreadPct + '%');
+    if (c.oi != null && c.oi < K.minOi) f.push('OI ' + c.oi + ' < ' + K.minOi);
+    if (m.mid != null && m.mid < K.minMid) f.push('mid $' + longRound_(m.mid, 2) + ' < $' + K.minMid);
+    if (m.extrinsic != null && m.extrinsic < 0) f.push('quote below intrinsic');
+    if (m.carry != null && m.carry > K.maxCarryPct) f.push('carry ' + longRound_(m.carry, 1) + '%/yr > ' + K.maxCarryPct + '%');
+    const score = f.length * 1000 + (m.spreadPct != null ? m.spreadPct : 50);
+    if (!nearest || score < nearest.score) nearest = { score: score, c: c, m: m, fails: f };
+    if (!f.length) {
+      const cost = m.carry;
+      if (!best || cost < best.cost) best = { cost: cost, c: c, m: m };
+    }
+  });
+  if (best) return { ok: true, pick: best.c, m: best.m };
+  if (!nearest) return { ok: false, near: null, why: 'no candidate contracts' };
+  const n = nearest.c;
+  return {
+    ok: false,
+    near: { strike: n.strike, expiry: n.expiry, oi: n.oi, volume: n.volume, mid: nearest.m.mid, spreadPct: nearest.m.spreadPct },
+    why: 'no usable contract: none of ' + cands.length + ' passed; closest $' + n.strike + 'C ' + longFmtDate_(n.expiry) + ': ' + nearest.fails.join(', ')
+  };
+}
+
+// Score 0-100: Quality 30 + Trend 20 + Entry timing 20 + Contract efficiency 20 + Upside 10. Missing inputs get half credit.
+function longScore_(x) {
+  const p = {};
+  p.quality = 30 * longLin_(x.quality, 50, 90);
+  // Trend 20 = vs 200-day 8 + 50/200 gap 5 + relative strength vs SPY 7 (stock's 3- and 6-month return minus SPY's, in points).
+  p.trend = 8 * longLin_(x.vs200, 0, 15) + 5 * longLin_(x.x50, 0, 8) + 7 * longLin_(x.rs, -5, 10);
+  // Timing 20 = RSI 7 + last-month dip 5 (full credit at -8% or lower) + closeness to the 52w high 4 + IV Rank 4.
+  p.timing = 7 * longLin_(x.rsi, 60, 40) + 5 * longLin_(x.ret21, 0, -8) + 4 * longLin_(x.offHigh, 25, 10) + 4 * longLin_(x.ivr, 60, 20);
+  p.contract = 13 * longLin_(x.carry, 8, 3) +      // bid-ask spread no longer scores; its 6 points moved to carry (+3) and delta (+3) so the total stays 20
+    7 * (x.delta == null ? 0.5 : 1 - Math.min(1, Math.abs(x.delta - 0.85) / 0.1));
+  p.upside = 10 * longLin_(x.upside, -5, 20);
+  let s = 0;
+  Object.keys(p).forEach(function (k) { s += p[k]; });
+  return { score: longRound_(s, 1), parts: p };
+}
+
+// Entry decision for a row you do NOT hold. x: vs200, x50, offHigh, rsi, ivr, bounce, fall, lowAge, quality (null ok), isEtf, risk (null ok),
+// score, contractOk, contractWhy.
+function longEvaluateEntry_(x, cfg) {
+  const E = cfg.entry;
+  const skip = [];
+  if (!(x.vs200 > 0)) skip.push('price under the 200-day' + (x.vs200 != null ? ' (' + longRound_(x.vs200, 1) + '%)' : ''));
+  if (!(x.x50 > 0)) skip.push('50-day under the 200-day');
+  if (x.offHigh != null && x.offHigh > E.skipOffHigh) skip.push(longRound_(x.offHigh, 1) + '% under the 52-week high (limit ' + E.skipOffHigh + '%)');
+  const qFloor = x.isEtf ? E.qualityFloorEtf : E.qualityFloor;
+  if (x.quality != null && x.quality < qFloor) skip.push('Quality ' + longRound_(x.quality, 1) + ' < ' + qFloor);
+  if (!x.contractOk) skip.push(x.contractWhy);
+  if (skip.length) return { action: 'SKIP', why: skip };
+
+  const strong = x.offHigh != null && x.rsi != null && x.offHigh <= E.strongMaxOffHigh && x.rsi <= E.strongMaxRsi;
+  const light = x.offHigh != null && x.rsi != null && x.offHigh <= E.lightMaxOffHigh && x.rsi <= E.lightMaxRsi;
+  const ivOk = x.ivr == null || x.ivr <= E.maxIvr;
+  const timingOk = (strong || light) && ivOk;
+  const bounceLane = x.offHigh != null && x.offHigh <= E.bounceMaxOffHigh && x.bounce != null && x.bounce >= E.bounceMinPct &&
+    x.fall != null && x.fall >= E.bounceMinFallPct && x.lowAge != null && x.lowAge >= E.bounceMinLowAgeDays;
+
+  const missing = [];
+  if (!(strong || light)) missing.push('needs a pullback: Off High <= ' + E.lightMaxOffHigh + '% and RSI <= ' + E.lightMaxRsi + ' (now ' +
+    (x.offHigh != null ? longRound_(x.offHigh, 1) + '%' : '?') + ' / RSI ' + (x.rsi != null ? Math.round(x.rsi) : '?') + ')');
+  if (!ivOk) missing.push('IV Rank ' + Math.round(x.ivr) + ' > ' + E.maxIvr);
+  if (x.score < E.scoreBuy) missing.push('Score ' + x.score + ' < ' + E.scoreBuy);
+
+  if (x.risk == null) return { action: 'WAIT', why: ['Risk model could not price this contract'] };
+  if (x.risk > E.riskGate) {
+    return { action: 'WAIT', why: ['Risk ' + longRound_(x.risk, 1) + ' > ' + E.riskGate + ': premium likely to drop 20%+ within 30 days, wait for the dip'] };
+  }
+  if (timingOk && x.score >= E.scoreBuy && E.regimeGate && x.regimeOk === false) {
+    return { action: 'READY', why: ['market regime: SPY is under its 200-day, so no new BUY (this would otherwise be a BUY, Score ' + x.score + ')'] };
+  }
+  if (timingOk && x.score >= E.scoreBuy) return { action: 'BUY', why: [(strong ? 'strong' : 'light') + ' pullback in an uptrend, Risk ' + longRound_(x.risk, 1) + ', Score ' + x.score] };
+  if (x.score >= E.scoreReady) {
+    if (!timingOk && bounceLane) return { action: 'READY', why: ['bounce lane (recovering ' + Math.round(x.bounce) + '% of the fall, low ' + x.lowAge + ' sessions ago), not a BUY', missing.join('; ')] };
+    return { action: 'READY', why: missing };
+  }
+  return { action: 'WAIT', why: missing.length ? missing : ['Score ' + x.score + ' < ' + E.scoreReady] };
+}
+
+// Action for a position you hold. h: dte, pl (% or null), spot, tech {price,c2,ma200,prevMa200}, upside, quality, isEtf, carry.
+// Precedence: TREND EXIT > ROLL > TAKE PROFIT > REVIEW > HOLD.
+function longHeldAction_(h, cfg) {
+  const X = cfg.exits, E = cfg.entry;
+  const t = h.tech;
+  if (h.dte != null && h.dte <= 0) return { action: 'ROLL', why: 'expired or expiring today' };
+  if (t && t.ma200 && h.spot != null) {
+    const twoCloses = t.price < t.ma200 && t.prevMa200 != null && t.c2 < t.prevMa200 && h.spot < t.ma200;
+    const brokenBand = h.spot <= t.ma200 * (1 - X.trendBandPct / 100);
+    if (twoCloses || brokenBand) {
+      return { action: 'TREND EXIT', why: brokenBand ? 'price ' + longRound_((h.spot / t.ma200 - 1) * 100, 1) + '% vs the 200-day (exit band -' + X.trendBandPct + '%)'
+        : '2 closes under the 200-day and price still under it' };
+    }
+  }
+  if (h.dte != null && h.dte <= X.rollDte) return { action: 'ROLL', why: h.dte + ' days left (roll at ' + X.rollDte + ' or less): move to ' + cfg.contract.minDte + '+ days' };
+  if (h.pl != null && h.pl >= X.takeProfitPct) return { action: 'TAKE PROFIT', why: 'option +' + longRound_(h.pl, 1) + '% vs Entry (target +' + X.takeProfitPct + '%)' };
+  const rv = [];
+  if (h.upside != null && h.upside < 0) rv.push('analyst target ' + longRound_(-h.upside, 1) + '% under the price');
+  const qFloor = h.isEtf ? E.qualityFloorEtf : E.qualityFloor;
+  if (h.quality != null && h.quality < qFloor) rv.push('Quality ' + longRound_(h.quality, 1) + ' < ' + qFloor);
+  if (h.carry != null && h.carry > X.reviewCarryPct) rv.push('carry ' + longRound_(h.carry, 1) + '%/yr > ' + X.reviewCarryPct + '%');
+  if (rv.length) return { action: 'REVIEW', why: rv.join('; ') };
+  return { action: 'HOLD', why: 'trend intact' + (h.pl != null ? ', option ' + (h.pl >= 0 ? '+' : '') + longRound_(h.pl, 1) + '%' : '') };
+}
+
+function longSortKey_(action, score, pl) {
+  const s = score != null && !isNaN(score) ? score : 0;
+  switch (action) {
+    case 'TREND EXIT': return 3200;
+    case 'ROLL': return 3100;
+    case 'TAKE PROFIT': return 3000 + (pl != null ? Math.min(99, Math.max(0, pl) / 10) : 0);
+    case 'FILL IN': return 2900;
+    case 'REVIEW': return 2800;
+    case 'BUY': return 2000 + s;
+    case 'HOLD': return 1500;
+    case 'READY': return 1200 + s;
+    case 'WAIT': return 1000 + s;
+    default: return s;   // SKIP
+  }
+}
+
+function longTrendLabel_(vs200, vs50, vs20) {
+  if (vs200 == null) return '';
+  if (vs200 > 0 && vs50 != null && vs50 > 0) return 'Up';
+  if (vs200 > 0) return 'Pullback';
+  if (vs50 != null && vs50 < 0) return 'Down';
+  return 'Mixed';
+}
+
+
+/* ============================================================================
+ * DATA FETCH
+ * ========================================================================== */
+
+// Daily bars WITH exchange dates (the shared fetcher drops the dates). Returns { dates, closes } or null.
+const LONG_YAHOO_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' };
+function longBarsUrl_(host, ticker) { return 'https://' + host + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=1y&interval=1d'; }
+
+function longParseBars_(resp) {
+  if (!resp || resp.getResponseCode() !== 200) return null;
+  const result = JSON.parse(resp.getContentText()).chart.result[0];
+  const ts = result.timestamp, q = result.indicators.quote[0];
+  if (!ts || !q || !q.close) return null;
+  const off = (result.meta && typeof result.meta.gmtoffset === 'number') ? result.meta.gmtoffset : -4 * 3600;
+  const dates = [], closes = [];
+  for (let k = 0; k < ts.length; k++) {
+    if (!isPlausible_(q.close[k], 0.01, null)) continue;
+    dates.push(new Date((ts[k] + off) * 1000).toISOString().slice(0, 10));   // exchange-local calendar date
+    closes.push(q.close[k]);
+  }
+  return closes.length >= 201 ? { dates: dates, closes: closes } : null;
+}
+
+function longFetchBars_(ticker) {
+  const hosts = ['query1', 'query2'];
+  for (let i = 0; i < hosts.length; i++) {
+    try {
+      const b = longParseBars_(UrlFetchApp.fetch(longBarsUrl_(hosts[i], ticker), { method: 'get', muteHttpExceptions: true, headers: LONG_YAHOO_HEADERS }));
+      if (b) return b;
+    } catch (e) { Logger.log('Long bars error for ' + ticker + ': ' + e); }
+  }
+  return null;
+}
+
+// Speed: the first scan of a day needs daily bars for every ticker. Instead of one request after another, fetch the stale ones
+// in parallel (8 at a time) and put them in the same cache longFetchTech_ reads. Anything that fails here is simply fetched the old way.
+function longPrefetchBars_(tickers, ctx) {
+  const stale = tickers.filter(function (t) {
+    return slowEntryAgeDays_(ctx.slowCache[slowKey_('LONGTECH2', t)]) >= SLOW_REFRESH_DAYS.DAILYBARS;
+  });
+  for (let i = 0; i < stale.length; i += 8) {
+    const chunk = stale.slice(i, i + 8);
+    let resps;
+    try {
+      resps = UrlFetchApp.fetchAll(chunk.map(function (t) { return { url: longBarsUrl_('query1', t), method: 'get', muteHttpExceptions: true, headers: LONG_YAHOO_HEADERS }; }));
+    } catch (e) { Logger.log('Long bars prefetch error: ' + e); continue; }
+    chunk.forEach(function (t, k) {
+      try {
+        const b = longParseBars_(resps[k]);
+        const tech = b ? longTechFromBars_(b.dates, b.closes, longTodayYmdEt_()) : null;
+        if (tech) {
+          const key = slowKey_('LONGTECH2', t), rec = { date: todayKey_(), value: tech };
+          ctx.pending[key] = JSON.stringify(rec); ctx.slowCache[key] = rec;
+        }
+      } catch (e) { /* normal path retries this ticker */ }
+    });
+  }
+}
+
+// Speed: one request for every live stock price instead of one per row. Missing tickers fall back to the single-ticker call.
+function longPrefetchQuotes_(tickers, token) {
   const out = {};
+  if (!token) return out;
   for (let i = 0; i < tickers.length; i += 20) {
     const chunk = tickers.slice(i, i + 20);
-    const reqs = chunk.map(function (t) {
-      return { url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(t) + '?range=' + range + '&interval=1d', method: 'get', muteHttpExceptions: true,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' } };
-    });
-    let resps = [];
-    try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { logToSheet_('Flip: daily bars batch failed: ' + e); continue; }
-    resps.forEach(function (r, k) {
-      if (r.getResponseCode() !== 200) return;
-      const bars = flipParseChart_(r.getContentText());
-      if (bars) out[chunk[k]] = bars;
-    });
-    if (i + 20 < tickers.length) Utilities.sleep(200);
-  }
-  return out;
-}
-
-function flipBarsToObjects_(arr) { return (arr || []).map(function (b) { return { d: b[0], h: b[1], l: b[2], c: b[3], v: b[4] }; }); }
-
-// Bars for these tickers: today's cache first, one parallel fetch for the rest.
-function flipGetBars_(tickers, ctx, range, keyPrefix) {
-  const out = {}, need = [];
-  tickers.forEach(function (t) {
-    const hit = flipCacheGet_(ctx.cache, keyPrefix + '|' + t, 0, ctx.now);
-    if (hit) out[t] = hit; else need.push(t);
-  });
-  if (need.length) {
-    const got = flipFetchBars_(need, range);
-    Object.keys(got).forEach(function (t) { out[t] = got[t]; flipCachePut_(ctx.cache, ctx.pending, keyPrefix + '|' + t, got[t], ctx.now); });
-  }
-  return out;
-}
-
-// Cloud Function "daily": 52-week position and 200/50-day trend. One request for all tickers. Cached for the day.
-function flipGetDaily_(tickers, ctx) {
-  const out = {}, need = [];
-  tickers.forEach(function (t) {
-    const hit = flipCacheGet_(ctx.cache, 'FDAILY|' + t, 0, ctx.now);
-    if (hit) out[t] = hit; else need.push(t);
-  });
-  if (!need.length) return out;
-  const url = getCloudFunctionUrl_(), secret = getCloudFunctionSharedSecret_();
-  if (!url || !secret) return out;
-  try {
-    const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true, payload: JSON.stringify({ apiKey: secret, daily: { tickers: need } }) });
-    if (resp.getResponseCode() !== 200) { logToSheet_('Flip: Cloud Function daily HTTP ' + resp.getResponseCode()); return out; }
-    const res = JSON.parse(resp.getContentText()).dailyResults || {};
-    Object.keys(res).forEach(function (t) {
-      const d = res[t];
-      const slim = { t200: d.t200, x50: d.x50, offHigh: d.offHigh, high52: d.high52, low52: d.low52, price: d.price, sma200: d.sma200 };
-      out[t] = slim; flipCachePut_(ctx.cache, ctx.pending, 'FDAILY|' + t, slim, ctx.now);
-    });
-  } catch (e) { logToSheet_('Flip: Cloud Function daily failed: ' + e); }
-  return out;
-}
-
-// Next earnings date (or null). Cached 2 days; Finnhub first, Yahoo second.
-function flipEarnings_(ticker, ctx) {
-  const key = 'EARN|' + ticker;
-  const hit = flipCacheGet_(ctx.cache, key, 2, ctx.now);
-  if (hit) return hit.date ? new Date(hit.date + 'T12:00:00') : null;
-  let c = null;
-  try { c = ctx.finnhubKey ? fetchFinnhubNextEarnings_(ticker, ctx.finnhubKey) : null; } catch (e) { c = null; }
-  if (!c) { try { c = fetchYahooNextEarnings_(ticker); } catch (e) { c = null; } }
-  const date = c && c.date ? Utilities.formatDate(c.date, 'America/New_York', 'yyyy-MM-dd') : null;
-  flipCachePut_(ctx.cache, ctx.pending, key, { date: date }, ctx.now);
-  ctx.earnFetched = (ctx.earnFetched || 0) + 1;
-  return date ? new Date(date + 'T12:00:00') : null;
-}
-
-// Picks the stock-proxy contract for one ticker (cached for the day). Needs live two-sided quotes, so it only succeeds
-// while the market is open; outside hours it returns the last good pick (up to probeMaxAgeDays old) marked stale.
-function flipPickContract_(ticker, spot, sigmaDay, ctx) {
-  const key = 'CON|' + ticker;
-  const today = flipCacheGet_(ctx.cache, key, 0, ctx.now);
-  if (today) return today;
-  const C = FLIP_CONFIG;
-  let res = { ok: false, why: 'no TastyTrade chain' };
-  if (ctx.token && spot > 0) {
-    let chain = ctx.chains[ticker];
-    if (chain === undefined) {
-      try { chain = fetchTastyOptionChainNested_(ticker, ctx.token) || null; } catch (e) { chain = null; }
-      ctx.chains[ticker] = chain;
-    }
-    if (chain) {
-      const exps = chain.map(function (e) { return { e: e, dte: Math.round((e.date.getTime() - ctx.now.getTime()) / 86400000) }; })
-        .filter(function (x) { return x.dte >= C.minDte && x.dte <= C.maxDte; })
-        .sort(function (a, b) { return Math.abs(a.dte - C.targetDte) - Math.abs(b.dte - C.targetDte); }).slice(0, 2);
-      const ivGuess = flipClamp_((sigmaDay || 2.5) * Math.sqrt(252) * 1.1, 25, 120);
-      const list = [];
-      exps.forEach(function (x) {
-        x.e.strikes.filter(function (s) { return s.callSymbol && s.strike >= spot * 0.5 && s.strike <= spot * 0.99; })
-          .map(function (s) { const d = blackScholesDelta_(spot, s.strike, x.dte, ivGuess, 'C'); return { s: s, est: d }; })
-          .filter(function (z) { return z.est != null && z.est >= 0.70 && z.est <= 0.97; })
-          .sort(function (a, b) { return Math.abs(a.est - 0.85) - Math.abs(b.est - 0.85); }).slice(0, 9)
-          .forEach(function (z) { list.push({ sym: z.s.callSymbol, strike: z.s.strike, est: z.est, dte: x.dte, expiry: x.e.date }); });
+    try {
+      const url = 'https://api.tastyworks.com/market-data/by-type?' + chunk.map(function (t) { return 'equity=' + encodeURIComponent(t); }).join('&');
+      const resp = fetchTastyWithRetry_(url, token);
+      if (resp.getResponseCode() !== 200) continue;
+      const items = (JSON.parse(resp.getContentText()).data || {}).items || [];
+      items.forEach(function (item) {
+        const sym = String(item.symbol || '').toUpperCase();
+        if (!sym) return;
+        const bid = parseFloat(item.bid), ask = parseFloat(item.ask);
+        const last = item.last != null ? parseFloat(item.last) : null;
+        const mark = item.mark != null ? parseFloat(item.mark) : (!isNaN(bid) && !isNaN(ask) ? (bid + ask) / 2 : null);
+        const cur = (last != null && !isNaN(last)) ? last : mark;
+        const price = isPlausible_(cur, 0.01, null) ? cur : null;
+        const pcRaw = item['prev-close'] != null ? item['prev-close'] : (item['previous-close'] != null ? item['previous-close'] : (item['close-price'] != null ? item['close-price'] : item.close));
+        const pc = pcRaw != null ? parseFloat(pcRaw) : null;
+        if (price != null) out[sym] = { price: price, change: (pc != null && !isNaN(pc) && pc !== 0) ? price - pc : null };
       });
-      if (list.length) {
-        const md = fetchTastyMarketDataBatch_(list.map(function (z) { return z.sym; }), ctx.token);
-        const cands = list.map(function (z) {
-          const q = md[z.sym];
-          if (!q) return null;
-          const mid = (q.bid > 0 && q.ask > 0) ? (q.bid + q.ask) / 2 : null;
-          const iv = mid ? impliedVolatilityBisection_(mid, spot, z.strike, z.dte, 'C') : null;
-          return { strike: z.strike, bid: q.bid, ask: q.ask, delta: q.delta != null ? q.delta : z.est, oi: q.oi, volume: q.volume, dte: z.dte, symbol: z.sym, expiry: z.expiry, iv: iv };
-        }).filter(Boolean);
-        res = flipChooseContract_(cands, spot, C);
-      } else res = { ok: false, why: 'no strike near delta 0.85' };
+    } catch (e) { Logger.log('Long quote prefetch error: ' + e); }
+  }
+  return out;
+}
+
+function longTodayYmdEt_() { return Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd'); }
+
+function longFetchTech_(ticker, ctx) {
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'LONGTECH2', ticker, SLOW_REFRESH_DAYS.DAILYBARS, function () {
+    const b = longFetchBars_(ticker);
+    return b ? longTechFromBars_(b.dates, b.closes, longTodayYmdEt_()) : null;
+  });
+  if (res.fetchAttempted) Utilities.sleep(LONG_CONFIG.sleepMs);
+  return res.value || null;
+}
+
+function longFetchEarnings_(ticker, ctx) {
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'CATALYST', ticker, SLOW_REFRESH_DAYS.CATALYST, function () {
+    let c = ctx.finnhubKey ? fetchFinnhubNextEarnings_(ticker, ctx.finnhubKey) : null;
+    if (!c) c = fetchYahooNextEarnings_(ticker);
+    if (!c) return null;
+    return { date: c.date ? Utilities.formatDate(c.date, Session.getScriptTimeZone(), 'yyyy-MM-dd') : null };
+  }, isCatalystPast_);
+  if (res.fetchAttempted) Utilities.sleep(LONG_CONFIG.sleepMs);
+  return (res.value && res.value.date) ? new Date(res.value.date + 'T12:00:00') : null;
+}
+
+function longFetchAnalyst_(ticker, ctx) {
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'ANALYST', ticker, SLOW_REFRESH_DAYS.ANALYST, function () {
+    const a = fetchYahooAnalystTarget_(ticker);
+    return a ? { target: a.target } : null;
+  });
+  if (res.fetchAttempted) Utilities.sleep(LONG_CONFIG.sleepMs);
+  return (res.value && res.value.target) ? res.value.target : null;
+}
+
+// Quote of ONE call contract -> candidate object (bid/ask/delta/oi/volume from Tasty; mark fallback elsewhere). Null if nothing usable.
+function longQuoteContract_(ticker, expiry, strike, ctx, now) {
+  const occ = buildOccSymbol_(ticker, expiry, strike, 'C');
+  let md = null;
+  try { const m = fetchTastyMarketDataBatch_([occ], ctx.token); md = m && m[occ]; } catch (e) { /* below */ }
+  return { occ: occ, expiry: expiry, strike: strike, dte: longDaysBetween_(now, expiry),
+    bid: md ? md.bid : null, ask: md ? md.ask : null, delta: md ? md.delta : null, oi: md ? md.oi : null, volume: md ? md.volume : null };
+}
+
+
+// The single listed expiry within 1.5 days of the entered one (but not the same day), or null.
+function longSnapExpiry_(ticker, expiry, ctx) {
+  if (!ctx.token) return null;
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain) return null;
+  const want = longYmd_(expiry);
+  const hits = chain.filter(function (e) {
+    return longYmd_(e.date) !== want && Math.abs(e.date.getTime() - expiry.getTime()) <= 1.5 * 86400000;
+  });
+  return hits.length === 1 ? hits[0].date : null;
+}
+
+// Only runs when a held contract has no usable quote: asks the chain why (expiry not listed? strike not listed? just no quote yet?).
+function longExplainMissingQuote_(ticker, expiry, strike, ctx, now) {
+  if (!ctx.token) return 'no TastyTrade token';
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain || !chain.length) return 'no option chain returned for ' + ticker;
+  const want = longYmd_(expiry);
+  const exp = chain.filter(function (e) { return longYmd_(e.date) === want; })[0];
+  if (!exp) {
+    const near = chain.map(function (e) { return { d: longYmd_(e.date), gap: Math.abs(e.date.getTime() - expiry.getTime()) }; })
+      .sort(function (a, b) { return a.gap - b.gap; }).slice(0, 3).map(function (x) { return x.d; });
+    return 'expiry ' + want + ' is not listed (nearest: ' + near.join(', ') + ') - check the Expiry cell';
+  }
+  const hit = exp.strikes.filter(function (s) { return Math.abs(s.strike - strike) < 0.001 && s.callSymbol; })[0];
+  if (!hit) {
+    const near = exp.strikes.filter(function (s) { return s.callSymbol; })
+      .sort(function (a, b) { return Math.abs(a.strike - strike) - Math.abs(b.strike - strike); }).slice(0, 3).map(function (s) { return s.strike; });
+    return 'strike ' + strike + ' is not listed for ' + want + ' (nearest: ' + near.join(', ') + ') - check the Strike cell';
+  }
+  return 'contract is listed but TastyTrade returned no bid/ask yet';
+}
+
+// Full pick from the Tasty chain: the expiries nearest the target DTE, the strikes nearest 84% of spot, one batched quote call.
+function longPickContract_(ticker, spot, ctx) {
+  const K = LONG_CONFIG.contract, now = ctx.now;
+  if (!ctx.token) return { ok: false, near: null, why: 'no TastyTrade token: Long needs real delta, bid/ask and open interest' };
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain) return { ok: false, near: null, why: 'no option chain from TastyTrade' };
+  const exps = chain.map(function (e) { return { e: e, dte: longDaysBetween_(now, e.date) }; })
+    .filter(function (x) { return x.dte >= K.minDte && x.dte <= K.maxDte; })
+    .sort(function (a, b) { return Math.abs(a.dte - K.targetDte) - Math.abs(b.dte - K.targetDte); })
+    .slice(0, K.expiriesToTry);
+  if (!exps.length) {
+    const longest = chain.reduce(function (m, e) { return Math.max(m, longDaysBetween_(now, e.date)); }, 0);
+    return { ok: false, near: null, why: 'no expiry between ' + K.minDte + ' and ' + K.maxDte + ' days (longest listed: ' + longest + 'd)' };
+  }
+  const syms = [], meta = {};
+  exps.forEach(function (x) {
+    x.e.strikes.filter(function (s) { return s.callSymbol && s.strike >= spot * 0.65 && s.strike <= spot * 0.98; })
+      .sort(function (a, b) { return Math.abs(a.strike - spot * 0.84) - Math.abs(b.strike - spot * 0.84); })
+      .slice(0, K.strikesPerExpiry)
+      .forEach(function (s) { syms.push(s.callSymbol); meta[s.callSymbol] = { expiry: x.e.date, dte: x.dte, strike: s.strike }; });
+  });
+  if (!syms.length) return { ok: false, near: null, why: 'no in-the-money call strikes listed in the LEAP expiries' };
+  const md = fetchTastyMarketDataBatch_(syms, ctx.token) || {};
+  const cands = syms.map(function (s) {
+    const q = md[s] || {};
+    return { occ: s, expiry: meta[s].expiry, dte: meta[s].dte, strike: meta[s].strike,
+      bid: q.bid != null ? q.bid : null, ask: q.ask != null ? q.ask : null, delta: q.delta != null ? q.delta : null,
+      oi: q.oi != null ? q.oi : null, volume: q.volume != null ? q.volume : null };
+  });
+  return longChooseContract_(cands, spot, LONG_CONFIG);
+}
+
+// Cached daily pick, re-quoted live on every run; re-picked when the live quote no longer passes. Failures are never cached.
+function longGetContract_(ticker, spot, ctx) {
+  const key = slowKey_('LONGCON2', ticker);
+  const cached = ctx.slowCache[key];
+  if (cached && cached.date === todayKey_() && cached.value && cached.value.fail && Date.now() - cached.value.at < LONG_CONFIG.contract.failCacheMin * 60000) {
+    const n = cached.value.near;
+    return { ok: false, why: cached.value.why, near: n ? { strike: n.strike, expiry: new Date(n.expiry + 'T12:00:00'), oi: n.oi, volume: n.volume } : null };
+  }
+  if (cached && cached.date === todayKey_() && cached.value && cached.value.strike && cached.value.expiry) {
+    const exp = new Date(cached.value.expiry + 'T12:00:00');
+    const cand = longQuoteContract_(ticker, exp, cached.value.strike, ctx, ctx.now);
+    const v = longChooseContract_([cand], spot, LONG_CONFIG);
+    if (v.ok) return { ok: true, pick: cand, m: v.m };
+  }
+  const r = longPickContract_(ticker, spot, ctx);
+  if (r.ok) {
+    const rec = { date: todayKey_(), value: { expiry: longYmd_(r.pick.expiry), strike: r.pick.strike } };
+    ctx.pending[key] = JSON.stringify(rec);
+    ctx.slowCache[key] = rec;
+  } else if (r.why && !/^no TastyTrade token|^no option chain/.test(r.why)) {
+    // Speed: remember a real "no usable contract" for a few hours so every scan does not re-download the chain. Outages are never remembered.
+    const n = r.near;
+    const rec = { date: todayKey_(), value: { fail: true, at: Date.now(), why: r.why, near: n ? { strike: n.strike, expiry: longYmd_(n.expiry), oi: n.oi, volume: n.volume } : null } };
+    ctx.pending[key] = JSON.stringify(rec);
+    ctx.slowCache[key] = rec;
+  }
+  Utilities.sleep(LONG_CONFIG.sleepMs);
+  return r;
+}
+
+
+/* ============================================================================
+ * ONE ROW
+ * ========================================================================== */
+
+function longMakeCtx_(tickers, now, slowCache, pending) {
+  const token = getTastyTradeAccessToken_();
+  return {
+    now: now, token: token, slowCache: slowCache, pending: pending, finnhubKey: getFinnhubApiKey_(),
+    ivRanks: cspFetchIvRanks_(tickers, token)
+  };
+}
+
+function longProcessRow_(inp, ctx) {
+  const now = ctx.now, cfg = LONG_CONFIG;
+  const t = inp.ticker;
+  const out = {};
+  const incomplete = !!(inp.holdCells && !inp.isOpen);
+  const missing = [];
+  if (incomplete) {
+    if (inp.pStrike == null) missing.push('Strike');
+    if (!inp.pExpiry) missing.push('Expiry');
+    if (!(inp.pEntry > 0)) missing.push('Entry (premium paid per share)');
+  }
+  const fillMsg = 'Qty is set but ' + (missing.length ? missing.join(', ') : 'part of the position') + ' is missing: enter it (Strike and Expiry are never overwritten while Qty is filled). Stock data on this row is live.';
+
+  const tech = longFetchTech_(t, ctx);
+  if (!tech) {
+    if (incomplete) { out.Action = 'FILL IN'; out.Why = fillMsg + ' (no daily price history from Yahoo)'; out.SortKey = longSortKey_('FILL IN'); return out; }
+    out.Action = 'SKIP'; out.Why = 'no daily price history from Yahoo (needs 201+ sessions)'; out.SortKey = 0; return out;
+  }
+
+  // Live spot: Tasty equity quote first, last completed close otherwise.
+  let spot = null, dayChg = null;
+  if (ctx.token) {
+    try {
+      const q = (ctx.quotes && ctx.quotes[t]) || fetchTastyEquityQuote_(t, ctx.token);
+      if (q && q.price != null) { spot = q.price; if (typeof q.change === 'number' && isFinite(q.change)) dayChg = q.change; }
+    } catch (e) { /* fall back */ }
+  }
+  if (spot == null) spot = tech.price;
+
+  const offHigh = tech.hi52 ? Math.max(0, (1 - spot / tech.hi52) * 100) : null;
+  const vs200 = tech.ma200 ? (spot / tech.ma200 - 1) * 100 : null;
+  const vs50 = tech.ma50 ? (spot / tech.ma50 - 1) * 100 : null;
+  const vs20 = tech.ma20 ? (spot / tech.ma20 - 1) * 100 : null;
+  const x50 = (tech.ma50 && tech.ma200) ? (tech.ma50 / tech.ma200 - 1) * 100 : null;
+  // Relative strength vs SPY (average of the 3- and 6-month return gaps) and the market regime (SPY vs its 200-day).
+  const spy = ctx.spyTech || null;
+  const gaps = [];
+  if (spy && tech.ret63 != null && spy.ret63 != null) gaps.push(tech.ret63 - spy.ret63);
+  if (spy && tech.ret126 != null && spy.ret126 != null) gaps.push(tech.ret126 - spy.ret126);
+  const rs = gaps.length ? gaps.reduce(function (a, b) { return a + b; }, 0) / gaps.length : null;
+  const regimeOk = (spy && spy.ma200 && spy.price) ? (spy.price > spy.ma200) : null;
+  out['RS vs SPY %'] = rs != null ? rs : ''; out['Ret 1M %'] = tech.ret21 != null ? tech.ret21 : '';
+  out.Price = spot;
+  if (dayChg != null) out.Change = round2_(dayChg);
+  out.Trend = longTrendLabel_(vs200, x50, vs20);
+  out['Off High %'] = offHigh; out['T200 %'] = vs200; out['X50 %'] = x50; out.RSI = tech.rsi; out.HV20 = tech.hv20;
+  out['52w High'] = tech.hi52; out['52w Low'] = tech.lo52; out.Bounce = tech.bounce;
+
+  const isEtf = !!inp.isEtf;
+  const earnDate = isEtf ? null : longFetchEarnings_(t, ctx);
+  const earnDays = earnDate ? longDaysBetween_(now, earnDate) : null;
+  out['Next Earnings'] = isEtf ? 'ETF' : (earnDate || ''); out['Earn Days'] = earnDays == null ? '' : earnDays;
+  const ivr = ctx.ivRanks[t] != null ? ctx.ivRanks[t] : null;
+  out['IV Rank'] = ivr != null ? ivr : '';
+  const target = isEtf ? null : longFetchAnalyst_(t, ctx);
+  const upside = target ? (target / spot - 1) * 100 : null;
+  if (target) { out.Analyst = target; out['Upside %'] = upside; }
+
+  if (incomplete) {
+    out.Action = 'FILL IN'; out.Why = fillMsg; out.SortKey = longSortKey_('FILL IN');
+    if (inp.pStrike != null && inp.pExpiry) {
+      try {
+        const c0 = longQuoteContract_(t, inp.pExpiry, inp.pStrike, ctx, now);
+        const m0 = longContractMetrics_(c0, spot);
+        out.DTE = c0.dte;
+        if (m0.mid != null) out.Mid = m0.mid;
+        if (c0.delta != null) out.Delta = c0.delta;
+      } catch (e) { /* optional */ }
     }
+    return out;
   }
-  if (res.ok) {
-    const c = res.c;
-    const rec = { ok: true, c: Object.assign({}, c, { expiry: Utilities.formatDate(c.expiry, 'America/New_York', 'yyyy-MM-dd') }) };
-    flipCachePut_(ctx.cache, ctx.pending, key, rec, ctx.now);
-    return rec;
+
+  // ----- a position you hold -----
+  if (inp.isOpen) {
+    let c = longQuoteContract_(t, inp.openExpiry, inp.openStrike, ctx, now);
+    let m = longContractMetrics_(c, spot);
+    let mark = m.mid;
+    if (mark == null) {
+      try {
+        if (ctx.token) { const q = fetchTastyTradeQuote_(c.occ, ctx.token); if (q && q.mark != null) mark = q.mark; }
+        if (mark == null) { const y = fetchYahooQuote_(t, inp.openExpiry, inp.openStrike, 'C'); if (y && y.mark != null) mark = y.mark; }
+      } catch (e) { /* leave null */ }
+      if (mark != null) m = longContractMetrics_({ bid: mark, ask: mark, delta: c.delta, strike: c.strike, dte: c.dte }, spot);
+    }
+    let snapNote = '';
+    if (mark == null) {
+      // Safety net: a date cell read one day off (time zones) matches no listed contract. If the chain has exactly one expiry within a day, use it and say so.
+      try {
+        const snap = longSnapExpiry_(t, inp.openExpiry, ctx);
+        if (snap) {
+          const c2 = longQuoteContract_(t, snap, inp.openStrike, ctx, now);
+          const m2 = longContractMetrics_(c2, spot);
+          if (m2.mid != null) {
+            c = c2; m = m2; mark = m2.mid;
+            snapNote = 'expiry cell reads ' + longYmd_(inp.openExpiry) + ' but the listed expiry is ' + longYmd_(snap) + ' (priced that one; correct the Expiry cell)';
+          }
+        }
+      } catch (e) { /* fall through to the explanation */ }
+    }
+    let noQuoteWhy = '';
+    if (mark == null) { try { noQuoteWhy = longExplainMissingQuote_(t, inp.openExpiry, inp.openStrike, ctx, now); } catch (e) { noQuoteWhy = 'no quote for this contract'; } }
+    const pl = (mark != null && inp.openEntry > 0) ? (mark / inp.openEntry - 1) * 100 : null;
+    const ha = longHeldAction_({ dte: c.dte, pl: pl, spot: spot, tech: tech, upside: upside, quality: inp.quality, isEtf: isEtf, carry: m.carry }, cfg);
+    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '') + (snapNote ? ' | ' + snapNote : '');
+    out.Strike = inp.openStrike; out.Expiry = inp.openExpiry; out.DTE = c.dte;
+    if (mark != null) out.Mid = mark;
+    if (c.delta != null) out.Delta = c.delta;
+    out['Spread %'] = m.spreadPct; out.OI = c.oi; out.Vol = c.volume; out.Bid = c.bid; out.Ask = c.ask;
+    out['Carry %/yr'] = m.carry; out['Breakeven %'] = m.breakeven; out.Lev = m.lev; out['Extrinsic $'] = m.extrinsic;
+    out['Roll By'] = new Date(inp.openExpiry.getTime() - cfg.exits.rollDte * 86400000);
+    if (c.delta != null) {
+      out['Stock Equiv $'] = c.delta * spot * 100 * inp.qty;
+      if (mark != null) out['Capital Saved $'] = (c.delta * spot - mark) * 100 * inp.qty;
+    }
+    if (inp.entryDate) out.Days = longDaysBetween_(inp.entryDate, now);
+    if (pl != null) { out['P/L %'] = pl; out['P/L $'] = (mark - inp.openEntry) * 100 * inp.qty; }
+    if (mark != null && c.dte > 40) {
+      const rk = computeLeapPremiumLoss_({ stockPrice: spot, strike: inp.openStrike, optionPrice: mark, daysToExpiry: c.dte, optionType: 'C',
+        ivPercent: tech.hv20, bidAskSpreadPct: m.spreadPct, ivRank: ivr, daysToCatalyst: earnDays, momentumPercent: tech.ret5, trendPercent: vs20 });
+      if (rk) { out.Risk = rk.risk; out['Risk 10%'] = rk.tierProbabilities[0] * 100; out['Risk 30%'] = rk.tierProbabilities[2] * 100; }
+    }
+    out.SortKey = longSortKey_(ha.action, null, pl);
+    return out;
   }
-  const old = flipCacheGet_(ctx.cache, key, C.promote.probeMaxAgeDays, ctx.now);
-  if (old && old.ok) return Object.assign({}, old, { stale: true });
-  return res;
-}
 
-// Expiry text -> Date (cache stores yyyy-MM-dd).
-function flipDate_(v) {
-  if (v == null || v === '') return null;
-  if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? null : v;
-  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? v + 'T12:00:00' : String(v));
-  return isNaN(d.getTime()) ? null : d;
-}
-
-
-
-/* ============================================================================
- * ROW LOGIC
- * ========================================================================== */
-
-function flipIsDate_(v) { return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime()); }
-function flipStaleMin_() { return typeof INTRADAY_STALE_MIN !== 'undefined' ? INTRADAY_STALE_MIN : 15; }
-function flipContractText_(expiry, strike) {
-  const d = flipDate_(expiry);
-  return d ? Utilities.formatDate(d, 'America/New_York', 'MMM yyyy') + ' $' + strike + 'C' : '';
-}
-
-// Intraday values that are fresh enough to act on, else null.
-function flipFreshIv_(iv, env) {
-  if (!iv || iv.aroonUp == null || iv.aroonDown == null || iv.rsi1m == null) return null;
-  if (!env.sess.open) return null;
-  const ageMin = iv.lastBarEpoch != null ? Math.round((env.now.getTime() - iv.lastBarEpoch * 1000) / 60000) : null;
-  if (env.sess.minutesSinceOpen > flipStaleMin_() && ageMin != null && ageMin > flipStaleMin_()) return null;
-  return iv;
-}
-
-// Earnings from cache only (no network). Returns Date or null.
-function flipEarningsCached_(ticker, ctx) {
-  const hit = flipCacheGet_(ctx.cache, 'EARN|' + ticker, 2, ctx.now);
-  return hit && hit.date ? new Date(hit.date + 'T12:00:00') : null;
-}
-
-function flipEarnDays_(date, now) {
-  if (!date) return null;
-  const d = Math.ceil((date.getTime() - now.getTime()) / 86400000);
-  return d < 0 ? null : d;
-}
-
-// Columns shared by every kind of row (stock-level facts).
-function flipStockCols_(res, t, env, price) {
-  const f = env.feat[t], d = env.daily[t] || {}, iv = env.ivFresh[t];
-  const C = FLIP_CONFIG;
-  res['Theme'] = flipThemeOf_(t);
-  if (price != null) res['Price'] = flipR2_(price);
-  if (f) {
-    const prev = env.prevClose[t];
-    if (price != null && prev > 0) res['Day %'] = flipR2_((price / prev - 1) * 100);
-    res['Trend'] = f.trend; res['SMA20 %'] = f.sma20 && price ? flipR1_((price / f.sma20 - 1) * 100) : flipR1_(f.sma20Pct);
-    res['RS5 %'] = flipR1_(f.rs5); res['ATR %'] = flipR2_(f.atrPct); res['Sigma Day %'] = flipR2_(f.sigmaDay);
+  // ----- a candidate -----
+  // Speed: the chain download is the slowest call. A stock that already fails a hard gate is a SKIP whatever its contract looks like, so skip the lookup.
+  const E0 = cfg.entry, qFloor0 = isEtf ? E0.qualityFloorEtf : E0.qualityFloor;
+  const stockFails = !(vs200 > 0) || !(x50 > 0) || (offHigh != null && offHigh > E0.skipOffHigh) || (inp.quality != null && inp.quality < qFloor0);
+  const pick = stockFails ? { ok: false, near: null, why: '' } : longGetContract_(t, spot, ctx);
+  let contractOk = false, risk = null, score = null, m = null, c = null;
+  if (pick.ok) {
+    contractOk = true; c = pick.pick; m = pick.m;
+    out.Expiry = c.expiry; out.Strike = c.strike; out.DTE = c.dte; out.Delta = c.delta; out.Mid = m.mid; out['Spread %'] = m.spreadPct;
+    out.OI = c.oi; out.Vol = c.volume; out.Bid = c.bid; out.Ask = c.ask;
+    out['Carry %/yr'] = m.carry; out['Breakeven %'] = m.breakeven; out.Lev = m.lev; out['Extrinsic $'] = m.extrinsic;
+    out['Roll By'] = new Date(c.expiry.getTime() - cfg.exits.rollDte * 86400000);
+    out['Stock Equiv $'] = c.delta * spot * 100; out['Capital Saved $'] = (c.delta * spot - m.mid) * 100;
+    const rk = computeLeapPremiumLoss_({ stockPrice: spot, strike: c.strike, optionPrice: m.mid, daysToExpiry: c.dte, optionType: 'C',
+      ivPercent: tech.hv20, bidAskSpreadPct: m.spreadPct, ivRank: ivr, daysToCatalyst: earnDays, momentumPercent: tech.ret5, trendPercent: vs20 });
+    if (rk) { risk = rk.risk; out.Risk = rk.risk; out['Risk 10%'] = rk.tierProbabilities[0] * 100; out['Risk 30%'] = rk.tierProbabilities[2] * 100; }
+  } else if (pick.near) {
+    out.Strike = pick.near.strike; out.Expiry = pick.near.expiry;
+    if (pick.near.oi != null) out.OI = pick.near.oi;
+    if (pick.near.volume != null) out.Vol = pick.near.volume;
   }
-  if (d.offHigh != null) res['Off High %'] = flipR1_(d.offHigh);
-  else if (f && price) res['Off High %'] = flipR1_((1 - price / f.high3m) * 100);
-  if (d.t200 != null) res['T200 %'] = flipR1_(d.t200);
-  if (iv) {
-    res['AUP'] = iv.aroonUp; res['ADN'] = iv.aroonDown; res['RSI'] = iv.rsi1m;
-    if (iv.vwapPct != null) res['VW %'] = iv.vwapPct;
-    if (iv.rvol != null) res['RVOL'] = iv.rvol;
-  }
-}
-
-// Live view of a contract from a Cloud Function quote, falling back to the picked values.
-function flipLiveContract_(base, q) {
-  let bid = base.bid, ask = base.ask, delta = base.delta;
-  if (q) {
-    if (q.bid > 0 && q.ask > 0 && q.ask >= q.bid) { bid = q.bid; ask = q.ask; }
-    if (q.delta != null && q.delta > 0 && q.delta <= 1) delta = q.delta;
-  }
-  const mid = (bid > 0 && ask > 0) ? (bid + ask) / 2 : base.mid;
-  const spreadPct = (bid > 0 && ask > 0) ? (ask - bid) / mid * 100 : base.spreadPct;
-  return { bid: bid, ask: ask, mid: mid, delta: delta, spreadPct: spreadPct, oi: (q && q.openInterest != null) ? q.openInterest : base.oi,
-    volume: (q && q.volume != null) ? q.volume : base.volume };
-}
-
-// ---- a row you HOLD ------------------------------------------------------------------------------
-function flipProcessHeld_(rw, env) {
-  const C = FLIP_CONFIG, t = rw.ticker, res = {};
-  const f = env.feat[t], iv = env.ivFresh[t];
-  const price = iv && iv.lastPrice > 0 ? iv.lastPrice : (f ? f.price : null);
-  flipStockCols_(res, t, env, price);
-  const earnDate = env.full ? flipEarnings_(t, env.ctx) : flipEarningsCached_(t, env.ctx);
-  const earnDays = flipEarnDays_(earnDate, env.now);
-  if (earnDate) res['Next Earnings'] = earnDate;
-  if (earnDays != null) res['Earn Days'] = earnDays;
-  if (!rw.complete) {
-    res['Action'] = 'FILL IN'; res['Why'] = 'Qty is filled: also enter Strike, Expiry and Entry (the price you paid) so the sheet can follow this position.';
-    return res;
-  }
-  const occ = buildOccSymbol_(t, rw.expiry, rw.strike, 'C');
-  const q = env.quotes[occ];
-  const bid = q && q.bid > 0 ? q.bid : null;
-  const ask = q && q.ask > 0 ? q.ask : null;
-  const mid = bid && ask ? (bid + ask) / 2 : (q && q.mark > 0 ? q.mark : null);
-  const plPct = bid ? (bid / rw.entry - 1) * 100 : null;
-  const days = rw.entryDate ? flipTradingDays_(rw.entryDate, env.now) : 0;
-  res['Contract'] = flipContractText_(rw.expiry, rw.strike);
-  res['DTE'] = Math.round((rw.expiry.getTime() - env.now.getTime()) / 86400000);
-  if (q) {
-    res['Bid'] = bid != null ? bid : ''; res['Ask'] = ask != null ? ask : ''; res['Mid'] = mid != null ? flipR2_(mid) : '';
-    if (bid && ask && mid) res['Spread %'] = flipR2_((ask - bid) / mid * 100);
-    if (q.delta != null) res['Delta'] = flipR2_(q.delta);
-    if (q.openInterest != null) res['OI'] = q.openInterest;
-    if (q.volume != null) res['VOL'] = q.volume;
-  }
-  let geo = null;
-  if (f && mid && q && q.delta > 0 && price) {
-    geo = flipTradeGeometry_({ mid: mid, delta: q.delta, spreadPct: res['Spread %'] || 0 }, price, f.atrPct, f.sigmaDay, C);
-    if (geo) { res['Lev'] = flipR1_(geo.lev); res['Stop %'] = flipR1_(geo.stopOpt); }
-  }
-  const stopPct = geo ? geo.stopOpt : (C.stopMinPct + C.stopMaxPct) / 2;
-  res['Target'] = flipR2_(rw.entry * (1 + C.targetPct / 100));
-  res['Stop'] = flipR2_(rw.entry * (1 - stopPct / 100));
-  res['Days'] = days;
-  if (plPct != null) { res['P/L %'] = flipR1_(plPct); res['P/L $'] = Math.round((bid - rw.entry) * 100 * rw.qty); res['Open Mark'] = flipR2_(bid); }
-  const exit = (iv && plPct != null) ? evaluateQuickExit_(iv, plPct, env.S) : { exit: false, fading: false };
-  const act = flipHeldAction_({ plPct: plPct, days: days, stopPct: stopPct, stopPrice: rw.entry * (1 - stopPct / 100), exit: exit, rsi: iv ? iv.rsi1m : null, earnDays: earnDays }, C);
-  res['Action'] = act.action; res['Why'] = act.why; res._held = true; res._plPct = plPct;
-  return res;
-}
-
-// ---- a candidate row (no position) ---------------------------------------------------------------
-function flipProcessCandidate_(rw, env) {
-  const C = FLIP_CONFIG, S = env.S, t = rw.ticker, res = {};
-  const f = env.feat[t], d = env.daily[t] || {}, iv = env.ivFresh[t];
-  const price = iv && iv.lastPrice > 0 ? iv.lastPrice : (f ? f.price : null);
-  flipStockCols_(res, t, env, price);
-  const done = function (action, why) { res['Action'] = action; res['Why'] = why; return res; };
-  if (!f || !price) return done('SKIP', 'no daily price history');
-  const offHigh = res['Off High %'] !== undefined && res['Off High %'] !== '' ? res['Off High %'] : null;
-
-  const earnDate = env.full ? flipEarnings_(t, env.ctx) : flipEarningsCached_(t, env.ctx);
-  const earnDays = flipEarnDays_(earnDate, env.now);
-  if (earnDate) res['Next Earnings'] = earnDate;
-  if (earnDays != null) res['Earn Days'] = earnDays;
-
-  if (price < C.minPrice) return done('SKIP', 'price $' + price.toFixed(2) + ' under $' + C.minPrice);
-  if (f.atrPct < C.minAtrPct) return done('SKIP', 'ATR ' + f.atrPct.toFixed(1) + '% is too quiet to reach +' + C.targetPct + '% in a few days');
-  if (f.atrPct > C.maxAtrPct) return done('SKIP', 'ATR ' + f.atrPct.toFixed(1) + '% is too wild: the stop would be hit by noise');
-  if (offHigh != null && offHigh > C.maxOffHighPct) return done('SKIP', offHigh + '% under the 52-week high: falling-knife filter');
-  if (earnDays != null && earnDays <= C.earnBlockDays) return done('SKIP', 'earnings in ' + earnDays + ' day(s): gap and IV-crush risk');
-
-  const pick = env.picks[t];
-  if (pick && !pick.ok && pick.near) {   // no contract passed: still show the closest one's strike, expiry, OI and volume so the Why text can be checked
-    const nr = pick.near;
-    res['Strike'] = nr.strike; res['Expiry'] = flipDate_(nr.expiry);
-    res['OI'] = nr.oi != null ? nr.oi : ''; res['VOL'] = nr.volume != null ? nr.volume : '';
-  }
-  if (!pick || !pick.ok) return done('SKIP', pick && pick.why ? 'no usable contract: ' + pick.why : 'no contract picked yet (run a full scan during market hours)');
-  const base = pick.c;
-  const q = env.quotes[base.symbol];
-  const live = flipLiveContract_(base, q);
-  const expiry = flipDate_(base.expiry);
-  const intrinsic = Math.max(price - base.strike, 0);
-  const extPct = live.mid > 0 ? (live.mid - intrinsic) / live.mid * 100 : null;
-  const geo = flipTradeGeometry_(live, price, f.atrPct, f.sigmaDay, C);
-
-  res['Strike'] = base.strike; res['Expiry'] = expiry; res['Contract'] = flipContractText_(expiry, base.strike);
-  res['DTE'] = expiry ? Math.round((expiry.getTime() - env.now.getTime()) / 86400000) : '';
-  res['Delta'] = flipR2_(live.delta); res['Bid'] = live.bid; res['Ask'] = live.ask; res['Mid'] = flipR2_(live.mid);
-  res['Spread %'] = flipR2_(live.spreadPct); res['Time Val %'] = flipR1_(extPct); res['Decay %/d'] = flipR2_(base.decayPct);
-  res['OI'] = live.oi != null ? live.oi : ''; res['VOL'] = live.volume != null ? live.volume : '';
-  if (!geo) return done('SKIP', 'cannot compute trade geometry for this contract');
-  res['Lev'] = flipR1_(geo.lev); res['Need %'] = flipR2_(geo.need); res['P Hit %'] = flipR1_(geo.pHit * 100);
-  res['BE Win %'] = flipR1_(geo.be * 100); res['Edge Needed'] = flipR1_(geo.edgeNeeded);
-  res['Target'] = flipR2_(geo.targetPrice); res['Stop'] = flipR2_(geo.stopPrice); res['Stop %'] = flipR1_(geo.stopOpt);
-  res['Size'] = flipSize_(live.mid, geo.stopOpt, C.riskPerTradeUsd);
-  res['Risk $'] = res['Size'] ? Math.round(res['Size'] * live.mid * 100 * geo.stopOpt / 100) : '';
-  if (pick.stale) res._stalePick = true;
-  if (live.spreadPct > C.maxSpreadPct) return done('WAIT', 'option spread ' + live.spreadPct.toFixed(1) + '% (max ' + C.maxSpreadPct + '%): it would eat the target');
-  if (geo.edgeNeeded > C.maxEdgeNeeded) return done('WAIT', 'costs too high: you would need to beat a coin-flip walk by ' + geo.edgeNeeded.toFixed(1) + ' points (limit ' + C.maxEdgeNeeded + ')');
-
-  // trigger
-  const trendOk = !!(iv && iv.aroonUp >= S.trendAupMin && iv.aroonDown <= S.trendAdnMax);
-  let ev = { level: null, dip: false, missing: [], bounce: null };
-  let blackout = '';
-  if (iv) {
-    const closeMin = env.closeMin, m = env.sess.minutesSinceOpen;
-    if (m < S.noEntryFirstMin) blackout = 'first ' + S.noEntryFirstMin + ' minutes after the open';
-    else if (closeMin - m < S.noEntryLastMin) blackout = 'last ' + S.noEntryLastMin + ' minutes before the close';
-    if (!blackout) ev = evaluateEntryLevel_(iv, S, env.spyHead, geo.need);
-    res['Signal'] = ev.level === 'strong' ? 'ENTRY' : (ev.level === 'light' ? 'GET READY' : '');
-    if (ev.bounce) res['Bounce'] = 'Y';
-  }
-  const score = flipScore_({ level: ev.level, bounce: !!ev.bounce, trendOk: trendOk, priceAbove20: price > f.sma20, slopeUp: f.slopeUp, rs5: f.rs5,
-    offHigh: offHigh, spreadPct: live.spreadPct, delta: live.delta, extPct: extPct, oi: live.oi, edgeNeeded: geo.edgeNeeded, earnDays: earnDays });
-  res['Score'] = score;
-  res._geo = geo; res._ev = ev; res._price = price; res._live = live; res._base = base;
-
-  if (!iv) return done('WAIT', env.sess.open ? 'no fresh intraday data for the entry trigger' : 'market closed: trigger is evaluated only while the market is open');
-  if (blackout) return done('WAIT', 'entry blackout (' + blackout + ')');
-  if (!ev.level) {
-    return done('WAIT', trendOk ? 'trend up, no RSI dip yet (RSI ' + iv.rsi1m + ')' : 'no 5-minute uptrend (Aroon up ' + iv.aroonUp + ', down ' + iv.aroonDown + ')');
-  }
-  const why = ev.level === 'strong'
-    ? 'dip bought: RSI was ' + iv.rsiMin5 + ' and is turning up, trend up, ' + (iv.vwapPct != null ? 'VWAP ' + iv.vwapPct + '%' : '') + ', needs +' + geo.need.toFixed(2) + '% in the stock'
-    : (ev.bounce ? bounceWhy_(ev.bounce) : (ev.dip && ev.missing.length ? 'waiting: ' + ev.missing.join('; ') : 'RSI low, no dip/turn yet'));
-  let action = null;
-  if (ev.level === 'strong' && score >= C.scoreBuy) action = 'BUY';
-  else if (score >= C.scoreReady) action = 'READY';
-  if (!action) return done('WAIT', 'signal is there but score ' + score + ' is under ' + C.scoreReady + ': ' + why);
-  if (action === 'BUY' && f.trend === 'Down') { action = 'READY'; res['Why'] = ''; return done('READY', 'would be a BUY, but the daily trend is down (price under a falling 20-day average): ' + why); }
-  if (action === 'BUY' || action === 'READY') {
-    const gd = flipPortfolioGuard_(env.open, flipThemeOf_(t), env.todayYmd, C);
-    if (gd.blocked) return done('BLOCKED', gd.why + ' | ' + action + ' otherwise: ' + why);
-  }
-  return done(action, why);
+  const x = { vs200: vs200, x50: x50, offHigh: offHigh, rsi: tech.rsi, ivr: ivr, bounce: tech.bounce, fall: tech.fall, lowAge: tech.lowAge,
+    quality: inp.quality, isEtf: isEtf, risk: risk, contractOk: contractOk, contractWhy: pick.why, upside: upside,
+    carry: m ? m.carry : null, spreadPct: m ? m.spreadPct : null, delta: c ? c.delta : null,
+    ret21: tech.ret21, rs: rs, regimeOk: regimeOk };
+  if (contractOk) { score = longScore_(x).score; out.Score = score; }
+  x.score = score;
+  const ev = longEvaluateEntry_(x, cfg);
+  out.Action = ev.action;
+  const noteQ = inp.quality == null ? ' | Quality not scored yet (run Promote)' : '';
+  out.Why = ev.why.filter(function (s) { return s; }).join(' | ') + noteQ + (earnDays != null && earnDays >= 0 && earnDays <= 7 ? ' | earnings in ' + earnDays + 'd (info)' : '');
+  out.SortKey = longSortKey_(ev.action, score, null);
+  return out;
 }
 
 
 /* ============================================================================
- * THE SCAN
+ * SCAN
  * ========================================================================== */
 
-function flipParseInputs_(data, map, now) {
+function runLongScan(timeBudgetMsOverride, dryRun, opts) {
+  opts = opts || {};
+  const ui = opts.quiet ? null : tryGetUi_();
+  const startMs = Date.now();
+  const budgetMs = (typeof timeBudgetMsOverride === 'number' && timeBudgetMsOverride > 0) ? timeBudgetMsOverride : LONG_CONFIG.timeBudgetMs;
+  const now = new Date();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(LONG_SHEET_NAME);
+  if (!sheet) { notify_(ui, 'Long', 'No "' + LONG_SHEET_NAME + '" tab. Run setupLong once from the Apps Script editor.'); return; }
+  const map = longEnsureHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) { notify_(ui, 'Long', 'Add tickers in column A first.'); return; }
+  const width = sheet.getLastColumn();
+  const data = sheet.getRange(2, 1, lastRow - 1, width).getValues();
+
   const rows = [];
   data.forEach(function (r, i) {
     const t = String(r[map['Ticker'] - 1] || '').trim().toUpperCase();
     if (!t) return;
-    const num = function (h) { return map[h] ? flipNum_(r[map[h] - 1]) : null; };
+    const num = function (h) { const v = r[map[h] - 1]; const n = (v === '' || v == null) ? null : (typeof v === 'number' ? v : parseFloat(String(v).replace(/[$,%\s]/g, ''))); return isNaN(n) ? null : n; };
     const qty = num('Qty');
-    const held = qty != null && qty > 0;
-    const strike = num('Strike'), entry = num('Entry');
-    const expiry = flipDate_(map['Expiry'] ? r[map['Expiry'] - 1] : null);
-    const entryDate = flipDate_(map['Entry Date'] ? r[map['Entry Date'] - 1] : null);
+    const holdCells = qty != null && qty > 0;
+    const oStrike = holdCells ? num('Strike') : null;
+    const oExpiry = holdCells ? longParseDate_(r[map['Expiry'] - 1]) : null;
+    const oEntry = holdCells ? num('Entry') : null;
+    const complete = holdCells && oStrike != null && oExpiry && oEntry != null && oEntry > 0;
+    const type = String(r[map['Type'] - 1] || '').trim().toUpperCase();
     rows.push({
-      idx: i, ticker: t, held: held, qty: qty || 0, strike: strike, expiry: expiry, entry: entry, entryDate: entryDate,
-      complete: !!(held && strike > 0 && expiry && entry > 0),
-      lastRun: map['LastRun'] && r[map['LastRun'] - 1] instanceof Date ? r[map['LastRun'] - 1].getTime() : 0
+      idx: i, ticker: t, isEtf: type === 'ETF' || !!LONG_ETF_SET[t], holdCells: holdCells, isOpen: !!complete, qty: qty || 1,
+      openStrike: complete ? oStrike : null, openExpiry: complete ? oExpiry : null, openEntry: complete ? oEntry : null,
+      pStrike: oStrike, pExpiry: oExpiry, pEntry: oEntry,
+      entryDate: longParseDate_(r[map['Entry Date'] - 1]), quality: num('Quality'),
+      lastRun: r[map['LastRun'] - 1] instanceof Date ? r[map['LastRun'] - 1].getTime() : 0
     });
   });
-  return rows;
-}
-
-// opts: { full (default true), quiet, noAlerts }. Returns { processed, counts, timedOut }.
-function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
-  opts = opts || {};
-  const full = opts.full !== false;
-  const ui = opts.quiet ? null : tryGetUi_();
-  const startMs = Date.now();
-  const C = FLIP_CONFIG;
-  const budgetMs = (typeof timeBudgetMsOverride === 'number' && timeBudgetMsOverride > 0) ? timeBudgetMsOverride : C.timeBudgetMs;
-  const now = new Date();
-  const sess = marketSessionAt_(now);
-  const todayYmd = flipTodayYmd_(now);
-  const closeMin = US_MARKET_EARLY_CLOSES[todayYmd] ? 210 : 390;
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(FLIP_SHEET_NAME);
-  if (!sheet) { notify_(ui, 'Flip', 'No "' + FLIP_SHEET_NAME + '" tab. Run setupFlip once from the Apps Script editor.'); return null; }
+  if (!rows.length) { notify_(ui, 'Long', 'No tickers found in column A.'); return; }
+  rows.sort(function (a, b) { return a.lastRun - b.lastRun; });   // stalest first, so partial runs cover everything over time
   const props = PropertiesService.getScriptProperties();
-  const running = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10);
-  if (running && Date.now() - running < 10 * 60000) { notify_(ui, 'Flip', 'A Flip run is already in progress. Try again in a minute.'); return null; }
+  props.setProperty('LONG_RUNNING', String(Date.now()));
 
-  const map = flipEnsureHeaders_(sheet);
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) { notify_(ui, 'Flip', 'No tickers yet. Run 🔁 Flip > Promote Research Picks, or type tickers in column A.'); return null; }
-  const width = sheet.getLastColumn();
-  const data = sheet.getRange(2, 1, lastRow - 1, width).getValues();
-  const rows = flipParseInputs_(data, map, now);
-  if (!rows.length) { notify_(ui, 'Flip', 'No tickers found in column A.'); return null; }
-
-  props.setProperty('FLIP_RUNNING', String(Date.now()));
+  let processed = 0, timedOut = false, alertItems = [];
+  const errors = [];
+  const counts = {};
   try {
-    const cache = flipCacheLoad_();
+    const slowCache = longLoadCache_();
+    // Contract picks of other tabs share nothing here; CSP's cache is not read (different keys).
     const pending = {};
-    const ctx = { cache: cache, pending: pending, now: now, token: null, chains: {}, finnhubKey: null };
-    if (full) { ctx.token = getTastyTradeAccessToken_(); ctx.finnhubKey = getFinnhubApiKey_(); }
+    const ctx = longMakeCtx_(rows.map(function (r) { return r.ticker; }).filter(function (v, i, a) { return a.indexOf(v) === i; }), now, slowCache, pending);
+    // Speed: parallel/batched prefetch. Both are best-effort: anything missed is fetched per row exactly as before.
+    const uniq = rows.map(function (r) { return r.ticker; }).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    try { ctx.quotes = longPrefetchQuotes_(uniq, ctx.token); } catch (e) { ctx.quotes = {}; }
+    try { longPrefetchBars_(uniq.indexOf('SPY') === -1 ? uniq.concat(['SPY']) : uniq, ctx); } catch (e) { /* per-row fetch handles it */ }
+    try { ctx.spyTech = longFetchTech_('SPY', ctx); } catch (e) { ctx.spyTech = null; }
+    const outCols = LONG_OUTPUT_HEADERS.filter(function (h) { return map[h]; });
+    const lastRunStamp = new Date();
 
-    // Which rows this run covers. A tick (full=false) covers held rows plus candidates whose contract was already picked today.
-    const heldRows = rows.filter(function (r) { return r.held; });
-    let cands = rows.filter(function (r) { return !r.held; });
-    if (!full) cands = cands.filter(function (r) { return !!flipCacheGet_(cache, 'CON|' + r.ticker, 0, now); });
-    cands.sort(function (a, b) { return a.lastRun - b.lastRun; });
-    const work = heldRows.concat(cands);
-    if (!work.length) { notify_(ui, 'Flip', 'Nothing to check.'); return { processed: 0, counts: {}, timedOut: false }; }
-
-    const tickers = work.map(function (r) { return r.ticker; }).filter(function (t, i, a) { return a.indexOf(t) === i; });
-    const withSpy = tickers.indexOf('SPY') === -1 ? tickers.concat(['SPY']) : tickers;
-
-    // Daily data (cached per day) -> features, minus today's still-forming bar.
-    const rawBars = flipGetBars_(withSpy, ctx, '6mo', 'FB');
-    const barsOf = function (t) {
-      const o = flipBarsToObjects_(rawBars[t]);
-      return o.length && o[o.length - 1].d === todayYmd ? o.slice(0, -1) : o;
-    };
-    const spyObj = barsOf('SPY');
-    const feat = {}, prevClose = {};
-    tickers.forEach(function (t) {
-      const b = barsOf(t);
-      feat[t] = flipFeatures_(b, spyObj);
-      prevClose[t] = b.length ? b[b.length - 1].c : null;
-    });
-    const daily = flipGetDaily_(tickers, ctx);
-
-    // Intraday (one Cloud call) and live option quotes (one Cloud call).
-    const ivMap = sess.open ? fetchIntradayMap_(withSpy) : {};
-    const spy = ivMap['SPY'] || null;
-    const spyHead = !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp);
-    const env = { now: now, sess: sess, closeMin: closeMin, S: flipSignal_(), spyHead: spyHead, feat: feat, prevClose: prevClose, daily: daily, ivFresh: {},
-      picks: {}, quotes: {}, ctx: ctx, full: full, open: [], todayYmd: todayYmd };
-    tickers.forEach(function (t) { env.ivFresh[t] = flipFreshIv_(ivMap[t], env); });
-
-    // Contracts for candidates (cached for the day; only a full scan may hit the chain endpoint).
-    let timedOut = false;
-    const gateOk = function (t) {
-      const f = feat[t]; if (!f) return false;
-      const d = daily[t] || {};
-      return f.price >= C.minPrice && f.atrPct >= C.minAtrPct && f.atrPct <= C.maxAtrPct && !(d.offHigh != null && d.offHigh > C.maxOffHighPct);
-    };
-    cands.forEach(function (r) {
-      const t = r.ticker;
-      if (!gateOk(t)) return;
-      const cached = flipCacheGet_(cache, 'CON|' + t, 0, now);
-      if (cached) { env.picks[t] = cached; return; }
-      if (!full) return;
-      if (Date.now() - startMs > budgetMs * 0.6) { timedOut = true; return; }
-      const f = feat[t], spot = env.ivFresh[t] && env.ivFresh[t].lastPrice > 0 ? env.ivFresh[t].lastPrice : f.price;
-      env.picks[t] = flipPickContract_(t, spot, f.sigmaDay, ctx);
-    });
-
-    const occ = [];
-    heldRows.forEach(function (r) { if (r.complete) occ.push(buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C')); });
-    Object.keys(env.picks).forEach(function (t) { const p = env.picks[t]; if (p && p.ok && p.c.symbol && occ.indexOf(p.c.symbol) === -1) occ.push(p.c.symbol); });
-    env.quotes = sess.open || heldRows.length ? fetchOptionQuotesMap_(occ) : {};
-
-    // Open book -> portfolio guard.
-    heldRows.forEach(function (r) {
-      if (!r.complete) return;
-      const q = env.quotes[buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C')];
-      const bid = q && q.bid > 0 ? q.bid : null;
-      env.open.push({ ticker: r.ticker, theme: flipThemeOf_(r.ticker), cost: r.entry * 100 * r.qty, plUsd: bid ? (bid - r.entry) * 100 * r.qty : 0,
-        entryYmd: r.entryDate ? Utilities.formatDate(r.entryDate, 'America/New_York', 'yyyy-MM-dd') : '' });
-    });
-
-    // Rows.
-    const outCols = FLIP_OUTPUT_HEADERS.filter(function (h) { return map[h]; });
-    const counts = {};
-    const errors = [];
-    const stamp = new Date();
-    let processed = 0;
-    const alertItems = [], logItems = [], pnlByIdx = {}, sortKeyByIdx = {}, jayByIdx = {};
-    const jay = flipJayMap_(now);   // one cached request for the whole tab; null if unreachable (the scan carries on)
-    for (let i = 0; i < work.length; i++) {
+    for (let i = 0; i < rows.length; i++) {
       if (Date.now() - startMs > budgetMs) { timedOut = true; break; }
-      const rw = work[i];
+      const rw = rows[i];
       let res;
-      try { res = rw.held ? flipProcessHeld_(rw, env) : flipProcessCandidate_(rw, env); }
-      catch (e) { res = { Action: 'WAIT', Why: 'error: ' + (e && e.message ? e.message : e) }; errors.push(rw.ticker + ': ' + (e && e.message ? e.message : e)); }
-      res['LastRun'] = stamp;
-      jayByIdx[rw.idx] = jay ? (jay[String(rw.ticker).toUpperCase()] || '') : 'n/a';
-      // Change = today's move in dollars: price now minus the previous session's close (same base as Day %).
-      if (typeof res['Price'] === 'number' && res['Price'] > 0) {
-        const pc = env.prevClose[rw.ticker];
-        if (pc > 0) res['Change'] = flipR2_(res['Price'] - pc);
+      try {
+        res = longProcessRow_(rw, ctx);
+      } catch (e) {
+        res = { Action: 'WAIT', Why: 'error: ' + (e && e.message ? e.message : e), SortKey: 1 };
+        errors.push(rw.ticker + ': ' + (e && e.message ? e.message : e));
       }
-      sortKeyByIdx[rw.idx] = flipSortKey_(res['Action'], res['Score'], res._plPct);
-      try { flipBuildAlertItems_(rw, res, alertItems); flipBuildLogItems_(rw, res, env, logItems); } catch (e) { /* alerts and logging never break a scan */ }
+      res.LastRun = lastRunStamp;
+      try { alertItems = alertItems.concat(longBuildAlertItems_(rw, res)); } catch (e) { /* never let alert building break a scan */ }
       const row = data[rw.idx];
-      const keep = rw.held ? FLIP_HELD_WHEN_OPEN : [];
-      outCols.forEach(function (h) { if (keep.indexOf(h) === -1) row[map[h] - 1] = ''; });
-      outCols.forEach(function (h) { if (keep.indexOf(h) === -1 && res[h] !== undefined && res[h] !== null) row[map[h] - 1] = res[h]; });
-      pnlByIdx[rw.idx] = (res['P/L $'] === undefined || res['P/L $'] === null) ? '' : res['P/L $'];
-      counts[res['Action']] = (counts[res['Action']] || 0) + 1;
+      const held = rw.holdCells ? LONG_HELD_WHEN_OPEN : [];
+      outCols.forEach(function (h) { if (held.indexOf(h) === -1) row[map[h] - 1] = ''; });
+      outCols.forEach(function (h) {
+        if (held.indexOf(h) !== -1) return;
+        if (res[h] !== undefined && res[h] !== null) row[map[h] - 1] = res[h];
+      });
+      counts[res.Action] = (counts[res.Action] || 0) + 1;
       processed++;
+      Utilities.sleep(LONG_CONFIG.sleepMs);
     }
 
     if (!dryRun) {
+      // Each contiguous group of output columns is written separately, so your input columns between them are never rewritten.
       const cols = outCols.map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });
       let g0 = 0;
       while (g0 < cols.length) {
@@ -1345,728 +1011,528 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
         sheet.getRange(2, c0, data.length, c1 - c0 + 1).setValues(data.map(function (r) { return r.slice(c0 - 1, c1); }));
         g0 = g1 + 1;
       }
-      // Jay column: rows processed this run get the paper-entry tier (or blank / n/a); other rows keep what is there (formula or value).
-      try {
-        const jc = map[FLIP_JAY_HEADER];
-        if (jc && Object.keys(jayByIdx).length) {
-          const rngJ = sheet.getRange(2, jc, data.length, 1);
-          const fj = rngJ.getFormulas(), vj = rngJ.getValues();
-          rngJ.setValues(data.map(function (r, i) {
-            if (jayByIdx[i] !== undefined) return [jayByIdx[i]];
-            return [fj[i][0] !== '' ? fj[i][0] : vj[i][0]];
-          }));
-        }
-      } catch (e) { logToSheet_('Flip: could not write the Jay column: ' + (e && e.message ? e.message : e)); }
-      // P/L $ column: rows processed this run get the dollar P/L (or blank); other rows keep what is there (formula or value).
-      try {
-        if (!flipPnlCol_(map)) throw new Error('P/L $ column not found (see FLIP_FIXED_COLUMNS)');
-        const rngP = sheet.getRange(2, flipPnlCol_(map), data.length, 1);
-        const fx = rngP.getFormulas(), vx = rngP.getValues();
-        rngP.setValues(data.map(function (r, i) {
-          if (pnlByIdx[i] !== undefined) return [pnlByIdx[i]];
-          return [fx[i][0] !== '' ? fx[i][0] : vx[i][0]];
-        }));
-      } catch (e) { logToSheet_('Flip: could not write the P/L $ column: ' + (e && e.message ? e.message : e)); }
-      if (map['Change']) sheet.getRange(2, map['Change'], data.length, 1).setNumberFormat(FLIP_CHANGE_FORMAT);
-      flipColorRows_(sheet, map, data.length);
-      flipApplyRules_(sheet, map, true);
-      if (full) flipSortRows_(sheet, map, data, sortKeyByIdx, jayByIdx);
-      flipCacheFlush_(pending);
-      if (logItems.length) flipAppendLog_(logItems, now);
+      longColorRows_(sheet, map, data.length);
+      longApplyChangeRules_(sheet, map, true);
+      if (map['SortKey']) sheet.getRange(2, 1, data.length, width).sort({ column: map['SortKey'], ascending: false });
+      longFlushCache_(pending);
     }
-
-    let alertNote = '';
-    if (!dryRun && !opts.noAlerts) { const ar = flipDispatchAlerts_(alertItems, now); alertNote = ar.note ? 'Alerts: ' + ar.note + '\n' : ''; }
-
-    const sec = Math.round((Date.now() - startMs) / 1000);
-    const order = ['STOP', 'TIME-STOP', 'SELL', 'REVIEW', 'FILL IN', 'HOLD', 'BUY', 'READY', 'BLOCKED', 'WAIT', 'SKIP'];
-    const msg =
-      (dryRun ? '(DRY RUN: nothing written)\n' : '') +
-      (timedOut ? '⏱️ Stopped at the time limit: ' + processed + ' of ' + work.length + ' rows done. Run again to continue with the stalest rows.\n\n' : '') +
-      'Rows processed: ' + processed + ' of ' + work.length + (full ? '' : ' (quick check)') + ' in ' + sec + 's\n' + alertNote + flipJayNote_() +
-      order.filter(function (k) { return counts[k]; }).map(function (k) { return k + ': ' + counts[k]; }).join('   ') + '\n' +
-      (sess.open ? '' : 'Market is closed: entry signals are evaluated only while it is open.\n') +
-      (spyHead ? 'SPY headwind: strong entries are held back.\n' : '') +
-      (full && !ctx.token ? '⚠️ No TastyTrade token: contracts cannot be picked.\n' : '') +
-      (errors.length ? '\nErrors:\n' + errors.map(function (e) { return '  • ' + e; }).join('\n') : '');
-    notify_(ui, 'Flip scan complete', msg);
-    return { processed: processed, counts: counts, timedOut: timedOut };
   } finally {
-    props.deleteProperty('FLIP_RUNNING');
+    props.deleteProperty('LONG_RUNNING');
   }
+
+  let alertNote = '';
+  if (!dryRun && !opts.noAlerts) {
+    const ar = longDispatchAlerts_(alertItems, now);
+    alertNote = ar.note ? 'Alerts: ' + ar.note + '\n' : '';
+  }
+  const sec = Math.round((Date.now() - startMs) / 1000);
+  const order = ['TREND EXIT', 'ROLL', 'TAKE PROFIT', 'FILL IN', 'REVIEW', 'BUY', 'HOLD', 'READY', 'WAIT', 'SKIP'];
+  const msg =
+    (dryRun ? '(DRY RUN: nothing written)\n' : '') +
+    (timedOut ? '⏱️ Stopped early at the time limit: ' + processed + ' of ' + rows.length + ' rows done. Run again to continue with the stalest rows.\n\n' : '') +
+    'Rows processed: ' + processed + ' of ' + rows.length + ' in ' + sec + 's\n' + alertNote +
+    order.filter(function (a) { return counts[a]; }).map(function (a) { return a + ': ' + counts[a]; }).join('   ') + '\n' +
+    (errors.length ? '\nErrors:\n' + errors.map(function (e) { return '  • ' + e; }).join('\n') : '');
+  notify_(ui, 'Long scan complete', msg);
+  return { processed: processed, counts: counts, timedOut: timedOut };
 }
 
-function flipColorRows_(sheet, map, n) {
-  if (!map['Action']) return;
-  const colorFor = { 'BUY': '#b7e1cd', 'READY': '#d9ead3', 'BLOCKED': '#fce5cd', 'WAIT': '#fff2cc', 'SKIP': '#eeeeee', 'HOLD': '#cfe2f3',
-    'SELL': '#93c47d', 'STOP': '#e06666', 'TIME-STOP': '#f6b26b', 'REVIEW': '#f4cccc', 'FILL IN': '#f4cccc' };
-  const rng = sheet.getRange(2, map['Action'], n, 1);
-  rng.setBackgrounds(rng.getValues().map(function (v) { return [colorFor[v[0]] || null]; }));
+function longParseDate_(v) {
+  if (v == null || v === '') return null;
+  if (longIsDate_(v)) {
+    // A date cell is midnight in the SPREADSHEET's time zone, which can differ from the script's: midnight GMT is the previous evening
+    // in New York, so Dec 15 became Dec 14 and no contract matched. Take the calendar day as the sheet shows it and pin it to noon.
+    try {
+      const sheetTz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      const p = Utilities.formatDate(v, sheetTz, 'yyyy-MM-dd').split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12, 0, 0);
+    } catch (e) { return v; }
+  }
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? null : d;
 }
 
-
-// Orders the rows by Jay tier (High > Medium > Low > none), then within each tier (STOP / SELL first, then HOLD, BUY, READY, BLOCKED, WAIT, SKIP) without a SortKey column on the sheet:
-// a temporary column carries the keys for the sort and is deleted straight after. Rows keep their inputs and formulas.
-function flipSortRows_(sheet, map, data, keys, jayByIdx) {
-  const n = data.length;
-  if (n < 2) return;
-  const a = map['Action'] - 1, sc = map['Score'] - 1;
-  // Jay tier comes first (High, then Medium, then Low, then no tier); the existing Action/Score order breaks ties inside each tier.
-  const jc = map['Jay'] ? map['Jay'] - 1 : -1;
-  const jayTier = function (i, r) {
-    const v = String((jayByIdx && jayByIdx[i] !== undefined) ? jayByIdx[i] : (jc >= 0 ? r[jc] : '')).toLowerCase();
-    return v.indexOf('high') === 0 ? 3 : (v.indexOf('medium') === 0 ? 2 : (v.indexOf('low') === 0 ? 1 : 0));
-  };
-  const col = data.map(function (r, i) {
-    const k = keys[i] !== undefined ? keys[i] : flipSortKey_(String(r[a] || ''), flipNum_(r[sc]) || 0, 0);
-    return [jayTier(i, r) * 100000 + k];
+function longColorRows_(sheet, map, n) {
+  const colorFor = { 'BUY': '#b7e1cd', 'READY': '#d9ead3', 'WAIT': '#fff2cc', 'SKIP': '#eeeeee', 'HOLD': '#cfe2f3', 'TAKE PROFIT': '#b7e1cd',
+    'TREND EXIT': '#ea9999', 'ROLL': '#fce5cd', 'REVIEW': '#f4cccc', 'FILL IN': '#f4cccc' };
+  if (map['Action']) {
+    const rng = sheet.getRange(2, map['Action'], n, 1);
+    rng.setBackgrounds(rng.getValues().map(function (v) { return [colorFor[v[0]] || null]; }));
+  }
+  if (map['Risk']) {
+    const rng = sheet.getRange(2, map['Risk'], n, 1);
+    rng.setBackgrounds(rng.getValues().map(function (v) {
+      const x = v[0]; if (x === '' || isNaN(x)) return [null];
+      return [x <= 20 ? '#b7e1cd' : (x <= LONG_CONFIG.entry.riskGate ? '#fff2cc' : '#f4cccc')];
+    }));
+  }
+  if (map['Score']) {
+    const rng = sheet.getRange(2, map['Score'], n, 1);
+    rng.setBackgrounds(rng.getValues().map(function (v) {
+      const x = v[0]; if (x === '' || isNaN(x)) return [null];
+      return [x >= LONG_CONFIG.entry.scoreBuy ? '#b7e1cd' : (x >= LONG_CONFIG.entry.scoreReady ? '#fff2cc' : null)];
+    }));
+  }
+  ['P/L %', 'P/L $'].forEach(function (h) {
+    if (!map[h]) return;
+    const rng = sheet.getRange(2, map[h], n, 1);
+    rng.setFontColors(rng.getValues().map(function (v) {
+      const x = v[0]; if (x === '' || isNaN(x)) return [null];
+      return [x > 0 ? '#38761d' : (x < 0 ? '#cc0000' : null)];
+    }));
   });
-  const lastC = sheet.getLastColumn();
-  sheet.insertColumnAfter(lastC);
-  const tmp = lastC + 1;
-  try {
-    sheet.getRange(2, tmp, n, 1).setValues(col);
-    sheet.getRange(2, 1, n, tmp).sort({ column: tmp, ascending: false });
-  } finally {
-    sheet.deleteColumn(tmp);
-  }
 }
 
 
 /* ============================================================================
- * SIGNAL LOG (FlipLog): every BUY / READY, so it can be graded later
+ * ALERTS — Telegram / Pushover / ntfy through the existing phone-alert setup (sendPhoneAlert_).
+ * One batched message per run. State is saved only when the message actually went out, so a failed send retries next run.
  * ========================================================================== */
 
-function flipBuildLogItems_(rw, res, env, items) {
-  const a = res['Action'];
-  if ((a !== 'BUY' && a !== 'READY') || !res._geo || rw.held) return;
-  const g = res._geo, b = res._base, live = res._live;
-  const exp = flipDate_(b.expiry);
-  items.push({
-    key: rw.ticker + '|' + a,
-    row: [Utilities.formatDate(env.now, 'America/New_York', 'yyyy-MM-dd HH:mm'), rw.ticker, a, flipR2_(res._price), b.strike,
-      exp ? Utilities.formatDate(exp, 'America/New_York', 'yyyy-MM-dd') : '', flipR2_(live.mid), flipR2_(live.delta), flipR1_(g.lev), flipR2_(live.spreadPct),
-      flipR2_(g.need), flipR2_(g.stopDist), flipR1_(g.pHit * 100), flipR1_(g.edgeNeeded), res['Score'],
-      res['AUP'] === undefined ? '' : res['AUP'], res['ADN'] === undefined ? '' : res['ADN'], res['RSI'] === undefined ? '' : res['RSI'],
-      res['VW %'] === undefined ? '' : res['VW %'], res['RVOL'] === undefined ? '' : res['RVOL'],
-      res['Off High %'] === undefined ? '' : res['Off High %'], res['Trend'] || '', res['Earn Days'] === undefined ? '' : res['Earn Days'],
-      '', '', '', '', '', '']
-  });
+function longAlertsOn_() {
+  return PropertiesService.getScriptProperties().getProperty('LONG_ALERTS') !== 'false';
 }
 
-// Appends new signals, at most one per ticker+signal per logCooldownMin minutes.
-function flipAppendLog_(items, now) {
-  try {
-    const props = PropertiesService.getScriptProperties();
-    let state = {};
-    try { state = JSON.parse(props.getProperty('FLIP_LOG_STATE') || '{}'); } catch (e) { state = {}; }
-    const nowMs = now.getTime(), cool = FLIP_CONFIG.logCooldownMin * 60000;
-    const rows = [];
-    items.forEach(function (it) {
-      if (state[it.key] && nowMs - state[it.key] < cool) return;
-      state[it.key] = nowMs; rows.push(it.row);
-    });
-    if (!rows.length) return 0;
-    Object.keys(state).forEach(function (k) { if (nowMs - state[k] > 86400000) delete state[k]; });
-    props.setProperty('FLIP_LOG_STATE', JSON.stringify(state));
-    const sh = flipEnsureSheet_(FLIP_LOG_SHEET, FLIP_LOG_HEADERS);
-    sh.getRange(sh.getLastRow() + 1, 1, rows.length, FLIP_LOG_HEADERS.length).setValues(rows);
-    return rows.length;
-  } catch (e) { logToSheet_('Flip: signal log failed: ' + e); return 0; }
-}
-
-
-/* ============================================================================
- * ALERTS (same Telegram / Pushover / ntfy setup as Quick; own on/off switch and own state)
- * ========================================================================== */
-
-function flipAlertsOn_() { return PropertiesService.getScriptProperties().getProperty('FLIP_ALERTS') !== 'false'; }
-
-function flipBuildAlertItems_(rw, res, items) {
-  const a = res['Action'];
+function longBuildAlertItems_(rw, res) {
+  const items = [];
   const t = rw.ticker;
-  if (a === 'STOP' || a === 'TIME-STOP' || a === 'SELL') {
-    if (!rw.complete) return;
-    const key = a + '|' + t + '|' + rw.strike + '|' + Utilities.formatDate(rw.expiry, 'America/New_York', 'yyyyMMdd');
-    items.push({ kind: 'exit', key: key, text: a + ' ' + t + ' ' + flipContractText_(rw.expiry, rw.strike) + ' (x' + rw.qty + '): ' + res['Why'] });
-  } else if (a === 'BUY' || a === 'READY') {
-    if (!res._base) return;
-    const b = res._base, live = res._live;
-    const key = a + '|' + t + '|' + b.strike + '|' + String(b.expiry).replace(/-/g, '');
-    const txt = (a === 'BUY' ? 'BUY ' : 'READY ') + t + ' ' + res['Contract'] + ' | ask ' + flipR2_(live.ask) + ' (spread ' + flipR1_(live.spreadPct) + '%) | size ' + res['Size'] +
-      ' | target ' + res['Target'] + ' stop ' + res['Stop'] + ' (-' + res['Stop %'] + '%) | stock needs +' + res['Need %'] + '% | P hit ' + res['P Hit %'] + '% edge ' + res['Edge Needed'] +
-      ' | AUP ' + res['AUP'] + ' ADN ' + res['ADN'] + ' RSI ' + res['RSI'] + ' | score ' + res['Score'];
-    items.push({ kind: a === 'BUY' ? 'buy' : 'ready', key: key, text: txt });
+  const r2 = function (v) { return (v === '' || v == null || isNaN(v)) ? '?' : (Math.round(v * 100) / 100).toFixed(2); };
+  const a = res.Action;
+  if (rw.isOpen && longIsDate_(rw.openExpiry)) {
+    const label = t + ' $' + rw.openStrike + 'C ' + Utilities.formatDate(rw.openExpiry, Session.getScriptTimeZone(), 'MMM d yyyy');
+    const key = a + '|' + t + '|' + rw.openStrike + '|' + longYmd_(rw.openExpiry);
+    const why = String(res.Why || '').replace(/^HELD: /, '');
+    const mk = ' Mid ' + r2(res.Mid) + ' vs entry ' + r2(rw.openEntry) + (res['P/L %'] !== '' && res['P/L %'] != null ? ' (' + r2(res['P/L %']) + '%)' : '') + '.';
+    if (a === 'TREND EXIT') items.push({ kind: 'exit', key: key, text: 'TREND EXIT ' + label + ': ' + why + '.' + mk + ' Plan says leave on a trend break.' });
+    else if (a === 'ROLL') items.push({ kind: 'roll', key: key, text: 'ROLL ' + label + ': ' + why + '.' + mk });
+    else if (a === 'TAKE PROFIT') items.push({ kind: 'tp', key: key, text: 'TAKE PROFIT ' + label + ': ' + why + '.' + mk + ' You decide how much.' });
+    else if (a === 'REVIEW') items.push({ kind: 'review', key: key, text: 'REVIEW ' + label + ': ' + why });
+  } else if (a === 'BUY' && longIsDate_(res.Expiry)) {
+    items.push({
+      kind: 'buy', key: 'BUY|' + t + '|' + longYmd_(res.Expiry),
+      text: 'BUY ' + t + ' ' + Utilities.formatDate(res.Expiry, Session.getScriptTimeZone(), 'MMM d yyyy') + ' $' + res.Strike + 'C @ ' + r2(res.Mid) +
+        ' (' + res.DTE + 'd, delta ' + r2(res.Delta) + ', carry ' + r2(res['Carry %/yr']) + '%/yr, spread ' + r2(res['Spread %']) + '%, Risk ' + r2(res.Risk) +
+        ', Score ' + r2(res.Score) + '). Stock equiv $' + Math.round(res['Stock Equiv $']) + ' for $' + Math.round(res.Mid * 100) + ' per contract.'
+    });
   }
+  return items;
 }
 
-// Returns { sent, note }. State only changes when the message really went out.
-function flipDispatchAlerts_(items, now) {
+// Returns { sent, note }. Never throws.
+function longDispatchAlerts_(items, now) {
   try {
     if (!items || !items.length) return { sent: 0, note: '' };
-    if (!flipAlertsOn_()) return { sent: 0, note: 'Flip alerts are switched off (menu: Flip > Alerts & Schedule).' };
-    const A = FLIP_CONFIG.alerts;
+    if (!longAlertsOn_()) return { sent: 0, note: 'Long alerts are switched off (menu: Long > Long Alerts & Schedule).' };
     const cfg = getAlertConfig_();
     if (!cfg.ready) return { sent: 0, note: 'phone alerts are not set up or are off (menu: Quick and Leap > Phone Alerts).' };
     const props = PropertiesService.getScriptProperties();
     let state = {};
-    try { state = JSON.parse(props.getProperty('FLIP_ALERT_STATE') || '{}'); } catch (e) { state = {}; }
+    try { state = JSON.parse(props.getProperty('LONG_ALERT_STATE') || '{}'); } catch (e) { state = {}; }
+    const A = LONG_CONFIG.alerts;
+    const hoursFor = { exit: A.exitRepeatHours, roll: A.rollRepeatHours, tp: A.tpRepeatHours, review: A.reviewRepeatHours, buy: A.buyRepeatHours };
     const nowMs = now.getTime();
-    const repeat = { exit: A.exitRepeatMin, buy: A.buyRepeatMin, ready: A.readyRepeatMin };
-    const fresh = items.filter(function (it) {
-      if (it.kind === 'ready' && !A.alertReady) return false;
-      return !state[it.key] || nowMs - state[it.key] >= repeat[it.kind] * 60000;
-    });
-    if (!fresh.length) return { sent: 0, note: items.length + ' signal(s), none new (already alerted inside their repeat window, or READY alerts are off).' };
-    const rank = { exit: 0, buy: 1, ready: 2 };
-    fresh.sort(function (a, b) { return rank[a.kind] - rank[b.kind]; });
+    const fresh = items.filter(function (it) { const prev = state[it.key]; return !prev || nowMs - prev >= hoursFor[it.kind] * 3600000; });
+    if (!fresh.length) return { sent: 0, note: items.length + ' signal(s), all already alerted within their repeat window.' };
+    const order = { exit: 0, roll: 1, tp: 2, review: 3, buy: 4 };
+    fresh.sort(function (a, b) { return order[a.kind] - order[b.kind]; });
     const n = function (k) { return fresh.filter(function (it) { return it.kind === k; }).length; };
     const parts = [];
-    if (n('exit')) parts.push(n('exit') + ' EXIT');
+    if (n('exit')) parts.push(n('exit') + ' trend exit');
+    if (n('roll')) parts.push(n('roll') + ' roll');
+    if (n('tp')) parts.push(n('tp') + ' take-profit');
+    if (n('review')) parts.push(n('review') + ' review');
     if (n('buy')) parts.push(n('buy') + ' BUY');
-    if (n('ready')) parts.push(n('ready') + ' get ready');
-    const lines = fresh.slice(0, 6).map(function (it) { return it.text; });
-    if (fresh.length > 6) lines.push('+' + (fresh.length - 6) + ' more on the sheet');
-    const r = sendPhoneAlert_(cfg, 'Flip: ' + parts.join(', '), lines.join('\n\n'), n('exit') + n('buy') > 0);
-    if (!r.ok) { logToSheet_('Flip alert failed: ' + r.detail); return { sent: 0, note: 'send failed (' + r.detail + ')' }; }
+    const r = sendPhoneAlert_(cfg, 'Long: ' + parts.join(', '), fresh.map(function (it) { return it.text; }).join('\n\n'), n('exit') > 0 || n('tp') > 0);
+    if (!r.ok) { logToSheet_('Long alert failed: ' + r.detail); return { sent: 0, note: 'send failed (' + r.detail + ')' }; }
     fresh.forEach(function (it) { state[it.key] = nowMs; });
-    Object.keys(state).forEach(function (k) { if (nowMs - state[k] > 3 * 86400000) delete state[k]; });
-    props.setProperty('FLIP_ALERT_STATE', JSON.stringify(state));
+    Object.keys(state).forEach(function (k) { if (nowMs - state[k] > 14 * 86400000) delete state[k]; });
+    props.setProperty('LONG_ALERT_STATE', JSON.stringify(state));
     return { sent: fresh.length, note: 'sent ' + fresh.length + ' (' + parts.join(', ') + ')' };
   } catch (e) {
-    logToSheet_('Flip alert error: ' + e);
+    logToSheet_('Long alert error: ' + e);
     return { sent: 0, note: 'error: ' + e };
   }
 }
 
-function sendTestFlipAlert_() {
+function sendTestLongAlert_() {
   const ui = tryGetUi_();
   const cfg = getAlertConfig_();
-  if (!cfg.ready) { notify_(ui, 'Flip alert test', 'Phone alerts are not set up or are off. Use Quick and Leap > Phone Alerts first (the same setup serves Quick, CSP and Flip).'); return; }
-  const r = sendPhoneAlert_(cfg, 'Flip: test', 'Test alert from the Flip tab. A real one looks like:\nBUY APP Jan 2028 $300C | ask 61.40 (spread 1.1%) | size 1 | target 63.7 stop 55.9 (-9.0%) | stock needs +1.9% | P hit 39% edge 4.1 | AUP 85 ADN 20 RSI 33 | score 72', false);
-  notify_(ui, 'Flip alert test', r.ok ? 'Sent. ' + r.detail : 'Failed: ' + r.detail);
+  if (!cfg.ready) { notify_(ui, 'Long alert test', 'Phone alerts are not set up or are off. Use Quick and Leap > Phone Alerts first (the same Telegram setup serves Long).'); return; }
+  const r = sendPhoneAlert_(cfg, 'Long: test', 'Test alert from the Long tab. A real one looks like:\nBUY KO Dec 17 2027 $55C @ 14.20 (430d, delta 0.86, carry 4.1%/yr, spread 0.9%, Risk 18.5, Score 72.0). Stock equiv $6200 for $1420 per contract.', false);
+  notify_(ui, 'Long alert test', r.ok ? 'Sent. ' + r.detail : 'Failed: ' + r.detail);
 }
 
-function toggleFlipAlerts_() {
+function toggleLongAlerts_() {
   const ui = tryGetUi_();
-  const nowOn = flipAlertsOn_();
-  PropertiesService.getScriptProperties().setProperty('FLIP_ALERTS', nowOn ? 'false' : 'true');
-  notify_(ui, 'Flip alerts', 'Flip alerts are now ' + (nowOn ? 'OFF' : 'ON') + '. (Quick and CSP alerts are unaffected.)');
+  const props = PropertiesService.getScriptProperties();
+  const nowOn = longAlertsOn_();
+  props.setProperty('LONG_ALERTS', nowOn ? 'false' : 'true');
+  notify_(ui, 'Long alerts', 'Long alerts are now ' + (nowOn ? 'OFF' : 'ON') + '. (Other tabs\' alerts are unaffected.)');
 }
 
 
 /* ============================================================================
- * SCHEDULE — one 5-minute trigger. Outside market hours it returns at once (no network).
- *   every tick in market hours: held positions + candidates already picked today (cheap)
- *   every fullScanEveryMin: full scan (new contracts, earnings, sort)
- *   before the open: research promotion      after the close: grade past signals
+ * SCHEDULE — hourly trigger; the tick exits at once outside US market hours.
+ *   market hours: one full scan per tick (cheap after the first of the day: contracts and daily bars are cached)
+ *   pre-market (06:00 to open): research promotion, once a day
  * ========================================================================== */
 
-const FLIP_TICK_FN = 'flipScheduledTick_';
+const LONG_TICK_FN = 'longScheduledTick_';
 
-function flipEtParts_(now) {
+function longEtParts_(now) {
   const tz = 'America/New_York';
   return { dow: parseInt(Utilities.formatDate(now, tz, 'u'), 10), hhmm: Utilities.formatDate(now, tz, 'HH:mm'), ymd: Utilities.formatDate(now, tz, 'yyyy-MM-dd') };
 }
 
-function flipRemoveTriggers_() {
+function longWithinMarketHours_(now) {
+  const p = longEtParts_(now);
+  return p.dow >= 1 && p.dow <= 5 && p.hhmm >= LONG_CONFIG.schedule.startHHmm && p.hhmm <= LONG_CONFIG.schedule.endHHmm;
+}
+
+function longRemoveTriggers_() {
   let n = 0;
-  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === FLIP_TICK_FN) { ScriptApp.deleteTrigger(t); n++; } });
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === LONG_TICK_FN) { ScriptApp.deleteTrigger(t); n++; } });
   return n;
 }
 
-function startFlipSchedule_() {
+function startLongSchedule_() {
   const ui = tryGetUi_();
-  flipRemoveTriggers_();
-  ScriptApp.newTrigger(FLIP_TICK_FN).timeBased().everyMinutes(5).create();
-  const S = FLIP_CONFIG.schedule;
-  notify_(ui, 'Flip schedule started',
-    'Runs every 5 minutes; outside Mon-Fri ' + S.startHHmm + '-' + S.endHHmm + ' ET each run exits in milliseconds.\n' +
-    'Each in-hours tick checks your held positions and today\'s candidates; every ' + S.fullScanEveryMin + ' minutes it does a full scan.\n' +
-    'Research promotion runs before the open; past signals are graded after ' + S.gradeAfterHHmm + '.\n' +
-    'Phone alerts go through the Quick alert setup.');
+  longRemoveTriggers_();
+  ScriptApp.newTrigger(LONG_TICK_FN).timeBased().everyHours(1).create();
+  notify_(ui, 'Long schedule started',
+    'Runs hourly. Outside Mon-Fri ' + LONG_CONFIG.schedule.startHHmm + '-' + LONG_CONFIG.schedule.endHHmm + ' ET it exits immediately.\n' +
+    'Each in-hours tick scans every row (stalest first); the first tick of the day is the slow one (picks contracts), later ticks are quick.\n' +
+    'Research promotion runs once a day before the open. Telegram alerts go through the existing phone-alert setup.');
 }
 
-function stopFlipSchedule_() { notify_(tryGetUi_(), 'Flip schedule', 'Stopped (' + flipRemoveTriggers_() + ' trigger(s) removed).'); }
+function stopLongSchedule_() {
+  notify_(tryGetUi_(), 'Long schedule', 'Stopped (' + longRemoveTriggers_() + ' trigger(s) removed).');
+}
 
-function flipScheduleStatus_() {
+function longScheduleStatus_() {
   const props = PropertiesService.getScriptProperties();
-  const n = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === FLIP_TICK_FN; }).length;
-  const lastFull = parseInt(props.getProperty('FLIP_LAST_FULL') || '0', 10);
+  const n = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === LONG_TICK_FN; }).length;
+  const lastFull = parseInt(props.getProperty('LONG_LAST_FULL') || '0', 10);
   const cfg = getAlertConfig_();
-  notify_(tryGetUi_(), 'Flip schedule status',
-    'Schedule: ' + (n ? 'ON' : 'OFF') + '\nLast full scan: ' + (lastFull ? new Date(lastFull).toString() : 'never') +
-    '\nLast promotion: ' + (props.getProperty('FLIP_LAST_PROMOTE') || 'never') + '\nLast grading: ' + (props.getProperty('FLIP_LAST_GRADE') || 'never') +
-    '\nFlip alerts: ' + (flipAlertsOn_() ? 'ON' : 'OFF') + '; phone provider ' + (cfg.ready ? 'ready (' + cfg.provider + ')' : 'NOT ready'));
+  notify_(tryGetUi_(), 'Long schedule status',
+    'Schedule: ' + (n ? 'ON (' + n + ' trigger)' : 'OFF') + '\n' +
+    'Last complete scan: ' + (lastFull ? new Date(lastFull).toString() : 'never') + '\n' +
+    'Last research promotion: ' + (props.getProperty('LONG_LAST_PROMOTE') || 'never') + '\n' +
+    'Long alerts: ' + (longAlertsOn_() ? 'ON' : 'OFF') + '; phone provider ' + (cfg.ready ? 'ready (' + cfg.provider + ')' : 'NOT ready'));
 }
 
-function flipScheduledTick_() {
+function longScheduledTick_() {
   const now = new Date();
-  const p = flipEtParts_(now);
+  const p = longEtParts_(now);
   if (p.dow < 1 || p.dow > 5) return;
-  const S = FLIP_CONFIG.schedule;
-  const inMarket = p.hhmm >= S.startHHmm && p.hhmm <= S.endHHmm;
   const props = PropertiesService.getScriptProperties();
-  const running = parseInt(props.getProperty('FLIP_RUNNING') || '0', 10);
-  if (running && Date.now() - running < 10 * 60000) return;
-  const mark = function (k) { props.setProperty(k, p.ymd); };
+  const running = parseInt(props.getProperty('LONG_RUNNING') || '0', 10);
+  if (running && Date.now() - running < 10 * 60000) return;      // a run is already in progress
+
+  const promoteDone = props.getProperty('LONG_LAST_PROMOTE') === p.ymd;
+  const inMarket = longWithinMarketHours_(now);
+  const runPromote = function (budgetMs) {
+    props.setProperty('LONG_RUNNING', String(Date.now()));
+    try {
+      const pr = longPromoteFromResearch_({ quiet: true, timeBudgetMs: budgetMs });
+      if (pr && pr.complete) props.setProperty('LONG_LAST_PROMOTE', p.ymd);
+    } catch (e) { logToSheet_('Long promote error: ' + e); }
+    props.deleteProperty('LONG_RUNNING');
+  };
 
   if (!inMarket) {
-    if (p.hhmm >= '06:00' && p.hhmm < S.startHHmm && props.getProperty('FLIP_LAST_PROMOTE') !== p.ymd) {
-      props.setProperty('FLIP_RUNNING', String(Date.now()));
-      try { const r = flipPromote_({ quiet: true, timeBudgetMs: 240000 }); if (r && r.complete) mark('FLIP_LAST_PROMOTE'); }
-      catch (e) { logToSheet_('Flip promote error: ' + e); }
-      finally { props.deleteProperty('FLIP_RUNNING'); }
-    } else if (p.hhmm >= S.gradeAfterHHmm && p.hhmm < '20:00' && props.getProperty('FLIP_LAST_GRADE') !== p.ymd) {
-      props.setProperty('FLIP_RUNNING', String(Date.now()));
-      try { flipGradeSignals({ quiet: true }); mark('FLIP_LAST_GRADE'); }
-      catch (e) { logToSheet_('Flip grading error: ' + e); }
-      finally { props.deleteProperty('FLIP_RUNNING'); }
-    }
+    if (!promoteDone && p.hhmm >= '06:00' && p.hhmm < LONG_CONFIG.schedule.startHHmm) runPromote(250000);
     return;
   }
-  const lastFull = parseInt(props.getProperty('FLIP_LAST_FULL') || '0', 10);
-  const full = !lastFull || Date.now() - lastFull >= S.fullScanEveryMin * 60000 - 90000 || new Date(lastFull).toDateString() !== now.toDateString();
-  const r = runFlipScan(full ? 250000 : 100000, false, { quiet: true, full: full });
-  if (full && r && !r.timedOut) props.setProperty('FLIP_LAST_FULL', String(Date.now()));
+  const t0 = Date.now();
+  if (!promoteDone) runPromote(100000);        // fallback: schedule started after the pre-market window
+  const remaining = Math.max(60000, 280000 - (Date.now() - t0));
+  const r = runLongScan(remaining, false, { quiet: true });
+  if (r && !r.timedOut) props.setProperty('LONG_LAST_FULL', String(Date.now()));
 }
 
 
 /* ============================================================================
- * PROMOTION — which names deserve a row
+ * RESEARCH PROMOTION — which quality names deserve a row on this tab
  * ----------------------------------------------------------------------------
- * Fit (0-100) = Range 25 + Liquidity 25 + Structure 35 + Personal 15.
- *   Range     ATR% sweet spot 3-6% (enough movement to reach +3% in days, not so much that the stop is noise)
- *   Liquidity average daily dollar volume, log scale, $1B (0) to $10B (full)
- *   Structure daily trend (Up 15, Pullback 10, Mixed 5, Down 0) + distance under the 52-week high (10) + above the 200-day (10)
- *   Personal  your own Results history: net winner 15, net loser 6; on Quick/Research only 8
- * Hard gates: dollar volume >= $1B, price >= $20, ATR 1.8-9%, <= 40% under the 52-week high.
- * Keeps the best 30 with Fit >= 60. A name you added by hand (only names this promotion added can be retired), a held position, or a row with
- * a Qty is never removed. Promoted names that miss the cut 5 promotions in a row are retired.
+ * Moat cannot be read off a data feed. This reuses the CSP quality screen (return on equity, margins, free cash flow, leverage,
+ * growth, 5-year record, size) and adds: market cap >= $50B, ROE >= 12%, operating margin >= 10% for stocks. It will miss
+ * brand / network-effect judgment and can be fooled by buybacks (ROE) or one good year. It builds the shortlist, it does not replace your view.
+ * "Hold comfortably if stuck" is approximated by the 5-year worst drawdown and leverage terms in the score.
+ * Option liquidity is NOT checked here: a name with no usable LEAP shows SKIP on the scan.
  * ========================================================================== */
 
-function flipReadTickerColumn_(sheetName) {
+function longReadTickerColumn_(sheetName) {
+  return (typeof cspReadTickerColumn_ === 'function') ? cspReadTickerColumn_(sheetName) : [];
+}
+
+function longEvaluateTicker_(t, isEtf, ctx) {
+  const tech = longFetchTech_(t, ctx);
+  const techForGates = tech ? { price: tech.price, ma50: tech.ma50, ma200: tech.ma200, hi52: tech.hi52 } : null;
+  const wRes = getSlowCached_(ctx.slowCache, ctx.pending, 'CSPW5', t, 7, function () { return cspFetchWeekly5y_(t); });
+  if (wRes.fetchAttempted) Utilities.sleep(LONG_CONFIG.sleepMs);
+  let f = null;
+  if (!isEtf) {
+    const fRes = getSlowCached_(ctx.slowCache, ctx.pending, 'CSPFUND', t, 14, function () { return cspFetchFundamentals_(t); });
+    if (fRes.fetchAttempted) Utilities.sleep(LONG_CONFIG.sleepMs);
+    f = fRes.value;
+  }
+  const q = isEtf ? cspQualityEtf_(wRes.value, techForGates, LONG_CONFIG) : cspQualityStock_(f, wRes.value, techForGates, LONG_CONFIG);
+  if (!isEtf && f) {
+    if (f.roe != null && f.roe * 100 < LONG_CONFIG.promote.minRoePct) q.fails.push('ROE ' + longRound_(f.roe * 100, 1) + '% < ' + LONG_CONFIG.promote.minRoePct + '%');
+    if (f.opm != null && f.opm * 100 < LONG_CONFIG.promote.minOpmPct) q.fails.push('operating margin ' + longRound_(f.opm * 100, 1) + '% < ' + LONG_CONFIG.promote.minOpmPct + '%');
+  }
+  q.ticker = t; q.isEtf = isEtf; q.price = tech ? tech.price : null;
+  q.minScore = isEtf ? LONG_CONFIG.promote.minEtfScore : LONG_CONFIG.promote.minStockScore;
+  q.qualifies = q.fails.length === 0 && q.score >= q.minScore;
+  return q;
+}
+
+// Quality screens already cached by the CSP tab (weekly 5y, fundamentals) are reused read-only: the first Long promote is then fast.
+function longPromoteCache_() {
+  const merged = {};
+  try { const c = (typeof cspLoadCache_ === 'function') ? cspLoadCache_() : {}; Object.keys(c).forEach(function (k) { if (/^SLOW_(CSPW5|CSPFUND)_/.test(k)) merged[k] = c[k]; }); } catch (e) { /* none */ }
+  const own = longLoadCache_();
+  Object.keys(own).forEach(function (k) { merged[k] = own[k]; });
+  return merged;
+}
+
+function longUniverse_(sheetRows) {
+  const never = {};
+  longNever_().forEach(function (t) { never[t] = true; });
+  const u = {};
+  LONG_STOCK_UNIVERSE.forEach(function (t) { if (!never[t]) u[t] = { isEtf: false }; });
+  LONG_ETF_UNIVERSE.forEach(function (t) { u[t] = { isEtf: true }; });
+  // Only the Long lists above plus rows you pinned (Qty filled or Ticker cell colored). The Research / Quick / Leap tabs are NOT used: they hold
+  // high-volatility names that do not fit "comfortable to hold for years".
+  (sheetRows || []).forEach(function (rw) { if (!u[rw.ticker] && (rw.held || rw.colored)) u[rw.ticker] = { isEtf: rw.isEtf }; });
+  return u;
+}
+
+// Rewrites the Long block of the Universe tab (sheet reads/writes only: no API calls). Sector / Industry / Cap tier you already filled are kept.
+function longUpdateUniverse() {
+  const ui = tryGetUi_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const uni = ss.getSheetByName('Universe') || ss.insertSheet('Universe');
+  const HEAD = ['Long Ticker', 'Sector', 'Industry', 'Cap tier (hand classification)', 'Type', 'On Long tab now', 'Sector source'];
+  const startCol = longUniverseStartCol_(uni, HEAD[0]);
+  const old = {};
+  if (uni.getLastRow() >= 2) uni.getRange(2, startCol, uni.getLastRow() - 1, HEAD.length).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) old[t] = r; });
+  const left = {};
+  if (uni.getLastRow() >= 2) uni.getRange(2, 1, uni.getLastRow() - 1, 4).getValues().forEach(function (r) { const t = String(r[0] || '').trim().toUpperCase(); if (t) left[t] = r; });
+  const overrides = (typeof loadSectorOverrides_ === 'function') ? loadSectorOverrides_() : {};
+  const onTab = {};
+  const sheetRows = [];
+  longReadTickerColumn_(LONG_SHEET_NAME).forEach(function (t) { onTab[t] = true; sheetRows.push({ ticker: t, isEtf: !!LONG_ETF_SET[t] }); });
+  const uniMap = longUniverse_(sheetRows);
+  const list = Object.keys(uniMap);
+  let fresh = 0, unclassified = 0;
+  const rows = list.map(function (t) {
+    const isEtf = !!uniMap[t].isEtf;
+    const o = old[t];
+    if (o && String(o[1] || '').trim() !== '' && String(o[1]).trim() !== '?' && String(o[1]).trim() !== 'unclassified') return [t, o[1], o[2], o[3], isEtf ? 'ETF' : 'Stock', onTab[t] ? 'Yes' : '', o[6] || ''];
+    let sec = '', ind = '', cap = '', src = '';
+    const ov = overrides[t], st = (typeof STATIC_SECTOR_MAP !== 'undefined') ? STATIC_SECTOR_MAP[t] : null, lf = left[t];
+    if (ov && ov.sector) { sec = ov.sector; ind = ov.industry || ''; src = 'Sector override'; }
+    else if (st) { sec = st.sector; ind = st.industry; src = 'Project STATIC_SECTOR_MAP'; }
+    else if (lf && String(lf[1] || '').trim() !== '') { sec = lf[1]; ind = lf[2]; cap = lf[3]; src = 'Quick/Leap block'; }
+    else if (isEtf) { sec = 'ETF'; src = 'ETF'; }
+    else { sec = 'unclassified'; src = 'unclassified'; unclassified++; }
+    fresh++;
+    return [t, sec, ind, cap || (isEtf ? 'ETF' : 'Large/mega (assumed)'), isEtf ? 'ETF' : 'Stock', onTab[t] ? 'Yes' : '', src];
+  });
+  if (uni.getMaxColumns() < startCol + HEAD.length - 1) uni.insertColumnsAfter(uni.getMaxColumns(), startCol + HEAD.length - 1 - uni.getMaxColumns());
+  uni.getRange(2, startCol, Math.max(uni.getMaxRows() - 1, 1), HEAD.length).clearContent();
+  uni.getRange(1, startCol, 1, HEAD.length).setValues([HEAD]);
+  if (rows.length) {
+    if (uni.getMaxRows() < rows.length + 1) uni.insertRowsAfter(uni.getMaxRows(), rows.length + 1 - uni.getMaxRows());
+    uni.getRange(2, startCol, rows.length, HEAD.length).setValues(rows);
+  }
+  notify_(ui, 'Long universe updated',
+    rows.length + ' tickers written to the Universe tab (columns from ' + startCol + ').\n' +
+    'Sources: built-in stock + ETF lists, the Research / Quick / Leap tabs (large/mega only), and the Long tab.\n' +
+    'New or re-classified: ' + fresh + (unclassified ? ' (' + unclassified + ' unclassified: type the sector in, it is kept next time)' : '') + '.\n\n' +
+    'This lists who Long looks at. Who qualifies is decided by Promote Research Picks to Long.');
+  return { count: rows.length, fresh: fresh };
+}
+
+// The Long block starts where its header already is (so moving the block is safe); first-time default is column AC (29), right of the Flip block (T:AA).
+function longUniverseStartCol_(uni, header) {
   try {
-    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-    if (!sh || sh.getLastRow() < 2) return [];
-    const top = sh.getRange(1, 1, Math.min(5, sh.getLastRow()), sh.getLastColumn()).getValues();
-    let hr = -1, hc = -1;
-    for (let r = 0; r < top.length && hr < 0; r++) for (let c = 0; c < top[r].length; c++) if (String(top[r][c]).trim().toLowerCase() === 'ticker') { hr = r; hc = c; break; }
-    if (hr < 0) return [];
-    const vals = sh.getRange(hr + 2, hc + 1, sh.getLastRow() - hr - 1, 1).getValues();
-    return vals.map(function (v) { return String(v[0] || '').trim().toUpperCase(); }).filter(function (t) { return /^[A-Z.]{1,6}$/.test(t); });
-  } catch (e) { return []; }
+    const row = uni.getRange(1, 1, 1, Math.max(uni.getLastColumn(), 1)).getValues()[0];
+    for (let i = 0; i < row.length; i++) if (String(row[i]).trim() === header) return i + 1;
+  } catch (e) { /* default below */ }
+  return 29;
 }
 
-// Net result per ticker from the Results tab (calls only).
-function flipResultsByTicker_() {
-  const out = {};
+// Wrapper: logs STARTED / COMPLETE / NOT COMPLETE to ScriptLog (a fresh run first wipes old ScriptLog rows, as the CSP promotion does).
+function longPromoteFromResearch_(opts) {
+  opts = opts || {};
+  const props = PropertiesService.getScriptProperties();
+  const src = opts.quiet ? 'scheduled' : 'manual';
+  const t0 = Date.now();
+  let cont = false;
+  if (opts.dryRun) {
+    logToSheet_('Long research+promote (dry run, nothing will be written): started');
+  } else {
+    cont = props.getProperty('LONG_PROMO_OPEN') === '1';
+    if (!cont && typeof cspClearScriptLog_ === 'function') cspClearScriptLog_();
+    props.setProperty('LONG_PROMO_OPEN', '1');
+    logToSheet_('Long research+promote ' + (cont ? 'CONTINUING after an unfinished run' : 'STARTED') + ' (' + src + ')');
+  }
+  let res;
   try {
-    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(FLIP_RESULTS_SHEET);
-    if (!sh || sh.getLastRow() < 3) return out;
-    sh.getRange(3, 1, sh.getLastRow() - 2, 10).getValues().forEach(function (r) {
-      const t = String(r[1] || '').trim().toUpperCase(), profit = flipMoney_(r[8]);
-      if (!t || profit == null || !/C$/i.test(String(r[2]).trim())) return;
-      out[t] = (out[t] || 0) + profit;
-    });
-  } catch (e) { /* personal score falls back to 0 */ }
-  return out;
+    res = longPromoteCore_(opts);
+  } catch (e) {
+    logToSheet_('Long research+promote FAILED: ' + (e && e.message ? e.message : e) + ' (the next run continues from cached scores)');
+    throw e;
+  }
+  const sec = Math.round((Date.now() - t0) / 1000);
+  if (res && res.complete) {
+    if (!opts.dryRun) props.deleteProperty('LONG_PROMO_OPEN');
+    logToSheet_('Long research+promote COMPLETE in ' + sec + 's: ' + res.chosen.length + ' names qualify; added ' +
+      (res.added.length ? res.added.join(', ') : 'none') + '; removed ' + (res.removed.length ? res.removed.join(', ') : 'none'));
+  } else {
+    logToSheet_('Long research+promote NOT COMPLETE after ' + sec + 's' +
+      (res && res.total ? ': ' + res.scored + ' of ' + res.total + ' tickers scored, sheet unchanged. ' : '. ') +
+      'The next run continues from cached scores (scheduled runs retry automatically; or run Promote Research Picks again).');
+  }
+  return res;
 }
 
-function flipMoney_(v) {
-  if (typeof v === 'number') return isFinite(v) ? v : null;
-  const s = String(v == null ? '' : v).replace(/[$,%\s]/g, '').replace(/^\((.*)\)$/, '-$1');
-  if (s === '') return null;
-  const n = parseFloat(s);
-  return isNaN(n) ? null : n;
-}
-
-// Pure: Fit score from inputs. f = flipFeatures_, d = Cloud daily, dollarVolM, personal in {win, loss, listed, none}.
-function flipFit_(f, d, dollarVolM, personal) {
-  const C = FLIP_CONFIG;
-  if (!f) return { fit: 0, gate: 'no price history' };
-  if (!(dollarVolM >= C.promote.minDollarVolM)) return { fit: 0, gate: 'dollar volume $' + Math.round(dollarVolM || 0) + 'M under $' + C.promote.minDollarVolM + 'M' };
-  if (f.price < C.minPrice) return { fit: 0, gate: 'price under $' + C.minPrice };
-  if (!(f.atrPct >= C.minAtrPct && f.atrPct <= C.maxAtrPct)) return { fit: 0, gate: 'ATR ' + flipR1_(f.atrPct) + '% outside ' + C.minAtrPct + '-' + C.maxAtrPct };
-  const offHigh = d && d.offHigh != null ? d.offHigh : (1 - f.price / f.high3m) * 100;
-  if (offHigh > C.maxOffHighPct) return { fit: 0, gate: flipR1_(offHigh) + '% under the high' };
-  const range = 25 * Math.min(flipLin_(f.atrPct, 1.8, 3), flipLin_(f.atrPct, 9, 6));
-  const liq = 25 * flipLin_(Math.log(dollarVolM) / Math.LN10, 3, 4);
-  const trend = { 'Up': 15, 'Pullback': 10, 'Mixed': 5, 'Down': 0 }[f.trend] || 0;
-  const struct = trend + 10 * flipLin_(offHigh, 40, 10) + ((d && d.t200 != null) ? (d.t200 > 0 ? 10 : 0) : 5);
-  const pers = { win: 15, loss: 6, listed: 8, none: 0 }[personal] || 0;
-  const fit = Math.round(range + liq + struct + pers);
-  return { fit: fit, note: 'range ' + Math.round(range) + ' liq ' + Math.round(liq) + ' struct ' + Math.round(struct) + ' you ' + pers + ' | ATR ' + flipR1_(f.atrPct) + '% $vol ' + Math.round(dollarVolM) + 'M ' + f.trend };
-}
-
-function runFlipPromote() { return flipPromote_({}); }
-
-function flipPromote_(opts) {
+function longPromoteCore_(opts) {
   opts = opts || {};
   const ui = opts.quiet ? null : tryGetUi_();
-  const C = FLIP_CONFIG, P = C.promote;
-  const startMs = Date.now();
-  const budget = opts.timeBudgetMs || P.timeBudgetMs;
-  const now = new Date();
+  const P = LONG_CONFIG.promote;
+  const start = Date.now();
+  const budgetMs = opts.timeBudgetMs || P.timeBudgetMs;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(FLIP_SHEET_NAME);
-  if (!sheet) { notify_(ui, 'Flip promote', 'No Flip tab. Run setupFlip first.'); return { complete: false }; }
-  const map = flipEnsureHeaders_(sheet);
-  const lastRow = sheet.getLastRow();
+  const sheet = ss.getSheetByName(LONG_SHEET_NAME);
+  if (!sheet) { notify_(ui, 'Long promote', 'No Long tab. Run setupLong once from the Apps Script editor.'); return { complete: false }; }
+  const map = longEnsureHeaders_(sheet);
   const width = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
   const data = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, width).getValues() : [];
+  const bgs = lastRow >= 2 ? sheet.getRange(2, map['Ticker'], lastRow - 1, 1).getBackgrounds() : [];
 
-  const onSheet = {};
-  data.forEach(function (r, i) { const t = String(r[map['Ticker'] - 1] || '').trim().toUpperCase(); if (t) onSheet[t] = i; });
-  const byResults = flipResultsByTicker_();
-  const listed = {};
-  flipReadTickerColumn_(FLIP_QUICK_SHEET).concat(flipReadTickerColumn_('Research')).forEach(function (t) { listed[t] = true; });
-  const universe = FLIP_UNIVERSE.concat(Object.keys(listed)).concat(Object.keys(onSheet)).concat(Object.keys(byResults))
-    .filter(function (t, i, a) { return a.indexOf(t) === i && t !== 'SPY'; });
-
-  const cache = flipCacheLoad_(), pending = {};
-  const ctx = { cache: cache, pending: pending, now: now };
-  const todayYmd = flipTodayYmd_(now);
-  const rawBars = flipGetBars_(universe.concat(['SPY']), ctx, '6mo', 'FB');
-  const daily = flipGetDaily_(universe, ctx);
-  const barsOf = function (t) { const o = flipBarsToObjects_(rawBars[t]); return o.length && o[o.length - 1].d === todayYmd ? o.slice(0, -1) : o; };
-  const spyObj = barsOf('SPY');
-
-  const scored = [];
-  universe.forEach(function (t) {
-    if (Date.now() - startMs > budget) return;
-    const b = barsOf(t);
-    const f = flipFeatures_(b, spyObj);
-    let dv = null;
-    if (b.length >= 20) { let s = 0; for (let i = b.length - 20; i < b.length; i++) s += b[i].c * (b[i].v || 0); dv = s / 20 / 1e6; }
-    const personal = byResults[t] != null ? (byResults[t] > 0 ? 'win' : 'loss') : (listed[t] ? 'listed' : 'none');
-    const r = flipFit_(f, daily[t], dv, personal);
-    scored.push({ t: t, fit: r.fit, note: r.gate ? 'gated: ' + r.gate : r.note, gated: !!r.gate });
-  });
-  const complete = scored.length === universe.length;
-  scored.sort(function (a, b) { return b.fit - a.fit; });
-  const keep = {};
-  scored.filter(function (s) { return !s.gated && s.fit >= P.minFit; }).slice(0, P.maxKeep).forEach(function (s) { keep[s.t] = s; });
-  const scoreOf = {};
-  scored.forEach(function (s) { scoreOf[s.t] = s; });
-
-  const props = PropertiesService.getScriptProperties();
-  let misses = {};
-  try { misses = JSON.parse(props.getProperty('FLIP_MISSES') || '{}'); } catch (e) { misses = {}; }
-
-  let promotedSet = {};
-  try { promotedSet = JSON.parse(props.getProperty('FLIP_PROMOTED') || '{}'); } catch (e) { promotedSet = {}; }
-  const added = [], retired = [], protectedKept = [];
-  const toDelete = [];
+  const onSheet = {}, sheetRows = [];
   data.forEach(function (r, i) {
     const t = String(r[map['Ticker'] - 1] || '').trim().toUpperCase();
     if (!t) return;
-    const s = scoreOf[t];
-    if (s) r[map['Fit'] - 1] = s.fit;
-    if (keep[t]) { misses[t] = 0; return; }
-    // Only names this promotion added (remembered in FLIP_PROMOTED) can be retired. Everything else, and anything you hold, stays.
-    const heldNow = flipNum_(r[map['Qty'] - 1]) > 0;
-    if (!promotedSet[t] || heldNow) { protectedKept.push(t); return; }
-    if (!complete || !s) return;
-    misses[t] = (misses[t] || 0) + 1;
-    if (misses[t] >= P.removeAfterMisses) { toDelete.push(i); retired.push(t); delete misses[t]; }
+    const type = String(r[map['Type'] - 1] || '').trim().toUpperCase();
+    const row = {
+      idx: i, ticker: t, source: String(r[map['Source'] - 1] || '').trim(), type: type, isEtf: type === 'ETF' || !!LONG_ETF_SET[t],
+      held: parseFloat(r[map['Qty'] - 1]) > 0,
+      colored: !!(bgs[i] && bgs[i][0] && bgs[i][0] !== '#ffffff')
+    };
+    onSheet[t] = row; sheetRows.push(row);
   });
-  const newRows = [];
-  Object.keys(keep).forEach(function (t) {
-    if (onSheet[t] != null) return;
-    const row = new Array(width).fill('');
-    row[map['Ticker'] - 1] = t; row[map['Fit'] - 1] = keep[t].fit;
-    newRows.push(row); added.push(t);
+  const universe = longUniverse_(sheetRows);
+
+  const slowCache = longPromoteCache_();
+  const pending = {};
+  const ctx = { slowCache: slowCache, pending: pending };
+  const evals = {};
+  const names = Object.keys(universe);
+  let complete = true;
+  for (let i = 0; i < names.length; i++) {
+    if (Date.now() - start > budgetMs) { complete = false; break; }
+    const t = names[i];
+    try { evals[t] = longEvaluateTicker_(t, universe[t].isEtf, ctx); }
+    catch (e) { evals[t] = { ticker: t, isEtf: universe[t].isEtf, score: 0, fails: ['error: ' + e], qualifies: false, parts: {} }; }
+  }
+  longFlushCache_(pending);
+  if (!complete) {
+    notify_(ui, 'Long promote', 'Stopped at the time limit after ' + Object.keys(evals).length + ' of ' + names.length + ' tickers. Nothing was changed on the sheet. Run again: finished tickers are cached, so the next pass is fast.');
+    return { complete: false, scored: Object.keys(evals).length, total: names.length };
+  }
+
+  // Pinned rows (Qty filled = you hold it, or Ticker cell colored) always stay and use up slots. The rest of the 30 goes to the best-scoring
+  // qualifying names (at most maxEtfs ETFs). Every other unpinned row is removed: this is what keeps the tab at 30.
+  const pinned = {};
+  sheetRows.forEach(function (rw) { if (rw.held || rw.colored) pinned[rw.ticker] = true; });
+  const slots = Math.max(0, P.maxTotal - Object.keys(pinned).length);
+  const ranked = Object.keys(evals).map(function (t) { return evals[t]; }).filter(function (q) { return q.qualifies && !pinned[q.ticker]; })
+    .sort(function (a, b) { return b.score - a.score; });
+  const chosen = {};
+  let nEtf = 0, nStock = 0;
+  ranked.forEach(function (q) {
+    if (Object.keys(chosen).length >= slots) return;
+    if (q.isEtf) { if (nEtf >= P.maxEtfs) return; nEtf++; } else nStock++;
+    chosen[q.ticker] = q;
+  });
+  const rs = { length: nStock }, re = { length: nEtf };
+
+  const props = PropertiesService.getScriptProperties();
+  const toAdd = Object.keys(chosen).filter(function (t) { return !onSheet[t]; });
+  const toRemove = [], keptHeld = [];
+  sheetRows.forEach(function (rw) {
+    if (chosen[rw.ticker]) return;
+    if (pinned[rw.ticker]) { if (!(evals[rw.ticker] && evals[rw.ticker].qualifies)) keptHeld.push(rw.ticker); return; }
+    const q = evals[rw.ticker];
+    // A failed data fetch is not a verdict: keep the row until it can be scored.
+    if (q && q.fails.some(function (f) { return /^error|no fundamentals|no 5-year|no daily/.test(f); })) return;
+    toRemove.push(rw);
   });
 
   if (!opts.dryRun) {
-    if (data.length) {
-      sheet.getRange(2, map['Fit'], data.length, 1).setValues(data.map(function (r) { return [r[map['Fit'] - 1]]; }));
+    if (map['Quality'] && data.length) {
+      const col = data.map(function (r) { return [r[map['Quality'] - 1]]; });
+      sheetRows.forEach(function (rw) { const q = evals[rw.ticker]; if (q) col[rw.idx][0] = q.score; });
+      sheet.getRange(2, map['Quality'], col.length, 1).setValues(col);
     }
-    toDelete.sort(function (a, b) { return b - a; }).forEach(function (i) { sheet.deleteRow(i + 2); });
-    if (newRows.length) {
-      const start = sheet.getLastRow() + 1;
-      sheet.getRange(start, 1, newRows.length, width).setValues(newRows);
+    toRemove.sort(function (a, b) { return b.idx - a.idx; }).forEach(function (rw) { sheet.deleteRow(rw.idx + 2); });
+    if (toAdd.length) {
+      const tickCol = sheet.getRange(2, map['Ticker'], Math.max(sheet.getMaxRows() - 1, 1), 1).getValues();
+      let lastTicker = 1;
+      for (let i = tickCol.length - 1; i >= 0; i--) { if (String(tickCol[i][0]).trim() !== '') { lastTicker = i + 2; break; } }
+      const w2 = sheet.getLastColumn();
+      const out = toAdd.map(function (t) {
+        const q = chosen[t];
+        const row = new Array(w2).fill('');
+        row[map['Ticker'] - 1] = t; row[map['Source'] - 1] = 'Research'; row[map['Type'] - 1] = q.isEtf ? 'ETF' : 'Stock'; row[map['Quality'] - 1] = q.score;
+        return row;
+      });
+      const need = lastTicker + out.length - sheet.getMaxRows();
+      if (need > 0) sheet.insertRowsAfter(sheet.getMaxRows(), need);
+      sheet.getRange(lastTicker + 1, 1, out.length, w2).setValues(out);
+      longFormatSheet_(sheet);
     }
-    added.forEach(function (t) { promotedSet[t] = 1; });
-    retired.forEach(function (t) { delete promotedSet[t]; });
-    props.setProperty('FLIP_PROMOTED', JSON.stringify(promotedSet));
-    props.setProperty('FLIP_MISSES', JSON.stringify(misses));
-    flipCacheFlush_(pending);
-    logToSheet_('Flip promotion COMPLETE: ' + scored.length + ' scored, kept ' + Object.keys(keep).length + ', added ' + added.length + ', retired ' + retired.length);
   }
-  const top = scored.filter(function (s) { return !s.gated; }).slice(0, 12).map(function (s) { return s.t + ' ' + s.fit; }).join(', ');
-  notify_(ui, 'Flip promotion' + (opts.dryRun ? ' (DRY RUN)' : ''),
-    'Scored ' + scored.length + ' of ' + universe.length + ' names in ' + Math.round((Date.now() - startMs) / 1000) + 's' + (complete ? '' : ' (time limit: partial, nothing retired)') + '.\n' +
-    'Added (' + added.length + '): ' + (added.join(', ') || 'none') + '\nRetired (' + retired.length + '): ' + (retired.join(', ') || 'none') + '\n' +
-    'Top Fit: ' + top + '\nPromotion needs Fit >= ' + P.minFit + ' and passes the hard gates; names you added by hand are never removed.');
-  return { complete: complete, added: added, retired: retired, scored: scored.length };
+
+  const failCounts = {};
+  Object.keys(evals).forEach(function (t) {
+    const q = evals[t];
+    if (q.qualifies) return;
+    if (q.fails.length) q.fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); failCounts[k] = (failCounts[k] || 0) + 1; });
+    else failCounts['score under the bar'] = (failCounts['score under the bar'] || 0) + 1;
+  });
+  const topFails = Object.keys(failCounts).sort(function (a, b) { return failCounts[b] - failCounts[a]; }).slice(0, 5).map(function (k) { return k + ' (' + failCounts[k] + ')'; }).join('; ');
+  notify_(ui, 'Long research promotion',
+    (opts.dryRun ? '(DRY RUN: nothing written)\n' : '') +
+    'Scored ' + names.length + ' tickers in ' + Math.round((Date.now() - start) / 1000) + 's.\n' +
+    'Kept on the tab: ' + rs.length + ' stocks + ' + re.length + ' ETFs (max ' + P.maxEtfs + ') + ' + Object.keys(pinned).length + ' pinned = at most ' + P.maxTotal + '.\n' +
+    'Added: ' + (toAdd.length ? toAdd.join(', ') : 'none') + '\n' +
+    'Removed (not in the top ' + P.maxTotal + '): ' + (toRemove.length ? toRemove.map(function (r) { return r.ticker; }).join(', ') : 'none') + '\n' +
+    (keptHeld.length ? 'Kept despite dropping out (held position or colored cell): ' + keptHeld.join(', ') + '\n' : '') +
+    (topFails ? 'Most common reasons for rejection: ' + topFails : ''));
+  return { complete: true, added: toAdd, removed: toRemove.map(function (r) { return r.ticker; }), chosen: Object.keys(chosen) };
 }
 
 
 /* ============================================================================
- * GRADING — did the signals work? (independent of what you traded)
- * ----------------------------------------------------------------------------
- * For each logged BUY / READY, the daily bars AFTER the signal day are walked for up to horizonDays days:
- *   TARGET  the stock's high reached the Need % level first
- *   STOP    the stock's low reached the stop distance first (a day touching both counts as STOP: the conservative call)
- *   TIME    neither within the window
- * The signal day itself cannot be graded from daily bars (the high/low may have come before the signal), so a same-day
- * +1.5% scalp is invisible here. MFE / MAE are the best / worst stock excursions in the window.
+ * DEBUG — one ticker, full decision trail, nothing written
  * ========================================================================== */
 
-// Pure. bars: [{d,h,l,c}] oldest first. sig: { ymd, stock, need, stop }. Returns null while undecided.
-function flipGradeOne_(bars, sig, horizon) {
-  const after = bars.filter(function (b) { return b.d > sig.ymd; });
-  if (!after.length || !(sig.stock > 0)) return null;
-  let mfe = -Infinity, mae = Infinity;
-  const n = Math.min(after.length, horizon);
-  for (let k = 0; k < n; k++) {
-    const b = after[k];
-    const up = (b.h / sig.stock - 1) * 100, dn = (b.l / sig.stock - 1) * 100;
-    mfe = Math.max(mfe, up); mae = Math.min(mae, dn);
-    const hitT = up >= sig.need, hitS = dn <= -sig.stop;
-    if (hitT || hitS) {
-      return { outcome: hitS ? 'STOP' : 'TARGET', days: k + 1, mfe: mfe, mae: mae, note: hitT && hitS ? 'touched both the same day: counted as STOP' : '' };
-    }
-  }
-  if (after.length >= horizon) {
-    const close = (after[horizon - 1].c / sig.stock - 1) * 100;
-    return { outcome: 'TIME', days: horizon, mfe: mfe, mae: mae, note: 'close on day ' + horizon + ' ' + (close >= 0 ? '+' : '') + close.toFixed(1) + '%' };
-  }
-  return null;
-}
-
-function flipGradeSignals(opts) {
-  opts = opts || {};
-  const ui = opts.quiet ? null : tryGetUi_();
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(FLIP_LOG_SHEET);
-  if (!sh || sh.getLastRow() < 2) { notify_(ui, 'Flip grading', 'No signals logged yet.'); return { graded: 0 }; }
-  const H = {}; FLIP_LOG_HEADERS.forEach(function (h, i) { H[h] = i; });
-  const n = sh.getLastRow() - 1;
-  const data = sh.getRange(2, 1, n, FLIP_LOG_HEADERS.length).getValues();
-  const todo = [];
-  data.forEach(function (r, i) {
-    if (r[H['Outcome']] !== '' || !r[H['Ticker']]) return;
-    const ymd = String(r[H['Time']]).substring(0, 10);
-    const stock = flipNum_(r[H['Stock']]), need = flipNum_(r[H['Need %']]), stop = flipNum_(r[H['Stop Dist %']]);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd) || !(stock > 0) || !(need > 0) || !(stop > 0)) return;
-    todo.push({ i: i, t: String(r[H['Ticker']]).toUpperCase(), sig: { ymd: ymd, stock: stock, need: need, stop: stop } });
-  });
-  if (!todo.length) { notify_(ui, 'Flip grading', 'Nothing waiting to be graded.'); return { graded: 0 }; }
-  const tickers = todo.map(function (x) { return x.t; }).filter(function (t, i, a) { return a.indexOf(t) === i; });
-  const bars = flipFetchBars_(tickers, '3mo');
-  const today = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
-  let graded = 0;
-  const hz = FLIP_CONFIG.horizonDays;
-  todo.forEach(function (x) {
-    const b = bars[x.t] ? flipBarsToObjects_(bars[x.t]) : null;
-    if (!b) return;
-    // a bar dated today may still be forming: only count completed days
-    const done = b.filter(function (z) { return z.d < today; });
-    const g = flipGradeOne_(done, x.sig, hz);
-    if (!g) return;
-    const r = data[x.i];
-    r[H['Outcome']] = g.outcome; r[H['Days']] = g.days; r[H['MFE %']] = flipR1_(g.mfe); r[H['MAE %']] = flipR1_(g.mae); r[H['Graded']] = today; r[H['Note']] = g.note;
-    graded++;
-  });
-  if (graded) sh.getRange(2, H['Outcome'] + 1, n, 6).setValues(data.map(function (r) {
-    return [r[H['Outcome']], r[H['Days']], r[H['MFE %']], r[H['MAE %']], r[H['Graded']], r[H['Note']]];
-  }));
-  notify_(ui, 'Flip grading', 'Graded ' + graded + ' of ' + todo.length + ' waiting signal(s). The rest need more trading days.');
-  return { graded: graded };
-}
-
-
-/* ============================================================================
- * STATS (FlipStats tab) — the honest scoreboard
- * ----------------------------------------------------------------------------
- * Realized trades come from Results (Strategy Quick / Flip, calls only). Open positions come from the Flip tab
- * (and Quick, if it has Ticker / Qty / P/L $ headers). "Win rate" is shown realized-only AND with open positions
- * marked to market, because a realized-only rate hides losers you are still holding.
- * ========================================================================== */
-
-// "Sep 9" / Date / "2026-09-09" -> Date (year inferred: the latest date not in the future).
-function flipParseTradeDate_(v, now) {
-  if (flipIsDate_(v)) return v;
-  const s = String(v == null ? '' : v).trim();
-  if (!s) return null;
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return flipDate_(s.substring(0, 10));
-  const m = s.match(/^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?$/);
-  if (!m) return null;
-  const mon = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(m[1].toLowerCase());
-  if (mon < 0) return null;
-  let y = m[3] ? parseInt(m[3], 10) : now.getFullYear();
-  let d = new Date(y, mon, parseInt(m[2], 10), 12, 0, 0);
-  if (!m[3] && d.getTime() > now.getTime() + 2 * 86400000) d = new Date(y - 1, mon, parseInt(m[2], 10), 12, 0, 0);
-  return d;
-}
-
-// Pure. trades: [{t, profit, ret, days}] -> summary numbers.
-function flipSummarize_(trades) {
-  const n = trades.length;
-  const wins = trades.filter(function (x) { return x.profit > 0; }), losses = trades.filter(function (x) { return x.profit <= 0; });
-  const sum = function (a, f) { return a.reduce(function (s, x) { return s + f(x); }, 0); };
-  const gross = sum(wins, function (x) { return x.profit; }), loss = -sum(losses, function (x) { return x.profit; });
-  const rets = trades.filter(function (x) { return x.ret != null; });
-  const avg = function (a) { return a.length ? sum(a, function (x) { return x.ret; }) / a.length : null; };
-  const sortedWins = wins.map(function (x) { return x.profit; }).sort(function (a, b) { return b - a; });
-  const buckets = [['same day', 0, 0], ['1 day', 1, 1], ['2-4 days', 2, 4], ['5+ days', 5, 999]].map(function (b) {
-    const g = trades.filter(function (x) { return x.days != null && x.days >= b[1] && x.days <= b[2]; });
-    return { label: b[0], n: g.length, avgRet: avg(g.filter(function (x) { return x.ret != null; })), net: sum(g, function (x) { return x.profit; }) };
-  });
-  return {
-    n: n, wins: wins.length, losses: losses.length, winRate: n ? wins.length / n * 100 : null, total: sum(trades, function (x) { return x.profit; }),
-    avgWinPct: avg(wins.filter(function (x) { return x.ret != null; })), avgLossPct: avg(losses.filter(function (x) { return x.ret != null; })),
-    expectancyPct: avg(rets), profitFactor: loss > 0 ? gross / loss : null,
-    top1Share: gross > 0 && sortedWins.length ? sortedWins[0] / gross * 100 : null,
-    top3Share: gross > 0 ? sortedWins.slice(0, 3).reduce(function (s, v) { return s + v; }, 0) / gross * 100 : null,
-    buckets: buckets
-  };
-}
-
-function flipReadOpenBook_(sheetName, pnlColNo) {
-  const out = [];
-  try {
-    const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-    if (!sh || sh.getLastRow() < 2) return out;
-    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function (h) { return String(h).trim(); });
-    const col = function (n) { return hdr.indexOf(n); };
-    const ct = col('Ticker'), cq = col('Qty'), cp = pnlColNo ? pnlColNo - 1 : col('P/L $'), cpp = col('P/L %'), ce = col('Entry'), cd = col('Days'), cth = col('Theme');
-    if (ct < 0 || cq < 0 || cp < 0) return out;
-    sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues().forEach(function (r) {
-      const q = flipNum_(r[cq]), pl = flipMoney_(r[cp]);
-      if (!(q > 0) || pl == null) return;
-      const ent = ce >= 0 ? flipNum_(r[ce]) : null;
-      out.push({ t: String(r[ct]).toUpperCase(), qty: q, pl: pl, plPct: cpp >= 0 ? flipNum_(r[cpp]) : null, cost: ent ? ent * 100 * q : null, days: cd >= 0 ? flipNum_(r[cd]) : null, theme: cth >= 0 ? r[cth] : flipThemeOf_(String(r[ct]).toUpperCase()), src: sheetName });
-    });
-  } catch (e) { /* missing columns: skipped */ }
-  return out;
-}
-
-function flipBuildStats() {
+function debugLongOneTicker() {
   const ui = tryGetUi_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const now = new Date();
-  const rs = ss.getSheetByName(FLIP_RESULTS_SHEET);
-  const trades = [];
-  if (rs && rs.getLastRow() >= 3) {
-    rs.getRange(3, 1, rs.getLastRow() - 2, 10).getValues().forEach(function (r) {
-      const strat = String(r[0] || ''), contract = String(r[2] || '').trim();
-      if (!/quick|flip/i.test(strat) || !/C$/i.test(contract)) return;
-      const profit = flipMoney_(r[8]);
-      if (profit == null) return;
-      let ret = flipMoney_(r[9]);
-      const e = flipMoney_(r[4]), x = flipMoney_(r[6]);
-      if (ret == null && e > 0 && x != null) ret = (x / e - 1) * 100;
-      const d0 = flipParseTradeDate_(r[3], now), d1 = flipParseTradeDate_(r[5], now);
-      trades.push({ t: String(r[1] || '').toUpperCase(), profit: profit, ret: ret, days: d0 && d1 ? flipTradingDays_(d0, d1) : null, strat: strat });
-    });
-  }
-  const S = flipSummarize_(trades);
-  const fsh = ss.getSheetByName(FLIP_SHEET_NAME);
-  const pnlNo = fsh ? flipPnlCol_(flipHeaderMap_(fsh)) : 0;
-  const open = flipReadOpenBook_(FLIP_SHEET_NAME, pnlNo).concat(flipReadOpenBook_(FLIP_QUICK_SHEET));
-  const openPl = open.reduce(function (s, o) { return s + o.pl; }, 0);
-  const openWin = open.filter(function (o) { return o.pl > 0; }).length;
-  const f1 = function (v) { return v == null ? 'n/a' : (Math.round(v * 10) / 10) + '%'; };
-  const usd = function (v) { return (v < 0 ? '-$' : '$') + Math.abs(Math.round(v)).toLocaleString('en-US'); };
-
-  const rows = [];
-  const sect = function (t) { rows.push([t, '', '', '', '']); };
-  const line = function (a, b, c, d, e) { rows.push([a, b === undefined ? '' : b, c === undefined ? '' : c, d === undefined ? '' : d, e === undefined ? '' : e]); };
-  rows.push(['FLIP STATS  (built ' + Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd HH:mm') + ' ET)', '', '', '', '']);
-  sect('1. REALIZED (Results tab, Quick / Flip calls)');
-  line('Closed trades', S.n); line('Wins / losses', S.wins + ' / ' + S.losses); line('Win rate (realized only)', f1(S.winRate));
-  line('Net profit', usd(S.total)); line('Average % on a win', f1(S.avgWinPct)); line('Average % on a loss', f1(S.avgLossPct));
-  line('Expectancy per trade (avg %)', f1(S.expectancyPct)); line('Profit factor (gross win / gross loss)', S.profitFactor == null ? 'n/a' : (Math.round(S.profitFactor * 100) / 100));
-  line('Best winner as % of all winnings', f1(S.top1Share)); line('Best 3 winners as % of all winnings', f1(S.top3Share));
-  sect('2. OPEN BOOK (what the win rate above leaves out)');
-  line('Open positions', open.length); line('Open P/L', usd(openPl)); line('Open winners / losers', openWin + ' / ' + (open.length - openWin));
-  const mtmN = S.n + open.length, mtmW = S.wins + openWin;
-  line('Win rate, open positions marked to market', mtmN ? f1(mtmW / mtmN * 100) : 'n/a');
-  line('Realized + open P/L', usd(S.total + openPl));
-  const th = {};
-  open.forEach(function (o) { th[o.theme || 'Other'] = th[o.theme || 'Other'] || { n: 0, pl: 0 }; th[o.theme || 'Other'].n++; th[o.theme || 'Other'].pl += o.pl; });
-  Object.keys(th).sort(function (a, b) { return th[b].n - th[a].n; }).forEach(function (k) { line('  open in ' + k, th[k].n + ' position(s)', usd(th[k].pl)); });
-  sect('3. HOLD TIME');
-  line('Bucket', 'Trades', 'Avg %', 'Net $');
-  S.buckets.forEach(function (b) { line('  ' + b.label, b.n, f1(b.avgRet), usd(b.net)); });
-  sect('4. BY TICKER (realized)');
-  line('Ticker', 'Trades', 'Net $');
-  const bt = {};
-  trades.forEach(function (x) { bt[x.t] = bt[x.t] || { n: 0, p: 0 }; bt[x.t].n++; bt[x.t].p += x.profit; });
-  Object.keys(bt).sort(function (a, b) { return bt[b].p - bt[a].p; }).forEach(function (k) { line('  ' + k, bt[k].n, usd(bt[k].p)); });
-
-  sect('5. SIGNAL CALIBRATION (FlipLog, graded on daily bars)');
-  const lg = ss.getSheetByName(FLIP_LOG_SHEET);
-  let gradedN = 0;
-  if (lg && lg.getLastRow() >= 2) {
-    const H = {}; FLIP_LOG_HEADERS.forEach(function (h, i) { H[h] = i; });
-    const g = lg.getRange(2, 1, lg.getLastRow() - 1, FLIP_LOG_HEADERS.length).getValues().filter(function (r) { return r[H['Outcome']] !== ''; });
-    gradedN = g.length;
-    ['BUY', 'READY'].forEach(function (kind) {
-      const k = g.filter(function (r) { return r[H['Signal']] === kind; });
-      if (!k.length) return;
-      const c = function (o) { return k.filter(function (r) { return r[H['Outcome']] === o; }).length; };
-      const pred = k.reduce(function (s, r) { return s + (flipNum_(r[H['P Hit %']]) || 0); }, 0) / k.length;
-      const mfe = k.reduce(function (s, r) { return s + (flipNum_(r[H['MFE %']]) || 0); }, 0) / k.length;
-      const mae = k.reduce(function (s, r) { return s + (flipNum_(r[H['MAE %']]) || 0); }, 0) / k.length;
-      line(kind + ' signals graded', k.length, 'TARGET ' + c('TARGET') + '  STOP ' + c('STOP') + '  TIME ' + c('TIME'));
-      line('  target hit rate vs the sheet\'s P Hit % (random-walk prediction)', f1(c('TARGET') / k.length * 100), f1(pred));
-      line('  average best / worst stock excursion', f1(mfe), f1(mae));
-    });
-  }
-  if (!gradedN) line('No graded signals yet', 'Signals are graded after enough trading days (menu: Grade Past Signals).');
-  line('Note', 'Hit rate above the predicted P Hit % over many signals (30+) is the evidence the entry trigger adds something. Near or below it means the trigger is not beating a random walk.');
-
-  const sh = flipEnsureSheet_(FLIP_STATS_SHEET, ['Flip stats']);
-  sh.clear();
-  sh.getRange(1, 1, rows.length, 5).setValues(rows);
-  sh.setColumnWidth(1, 430); sh.setColumnWidth(2, 140); sh.setColumnWidth(3, 190); sh.setColumnWidth(4, 110); sh.setColumnWidth(5, 80);
-  sh.getRange(1, 1).setFontWeight('bold').setFontSize(13);
-  rows.forEach(function (r, i) { if (/^\d\. /.test(r[0])) sh.getRange(i + 1, 1, 1, 5).setBackground('#d9ead3').setFontWeight('bold'); });
-  notify_(ui, 'Flip stats', 'Wrote ' + FLIP_STATS_SHEET + '. Realized win rate ' + f1(S.winRate) + ', with open positions marked to market ' + (mtmN ? f1(mtmW / mtmN * 100) : 'n/a') + '. Realized + open P/L ' + usd(S.total + openPl) + '.');
-  return { realized: S, open: open.length };
-}
-
-
-/* ============================================================================
- * DEBUG — one ticker, full decision trail
- * ========================================================================== */
-
-function debugFlipOneTicker() {
-  const ui = tryGetUi_();
-  if (!ui) return;
-  const r = ui.prompt('Flip debug', 'Ticker (e.g. APP):', ui.ButtonSet.OK_CANCEL);
+  if (!ui) { logToSheet_('Long debug: run it from the sheet menu (it asks for a ticker).'); return; }
+  const r = ui.prompt('Long: one ticker', 'Ticker (shown as a new candidate; nothing is written):', ui.ButtonSet.OK_CANCEL);
   if (r.getSelectedButton() !== ui.Button.OK) return;
-  const t = r.getResponseText().trim().toUpperCase();
+  const t = String(r.getResponseText() || '').trim().toUpperCase();
   if (!t) return;
-  const now = new Date(), sess = marketSessionAt_(now), todayYmd = flipTodayYmd_(now);
-  const cache = flipCacheLoad_(), pending = {};
-  const ctx = { cache: cache, pending: pending, now: now, token: getTastyTradeAccessToken_(), chains: {}, finnhubKey: getFinnhubApiKey_() };
-  const raw = flipGetBars_([t, 'SPY'], ctx, '6mo', 'FB');
-  const barsOf = function (k) { const o = flipBarsToObjects_(raw[k]); return o.length && o[o.length - 1].d === todayYmd ? o.slice(0, -1) : o; };
-  const b = barsOf(t);
-  const feat = {}, prevClose = {};
-  feat[t] = flipFeatures_(b, barsOf('SPY')); prevClose[t] = b.length ? b[b.length - 1].c : null;
-  const daily = flipGetDaily_([t], ctx);
-  const ivMap = sess.open ? fetchIntradayMap_([t, 'SPY']) : {};
-  const spy = ivMap['SPY'] || null;
-  const env = { now: now, sess: sess, closeMin: US_MARKET_EARLY_CLOSES[todayYmd] ? 210 : 390, S: flipSignal_(),
-    spyHead: !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp),
-    feat: feat, prevClose: prevClose, daily: daily, ivFresh: {}, picks: {}, quotes: {}, ctx: ctx, full: true, open: [], todayYmd: todayYmd };
-  env.ivFresh[t] = flipFreshIv_(ivMap[t], env);
-  const f = feat[t];
-  if (f) env.picks[t] = flipPickContract_(t, env.ivFresh[t] && env.ivFresh[t].lastPrice > 0 ? env.ivFresh[t].lastPrice : f.price, f.sigmaDay, ctx);
-  if (env.picks[t] && env.picks[t].ok && env.picks[t].c.symbol) env.quotes = fetchOptionQuotesMap_([env.picks[t].c.symbol]);
-  const res = flipProcessCandidate_({ ticker: t, held: false }, env);
-  flipCacheFlush_(pending);
-  const lines = ['Market open: ' + sess.open + ' | SPY headwind: ' + env.spyHead + ' | intraday: ' + (env.ivFresh[t] ? 'fresh' : 'none/stale'),
-    'Pick: ' + (env.picks[t] ? (env.picks[t].ok ? 'ok' + (env.picks[t].stale ? ' (stale)' : '') : env.picks[t].why) : 'none'), '---'];
-  Object.keys(res).filter(function (k) { return k.charAt(0) !== '_'; }).forEach(function (k) {
-    const v = res[k];
-    lines.push(k + ': ' + (flipIsDate_(v) ? Utilities.formatDate(v, 'America/New_York', 'yyyy-MM-dd') : v));
-  });
-  ui.alert('Flip debug: ' + t, lines.join('\n').substring(0, 5000), ui.ButtonSet.OK);
+  const ctx = longMakeCtx_([t], new Date(), longLoadCache_(), {});
+  const out = longProcessRow_({ ticker: t, isEtf: !!LONG_ETF_SET[t], holdCells: false, isOpen: false, qty: 1, quality: null }, ctx);
+  const lines = Object.keys(out).map(function (k) { const v = out[k]; return k + ': ' + (longIsDate_(v) ? longYmd_(v) : (typeof v === 'number' ? longRound_(v, 3) : v)); });
+  notify_(ui, 'Long: ' + t, lines.join('\n'));
 }
