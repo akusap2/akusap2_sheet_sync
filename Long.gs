@@ -579,6 +579,18 @@ function longQuoteContract_(ticker, expiry, strike, ctx, now) {
 }
 
 
+// The single listed expiry within 1.5 days of the entered one (but not the same day), or null.
+function longSnapExpiry_(ticker, expiry, ctx) {
+  if (!ctx.token) return null;
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain) return null;
+  const want = longYmd_(expiry);
+  const hits = chain.filter(function (e) {
+    return longYmd_(e.date) !== want && Math.abs(e.date.getTime() - expiry.getTime()) <= 1.5 * 86400000;
+  });
+  return hits.length === 1 ? hits[0].date : null;
+}
+
 // Only runs when a held contract has no usable quote: asks the chain why (expiry not listed? strike not listed? just no quote yet?).
 function longExplainMissingQuote_(ticker, expiry, strike, ctx, now) {
   if (!ctx.token) return 'no TastyTrade token';
@@ -731,7 +743,7 @@ function longProcessRow_(inp, ctx) {
 
   // ----- a position you hold -----
   if (inp.isOpen) {
-    const c = longQuoteContract_(t, inp.openExpiry, inp.openStrike, ctx, now);
+    let c = longQuoteContract_(t, inp.openExpiry, inp.openStrike, ctx, now);
     let m = longContractMetrics_(c, spot);
     let mark = m.mid;
     if (mark == null) {
@@ -741,11 +753,26 @@ function longProcessRow_(inp, ctx) {
       } catch (e) { /* leave null */ }
       if (mark != null) m = longContractMetrics_({ bid: mark, ask: mark, delta: c.delta, strike: c.strike, dte: c.dte }, spot);
     }
+    let snapNote = '';
+    if (mark == null) {
+      // Safety net: a date cell read one day off (time zones) matches no listed contract. If the chain has exactly one expiry within a day, use it and say so.
+      try {
+        const snap = longSnapExpiry_(t, inp.openExpiry, ctx);
+        if (snap) {
+          const c2 = longQuoteContract_(t, snap, inp.openStrike, ctx, now);
+          const m2 = longContractMetrics_(c2, spot);
+          if (m2.mid != null) {
+            c = c2; m = m2; mark = m2.mid;
+            snapNote = 'expiry cell reads ' + longYmd_(inp.openExpiry) + ' but the listed expiry is ' + longYmd_(snap) + ' (priced that one; correct the Expiry cell)';
+          }
+        }
+      } catch (e) { /* fall through to the explanation */ }
+    }
     let noQuoteWhy = '';
     if (mark == null) { try { noQuoteWhy = longExplainMissingQuote_(t, inp.openExpiry, inp.openStrike, ctx, now); } catch (e) { noQuoteWhy = 'no quote for this contract'; } }
     const pl = (mark != null && inp.openEntry > 0) ? (mark / inp.openEntry - 1) * 100 : null;
     const ha = longHeldAction_({ dte: c.dte, pl: pl, spot: spot, tech: tech, upside: upside, quality: inp.quality, isEtf: isEtf, carry: m.carry }, cfg);
-    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '');
+    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '') + (snapNote ? ' | ' + snapNote : '');
     out.Strike = inp.openStrike; out.Expiry = inp.openExpiry; out.DTE = c.dte;
     if (mark != null) out.Mid = mark;
     if (c.delta != null) out.Delta = c.delta;
