@@ -640,6 +640,33 @@ function cspScore_(m) {
 }
 
 // Action for a position you already hold. pl = % of credit captured.
+
+// ---- held put with no live quote: find the real contract, or price it by model -------------------------------
+// Looks the put up in the TastyTrade chain instead of building its symbol by hand (an expiry cell that reads a day off, or a differently
+// formatted symbol, otherwise means no quote at all). Returns { sym, note } when found, { why } when the chain says why not.
+function cspResolveHeldPut_(ticker, expiry, strike, ctx) {
+  if (!ctx.token) return { why: 'no TastyTrade token' };
+  const chain = fetchTastyOptionChainNested_(ticker, ctx.token);
+  if (!chain || !chain.length) return { why: 'no option chain returned for ' + ticker };
+  const want = expiry.getTime();
+  const fmt = function (d) { return Utilities.formatDate(d, 'America/New_York', 'yyyy-MM-dd'); };
+  const exps = chain.filter(function (e) { return Math.abs(e.date.getTime() - want) <= 1.5 * 86400000; })
+    .sort(function (a, b) { return Math.abs(a.date.getTime() - want) - Math.abs(b.date.getTime() - want); });
+  if (!exps.length) {
+    const near = chain.map(function (e) { return { d: fmt(e.date), gap: Math.abs(e.date.getTime() - want) }; })
+      .sort(function (a, b) { return a.gap - b.gap; }).slice(0, 3).map(function (x) { return x.d; });
+    return { why: 'expiry ' + fmt(expiry) + ' is not listed (nearest: ' + near.join(', ') + ')' };
+  }
+  const e = exps[0];
+  const hit = e.strikes.filter(function (z) { return Math.abs(z.strike - strike) < 0.001 && z.putSymbol; })[0];
+  if (!hit) {
+    const near = e.strikes.filter(function (z) { return z.putSymbol; })
+      .sort(function (a, b) { return Math.abs(a.strike - strike) - Math.abs(b.strike - strike); }).slice(0, 3).map(function (z) { return z.strike; });
+    return { why: 'strike ' + strike + ' is not listed for ' + fmt(e.date) + ' (nearest: ' + near.join(', ') + ')' };
+  }
+  return { sym: hit.putSymbol, note: fmt(e.date) !== fmt(expiry) ? 'Expiry cell reads ' + fmt(expiry) + ' but the listed expiry is ' + fmt(e.date) : '' };
+}
+
 function cspOpenAction_(o, cfg) {
   if (o.dte == null) return { action: '', why: '' };
   if (o.dte <= 0) return { action: 'EXPIRING', why: 'at or past expiry — check assignment' };
@@ -914,6 +941,19 @@ function cspProcessRow_(inp, ctx) {
       if (ctx.token) { const q = fetchTastyTradeQuote_(buildOccSymbol_(t, inp.openExpiry, inp.openStrike, 'P'), ctx.token); if (q) mark = q.mark; }
       if (mark == null) { const y = fetchYahooQuote_(t, inp.openExpiry, inp.openStrike, 'P'); if (y) mark = y.mark; }
     } catch (e) { /* leave null */ }
+    // No live quote: look the put up in the chain by strike and expiry (handles a day-off expiry cell or a different symbol format).
+    let occUsed = null, quoteNote = '', quoteWhy = '';
+    if (mark == null && ctx.token) {
+      try {
+        const rr = cspResolveHeldPut_(t, inp.openExpiry, inp.openStrike, ctx);
+        if (rr.sym) {
+          occUsed = rr.sym; quoteNote = rr.note || '';
+          const q2 = fetchTastyTradeQuote_(rr.sym, ctx.token);
+          if (q2 && q2.mark != null && q2.mark > 0) mark = q2.mark;
+          else quoteWhy = 'the put is listed but TastyTrade has no bid/ask for it right now';
+        } else quoteWhy = rr.why || '';
+      } catch (e) { quoteWhy = 'quote lookup failed'; }
+    }
     const pl = (mark != null && inp.openCredit) ? (inp.openCredit - mark) / inp.openCredit * 100 : null;
     const oa = cspOpenAction_({ dte: dteLeft, pl: pl, spot: spot, strike: inp.openStrike, credit: inp.openCredit, mark: mark }, cfg);
     out['Open Mark'] = mark != null ? mark : ''; out['Open P/L %'] = pl != null ? pl : '';
@@ -925,7 +965,7 @@ function cspProcessRow_(inp, ctx) {
     out.Action = oa.action || 'HOLD'; out.Score = ''; out.DTE = dteLeft;
     try {
       if (ctx.token) {
-        const occ = buildOccSymbol_(t, inp.openExpiry, inp.openStrike, 'P');
+        const occ = occUsed || buildOccSymbol_(t, inp.openExpiry, inp.openStrike, 'P');
         const md = fetchTastyMarketDataBatch_([occ], ctx.token);
         const q = md && md[occ];
         if (q) {
@@ -940,27 +980,37 @@ function cspProcessRow_(inp, ctx) {
       }
     } catch (e) { /* contract detail is optional */ }
     // Annualized on the premium you received (needs Open Date), cushion in expected moves from the put's current implied vol.
+    let estNote = '';
     try {
       if (inp.openCredit && inp.openDate) {
         const held0 = cspDaysBetween_(inp.openDate, inp.openExpiry);
         if (held0 > 0) out['Annualized %'] = inp.openCredit / inp.openStrike * 100 * 365 / held0;
       }
-      if (mark != null && dteLeft > 0) {
-        const ivO = impliedVolatilityBisection_(mark, spot, inp.openStrike, dteLeft, 'P');
+      // Still no quote: assume the put is still worth about the credit you received, so P25 / P50 and Cushion are filled as far as possible.
+      // This is an assumption, not a price: Open Mark, Open P/L % and the Open Action stay blank, so an estimate can never trigger a TAKE PROFIT.
+      let markCalc = mark;
+      if (markCalc == null && dteLeft > 1 && inp.openCredit > 0) {
+        markCalc = inp.openCredit;
+        estNote = 'P25 / P50 and Cushion are ESTIMATES: no live quote, so the put is assumed to still be worth your credit ' + round2_(inp.openCredit) + ' (it may be worth more or less after the stock moved)';
+      }
+      if (markCalc != null && dteLeft > 0) {
+        const mark_ = markCalc;
+        const ivO = impliedVolatilityBisection_(mark_, spot, inp.openStrike, dteLeft, 'P');
         if (ivO) {
           const emO = spot * (ivO / 100) * Math.sqrt(dteLeft / 365);
           if (emO > 0) out['Cushion EM'] = (spot - (inp.openStrike - inp.openCredit)) / emO;
           // chance of reaching the 25% / 50% profit level on your credit within the horizon, from today's mark
           const pTp = function (pct) {
             const tgt = inp.openCredit * (1 - pct / 100);
-            return mark <= tgt ? 100 : cspProbTakeProfit_(spot, inp.openStrike, dteLeft, ivO, mark, (1 - tgt / mark) * 100, CSP_PROB_DAYS);
+            return mark_ <= tgt ? 100 : cspProbTakeProfit_(spot, inp.openStrike, dteLeft, ivO, mark_, (1 - tgt / mark_) * 100, CSP_PROB_DAYS);
           };
           out['P25 in 10d %'] = pTp(cfg.tp1Pct); out['P50 in 10d %'] = pTp(cfg.tp2Pct);
         }
       }
     } catch (e) { /* optional */ }
     if (out.Mid !== undefined && out.Mid !== '' && inp.openCredit > 0) out.PNL = Math.round((inp.openCredit - out.Mid) * 100) / 100;
-    out.Why = (earnDays != null && earnDays <= dteLeft) ? 'earnings in ' + earnDays + ' days, inside this put\'s life' : '';
+    out.Why = [(earnDays != null && earnDays <= dteLeft) ? 'earnings in ' + earnDays + ' days, inside this put\'s life' : '',
+      mark == null ? 'NO LIVE QUOTE' + (quoteWhy ? ': ' + quoteWhy : '') : '', quoteNote, estNote].filter(function (z) { return z; }).join(' | ');
     out.SortKey = cspSortKey_(out.Action, 0, out.Action, pl);
     return out;
   } else {
