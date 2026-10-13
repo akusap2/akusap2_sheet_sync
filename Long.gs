@@ -47,7 +47,7 @@ function longFlushCache_(pending) {
   const cutoff = Date.now() - 3 * 86400000;
   const rows = [];
   Object.keys(existing).forEach(function (k) {
-    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH)_/.test(k)) {
+    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH|LONGTECH2)_/.test(k)) {
       try { const d = JSON.parse(existing[k]).date; if (new Date(d + 'T00:00:00').getTime() < cutoff) return; } catch (e) { return; }
     }
     rows.push([k, existing[k]]);
@@ -78,7 +78,8 @@ const LONG_CONFIG = {
     skipOffHigh: 35,
     riskGate: 30,            // Risk = chance the premium is down 20%+ in 30 days (computeLeapPremiumLoss_)
     scoreBuy: 65, scoreReady: 50,
-    qualityFloor: 65, qualityFloorEtf: 55
+    qualityFloor: 65, qualityFloorEtf: 55,
+    regimeGate: true         // SPY under its 200-day: no new BUY (a would-be BUY is shown as READY). Set false to turn off.
   },
   // --- exits (held positions) -------------------------------------------------
   exits: { trendBandPct: 3, takeProfitPct: 50, rollDte: 180, reviewCarryPct: 12 },
@@ -144,7 +145,7 @@ const LONG_EXTRA_HEADERS = ['Quality', 'Source', 'Type'];                       
 const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality',
   'Earn Days', 'IV Rank', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
   'Days', 'P/L $', 'Why', 'LastRun'];
-const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20',
+const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20', 'RS vs SPY %', 'Ret 1M %',
   'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
 // Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
 const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
@@ -307,7 +308,7 @@ function longFormatSheet_(sheet) {
   fmt('Stock Equiv $', '$#,##0'); fmt('Capital Saved $', '$#,##0'); fmt('P/L $', '$#,##0;-$#,##0;$0');
   ['Entry Date', 'Expiry', 'Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
-  ['Off High %', 'T200 %', 'X50 %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality']
+  ['Off High %', 'T200 %', 'X50 %', 'RS vs SPY %', 'Ret 1M %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RS vs SPY %', 'Ret 1M %', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality']
     .forEach(function (h) { fmt(h, '0.0'); });
   ['Score', 'Delta', 'Lev'].forEach(function (h) { fmt(h, '0.00'); });
   LONG_INPUT_HEADERS.concat(LONG_HELD_WHEN_OPEN).forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
@@ -357,6 +358,9 @@ function longTechFromBars_(dates, closes, todayYmd) {
     ma20: cspSma_(c, 20), ma50: cspSma_(c, 50), ma200: cspSma_(c, 200), prevMa200: cspSma_(prev, 200),
     hi52: hi52, lo52: lo52, rsi: cspRsi_(c, 14), hv20: cspHv_(c, 20),
     ret5: c.length > 5 ? (last / c[c.length - 6] - 1) * 100 : null,
+    ret21: c.length > 21 ? (last / c[c.length - 22] - 1) * 100 : null,
+    ret63: c.length > 63 ? (last / c[c.length - 64] - 1) * 100 : null,
+    ret126: c.length > 126 ? (last / c[c.length - 127] - 1) * 100 : null,
     fall: fall, bounce: bounce, lowAge: w.length - 1 - lowI, n: c.length
   };
 }
@@ -412,8 +416,10 @@ function longChooseContract_(cands, spot, cfg) {
 function longScore_(x) {
   const p = {};
   p.quality = 30 * longLin_(x.quality, 50, 90);
-  p.trend = 12 * longLin_(x.vs200, 0, 15) + 8 * longLin_(x.x50, 0, 8);
-  p.timing = 10 * longLin_(x.rsi, 60, 40) + 5 * longLin_(x.offHigh, 25, 10) + 5 * longLin_(x.ivr, 60, 20);
+  // Trend 20 = vs 200-day 8 + 50/200 gap 5 + relative strength vs SPY 7 (stock's 3- and 6-month return minus SPY's, in points).
+  p.trend = 8 * longLin_(x.vs200, 0, 15) + 5 * longLin_(x.x50, 0, 8) + 7 * longLin_(x.rs, -5, 10);
+  // Timing 20 = RSI 7 + last-month dip 5 (full credit at -8% or lower) + closeness to the 52w high 4 + IV Rank 4.
+  p.timing = 7 * longLin_(x.rsi, 60, 40) + 5 * longLin_(x.ret21, 0, -8) + 4 * longLin_(x.offHigh, 25, 10) + 4 * longLin_(x.ivr, 60, 20);
   p.contract = 13 * longLin_(x.carry, 8, 3) +      // bid-ask spread no longer scores; its 6 points moved to carry (+3) and delta (+3) so the total stays 20
     7 * (x.delta == null ? 0.5 : 1 - Math.min(1, Math.abs(x.delta - 0.85) / 0.1));
   p.upside = 10 * longLin_(x.upside, -5, 20);
@@ -451,6 +457,9 @@ function longEvaluateEntry_(x, cfg) {
   if (x.risk == null) return { action: 'WAIT', why: ['Risk model could not price this contract'] };
   if (x.risk > E.riskGate) {
     return { action: 'WAIT', why: ['Risk ' + longRound_(x.risk, 1) + ' > ' + E.riskGate + ': premium likely to drop 20%+ within 30 days, wait for the dip'] };
+  }
+  if (timingOk && x.score >= E.scoreBuy && E.regimeGate && x.regimeOk === false) {
+    return { action: 'READY', why: ['market regime: SPY is under its 200-day, so no new BUY (this would otherwise be a BUY, Score ' + x.score + ')'] };
   }
   if (timingOk && x.score >= E.scoreBuy) return { action: 'BUY', why: [(strong ? 'strong' : 'light') + ' pullback in an uptrend, Risk ' + longRound_(x.risk, 1) + ', Score ' + x.score] };
   if (x.score >= E.scoreReady) {
@@ -548,7 +557,7 @@ function longFetchBars_(ticker) {
 // in parallel (8 at a time) and put them in the same cache longFetchTech_ reads. Anything that fails here is simply fetched the old way.
 function longPrefetchBars_(tickers, ctx) {
   const stale = tickers.filter(function (t) {
-    return slowEntryAgeDays_(ctx.slowCache[slowKey_('LONGTECH', t)]) >= SLOW_REFRESH_DAYS.DAILYBARS;
+    return slowEntryAgeDays_(ctx.slowCache[slowKey_('LONGTECH2', t)]) >= SLOW_REFRESH_DAYS.DAILYBARS;
   });
   for (let i = 0; i < stale.length; i += 8) {
     const chunk = stale.slice(i, i + 8);
@@ -561,7 +570,7 @@ function longPrefetchBars_(tickers, ctx) {
         const b = longParseBars_(resps[k]);
         const tech = b ? longTechFromBars_(b.dates, b.closes, longTodayYmdEt_()) : null;
         if (tech) {
-          const key = slowKey_('LONGTECH', t), rec = { date: todayKey_(), value: tech };
+          const key = slowKey_('LONGTECH2', t), rec = { date: todayKey_(), value: tech };
           ctx.pending[key] = JSON.stringify(rec); ctx.slowCache[key] = rec;
         }
       } catch (e) { /* normal path retries this ticker */ }
@@ -600,7 +609,7 @@ function longPrefetchQuotes_(tickers, token) {
 function longTodayYmdEt_() { return Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd'); }
 
 function longFetchTech_(ticker, ctx) {
-  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'LONGTECH', ticker, SLOW_REFRESH_DAYS.DAILYBARS, function () {
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'LONGTECH2', ticker, SLOW_REFRESH_DAYS.DAILYBARS, function () {
     const b = longFetchBars_(ticker);
     return b ? longTechFromBars_(b.dates, b.closes, longTodayYmdEt_()) : null;
   });
@@ -780,6 +789,14 @@ function longProcessRow_(inp, ctx) {
   const vs50 = tech.ma50 ? (spot / tech.ma50 - 1) * 100 : null;
   const vs20 = tech.ma20 ? (spot / tech.ma20 - 1) * 100 : null;
   const x50 = (tech.ma50 && tech.ma200) ? (tech.ma50 / tech.ma200 - 1) * 100 : null;
+  // Relative strength vs SPY (average of the 3- and 6-month return gaps) and the market regime (SPY vs its 200-day).
+  const spy = ctx.spyTech || null;
+  const gaps = [];
+  if (spy && tech.ret63 != null && spy.ret63 != null) gaps.push(tech.ret63 - spy.ret63);
+  if (spy && tech.ret126 != null && spy.ret126 != null) gaps.push(tech.ret126 - spy.ret126);
+  const rs = gaps.length ? gaps.reduce(function (a, b) { return a + b; }, 0) / gaps.length : null;
+  const regimeOk = (spy && spy.ma200 && spy.price) ? (spy.price > spy.ma200) : null;
+  out['RS vs SPY %'] = rs != null ? rs : ''; out['Ret 1M %'] = tech.ret21 != null ? tech.ret21 : '';
   out.Price = spot;
   if (dayChg != null) out.Change = round2_(dayChg);
   out.Trend = longTrendLabel_(vs200, x50, vs20);
@@ -886,7 +903,8 @@ function longProcessRow_(inp, ctx) {
   }
   const x = { vs200: vs200, x50: x50, offHigh: offHigh, rsi: tech.rsi, ivr: ivr, bounce: tech.bounce, fall: tech.fall, lowAge: tech.lowAge,
     quality: inp.quality, isEtf: isEtf, risk: risk, contractOk: contractOk, contractWhy: pick.why, upside: upside,
-    carry: m ? m.carry : null, spreadPct: m ? m.spreadPct : null, delta: c ? c.delta : null };
+    carry: m ? m.carry : null, spreadPct: m ? m.spreadPct : null, delta: c ? c.delta : null,
+    ret21: tech.ret21, rs: rs, regimeOk: regimeOk };
   if (contractOk) { score = longScore_(x).score; out.Score = score; }
   x.score = score;
   const ev = longEvaluateEntry_(x, cfg);
@@ -953,7 +971,8 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
     // Speed: parallel/batched prefetch. Both are best-effort: anything missed is fetched per row exactly as before.
     const uniq = rows.map(function (r) { return r.ticker; }).filter(function (v, i, a) { return a.indexOf(v) === i; });
     try { ctx.quotes = longPrefetchQuotes_(uniq, ctx.token); } catch (e) { ctx.quotes = {}; }
-    try { longPrefetchBars_(uniq, ctx); } catch (e) { /* per-row fetch handles it */ }
+    try { longPrefetchBars_(uniq.indexOf('SPY') === -1 ? uniq.concat(['SPY']) : uniq, ctx); } catch (e) { /* per-row fetch handles it */ }
+    try { ctx.spyTech = longFetchTech_('SPY', ctx); } catch (e) { ctx.spyTech = null; }
     const outCols = LONG_OUTPUT_HEADERS.filter(function (h) { return map[h]; });
     const lastRunStamp = new Date();
 
