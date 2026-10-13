@@ -47,7 +47,7 @@ function longFlushCache_(pending) {
   const cutoff = Date.now() - 3 * 86400000;
   const rows = [];
   Object.keys(existing).forEach(function (k) {
-    if (/^SLOW_(LONGCON|LONGTECH)_/.test(k)) {
+    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH)_/.test(k)) {
       try { const d = JSON.parse(existing[k]).date; if (new Date(d + 'T00:00:00').getTime() < cutoff) return; } catch (e) { return; }
     }
     rows.push([k, existing[k]]);
@@ -62,11 +62,12 @@ const LONG_CONFIG = {
   contract: {
     minDte: 400, maxDte: 730, targetDte: 540,
     minDelta: 0.80, maxDelta: 0.92, targetDelta: 0.85,
-    maxSpreadPct: 2,         // bid-ask gap as % of mid
+    maxSpreadPct: null,      // bid-ask gap is NOT a criterion any more (set a number such as 2 to bring the gate back); Spread % is still shown
     minOi: 50,               // LEAP chains are thin
     minMid: 1,
     maxCarryPct: 8,          // extrinsic value per year as % of the stock price
-    expiriesToTry: 2, strikesPerExpiry: 10
+    expiriesToTry: 2, strikesPerExpiry: 10,
+    failCacheMin: 180        // a real "no usable contract" is remembered this long before the chain is downloaded again
   },
   // --- entry ---------------------------------------------------------------
   entry: {
@@ -374,7 +375,7 @@ function longContractMetrics_(c, spot) {
 }
 
 // Picks the cheapest-to-hold contract that passes every gate. cands: [{expiry:Date, dte, strike, bid, ask, delta, oi}].
-// Returns { ok:true, pick, m } or { ok:false, near, why } where near is the closest candidate (fewest failures, then tightest spread).
+// Returns { ok:true, pick, m } or { ok:false, near, why } where near is the closest candidate (fewest failures, then tightest spread as a tiebreak).
 function longChooseContract_(cands, spot, cfg) {
   const K = cfg.contract;
   let best = null, nearest = null;
@@ -385,7 +386,7 @@ function longChooseContract_(cands, spot, cfg) {
     if (c.delta == null) f.push('no delta');
     else if (c.delta < K.minDelta || c.delta > K.maxDelta) f.push('delta ' + longRound_(c.delta, 2) + ' outside ' + K.minDelta + '-' + K.maxDelta);
     if (c.dte < K.minDte || c.dte > K.maxDte) f.push(c.dte + 'd outside ' + K.minDte + '-' + K.maxDte);
-    if (m.spreadPct != null && m.spreadPct > K.maxSpreadPct) f.push('spread ' + longRound_(m.spreadPct, 1) + '% > ' + K.maxSpreadPct + '%');
+    if (K.maxSpreadPct != null && m.spreadPct != null && m.spreadPct > K.maxSpreadPct) f.push('spread ' + longRound_(m.spreadPct, 1) + '% > ' + K.maxSpreadPct + '%');
     if (c.oi != null && c.oi < K.minOi) f.push('OI ' + c.oi + ' < ' + K.minOi);
     if (m.mid != null && m.mid < K.minMid) f.push('mid $' + longRound_(m.mid, 2) + ' < $' + K.minMid);
     if (m.extrinsic != null && m.extrinsic < 0) f.push('quote below intrinsic');
@@ -393,7 +394,7 @@ function longChooseContract_(cands, spot, cfg) {
     const score = f.length * 1000 + (m.spreadPct != null ? m.spreadPct : 50);
     if (!nearest || score < nearest.score) nearest = { score: score, c: c, m: m, fails: f };
     if (!f.length) {
-      const cost = m.carry + (m.spreadPct || 0) / 2;
+      const cost = m.carry;
       if (!best || cost < best.cost) best = { cost: cost, c: c, m: m };
     }
   });
@@ -413,8 +414,8 @@ function longScore_(x) {
   p.quality = 30 * longLin_(x.quality, 50, 90);
   p.trend = 12 * longLin_(x.vs200, 0, 15) + 8 * longLin_(x.x50, 0, 8);
   p.timing = 10 * longLin_(x.rsi, 60, 40) + 5 * longLin_(x.offHigh, 25, 10) + 5 * longLin_(x.ivr, 60, 20);
-  p.contract = 10 * longLin_(x.carry, 8, 3) + 6 * longLin_(x.spreadPct, 2, 0.5) +
-    4 * (x.delta == null ? 0.5 : 1 - Math.min(1, Math.abs(x.delta - 0.85) / 0.1));
+  p.contract = 13 * longLin_(x.carry, 8, 3) +      // bid-ask spread no longer scores; its 6 points moved to carry (+3) and delta (+3) so the total stays 20
+    7 * (x.delta == null ? 0.5 : 1 - Math.min(1, Math.abs(x.delta - 0.85) / 0.1));
   p.upside = 10 * longLin_(x.upside, -5, 20);
   let s = 0;
   Object.keys(p).forEach(function (k) { s += p[k]; });
@@ -514,30 +515,86 @@ function longTrendLabel_(vs200, vs50, vs20) {
  * ========================================================================== */
 
 // Daily bars WITH exchange dates (the shared fetcher drops the dates). Returns { dates, closes } or null.
+const LONG_YAHOO_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' };
+function longBarsUrl_(host, ticker) { return 'https://' + host + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=1y&interval=1d'; }
+
+function longParseBars_(resp) {
+  if (!resp || resp.getResponseCode() !== 200) return null;
+  const result = JSON.parse(resp.getContentText()).chart.result[0];
+  const ts = result.timestamp, q = result.indicators.quote[0];
+  if (!ts || !q || !q.close) return null;
+  const off = (result.meta && typeof result.meta.gmtoffset === 'number') ? result.meta.gmtoffset : -4 * 3600;
+  const dates = [], closes = [];
+  for (let k = 0; k < ts.length; k++) {
+    if (!isPlausible_(q.close[k], 0.01, null)) continue;
+    dates.push(new Date((ts[k] + off) * 1000).toISOString().slice(0, 10));   // exchange-local calendar date
+    closes.push(q.close[k]);
+  }
+  return closes.length >= 201 ? { dates: dates, closes: closes } : null;
+}
+
 function longFetchBars_(ticker) {
-  const urls = [
-    'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=1y&interval=1d',
-    'https://query2.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=1y&interval=1d'
-  ];
-  for (let i = 0; i < urls.length; i++) {
+  const hosts = ['query1', 'query2'];
+  for (let i = 0; i < hosts.length; i++) {
     try {
-      const resp = UrlFetchApp.fetch(urls[i], { method: 'get', muteHttpExceptions: true,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' } });
-      if (resp.getResponseCode() !== 200) continue;
-      const result = JSON.parse(resp.getContentText()).chart.result[0];
-      const ts = result.timestamp, q = result.indicators.quote[0];
-      if (!ts || !q || !q.close) continue;
-      const off = (result.meta && typeof result.meta.gmtoffset === 'number') ? result.meta.gmtoffset : -4 * 3600;
-      const dates = [], closes = [];
-      for (let k = 0; k < ts.length; k++) {
-        if (!isPlausible_(q.close[k], 0.01, null)) continue;
-        dates.push(new Date((ts[k] + off) * 1000).toISOString().slice(0, 10));   // exchange-local calendar date
-        closes.push(q.close[k]);
-      }
-      if (closes.length >= 201) return { dates: dates, closes: closes };
+      const b = longParseBars_(UrlFetchApp.fetch(longBarsUrl_(hosts[i], ticker), { method: 'get', muteHttpExceptions: true, headers: LONG_YAHOO_HEADERS }));
+      if (b) return b;
     } catch (e) { Logger.log('Long bars error for ' + ticker + ': ' + e); }
   }
   return null;
+}
+
+// Speed: the first scan of a day needs daily bars for every ticker. Instead of one request after another, fetch the stale ones
+// in parallel (8 at a time) and put them in the same cache longFetchTech_ reads. Anything that fails here is simply fetched the old way.
+function longPrefetchBars_(tickers, ctx) {
+  const stale = tickers.filter(function (t) {
+    return slowEntryAgeDays_(ctx.slowCache[slowKey_('LONGTECH', t)]) >= SLOW_REFRESH_DAYS.DAILYBARS;
+  });
+  for (let i = 0; i < stale.length; i += 8) {
+    const chunk = stale.slice(i, i + 8);
+    let resps;
+    try {
+      resps = UrlFetchApp.fetchAll(chunk.map(function (t) { return { url: longBarsUrl_('query1', t), method: 'get', muteHttpExceptions: true, headers: LONG_YAHOO_HEADERS }; }));
+    } catch (e) { Logger.log('Long bars prefetch error: ' + e); continue; }
+    chunk.forEach(function (t, k) {
+      try {
+        const b = longParseBars_(resps[k]);
+        const tech = b ? longTechFromBars_(b.dates, b.closes, longTodayYmdEt_()) : null;
+        if (tech) {
+          const key = slowKey_('LONGTECH', t), rec = { date: todayKey_(), value: tech };
+          ctx.pending[key] = JSON.stringify(rec); ctx.slowCache[key] = rec;
+        }
+      } catch (e) { /* normal path retries this ticker */ }
+    });
+  }
+}
+
+// Speed: one request for every live stock price instead of one per row. Missing tickers fall back to the single-ticker call.
+function longPrefetchQuotes_(tickers, token) {
+  const out = {};
+  if (!token) return out;
+  for (let i = 0; i < tickers.length; i += 20) {
+    const chunk = tickers.slice(i, i + 20);
+    try {
+      const url = 'https://api.tastyworks.com/market-data/by-type?' + chunk.map(function (t) { return 'equity=' + encodeURIComponent(t); }).join('&');
+      const resp = fetchTastyWithRetry_(url, token);
+      if (resp.getResponseCode() !== 200) continue;
+      const items = (JSON.parse(resp.getContentText()).data || {}).items || [];
+      items.forEach(function (item) {
+        const sym = String(item.symbol || '').toUpperCase();
+        if (!sym) return;
+        const bid = parseFloat(item.bid), ask = parseFloat(item.ask);
+        const last = item.last != null ? parseFloat(item.last) : null;
+        const mark = item.mark != null ? parseFloat(item.mark) : (!isNaN(bid) && !isNaN(ask) ? (bid + ask) / 2 : null);
+        const cur = (last != null && !isNaN(last)) ? last : mark;
+        const price = isPlausible_(cur, 0.01, null) ? cur : null;
+        const pcRaw = item['prev-close'] != null ? item['prev-close'] : (item['previous-close'] != null ? item['previous-close'] : (item['close-price'] != null ? item['close-price'] : item.close));
+        const pc = pcRaw != null ? parseFloat(pcRaw) : null;
+        if (price != null) out[sym] = { price: price, change: (pc != null && !isNaN(pc) && pc !== 0) ? price - pc : null };
+      });
+    } catch (e) { Logger.log('Long quote prefetch error: ' + e); }
+  }
+  return out;
 }
 
 function longTodayYmdEt_() { return Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd'); }
@@ -648,8 +705,12 @@ function longPickContract_(ticker, spot, ctx) {
 
 // Cached daily pick, re-quoted live on every run; re-picked when the live quote no longer passes. Failures are never cached.
 function longGetContract_(ticker, spot, ctx) {
-  const key = slowKey_('LONGCON', ticker);
+  const key = slowKey_('LONGCON2', ticker);
   const cached = ctx.slowCache[key];
+  if (cached && cached.date === todayKey_() && cached.value && cached.value.fail && Date.now() - cached.value.at < LONG_CONFIG.contract.failCacheMin * 60000) {
+    const n = cached.value.near;
+    return { ok: false, why: cached.value.why, near: n ? { strike: n.strike, expiry: new Date(n.expiry + 'T12:00:00'), oi: n.oi, volume: n.volume } : null };
+  }
   if (cached && cached.date === todayKey_() && cached.value && cached.value.strike && cached.value.expiry) {
     const exp = new Date(cached.value.expiry + 'T12:00:00');
     const cand = longQuoteContract_(ticker, exp, cached.value.strike, ctx, ctx.now);
@@ -659,6 +720,12 @@ function longGetContract_(ticker, spot, ctx) {
   const r = longPickContract_(ticker, spot, ctx);
   if (r.ok) {
     const rec = { date: todayKey_(), value: { expiry: longYmd_(r.pick.expiry), strike: r.pick.strike } };
+    ctx.pending[key] = JSON.stringify(rec);
+    ctx.slowCache[key] = rec;
+  } else if (r.why && !/^no TastyTrade token|^no option chain/.test(r.why)) {
+    // Speed: remember a real "no usable contract" for a few hours so every scan does not re-download the chain. Outages are never remembered.
+    const n = r.near;
+    const rec = { date: todayKey_(), value: { fail: true, at: Date.now(), why: r.why, near: n ? { strike: n.strike, expiry: longYmd_(n.expiry), oi: n.oi, volume: n.volume } : null } };
     ctx.pending[key] = JSON.stringify(rec);
     ctx.slowCache[key] = rec;
   }
@@ -702,7 +769,7 @@ function longProcessRow_(inp, ctx) {
   let spot = null, dayChg = null;
   if (ctx.token) {
     try {
-      const q = fetchTastyEquityQuote_(t, ctx.token);
+      const q = (ctx.quotes && ctx.quotes[t]) || fetchTastyEquityQuote_(t, ctx.token);
       if (q && q.price != null) { spot = q.price; if (typeof q.change === 'number' && isFinite(q.change)) dayChg = q.change; }
     } catch (e) { /* fall back */ }
   }
@@ -797,7 +864,10 @@ function longProcessRow_(inp, ctx) {
   }
 
   // ----- a candidate -----
-  const pick = longGetContract_(t, spot, ctx);
+  // Speed: the chain download is the slowest call. A stock that already fails a hard gate is a SKIP whatever its contract looks like, so skip the lookup.
+  const E0 = cfg.entry, qFloor0 = isEtf ? E0.qualityFloorEtf : E0.qualityFloor;
+  const stockFails = !(vs200 > 0) || !(x50 > 0) || (offHigh != null && offHigh > E0.skipOffHigh) || (inp.quality != null && inp.quality < qFloor0);
+  const pick = stockFails ? { ok: false, near: null, why: '' } : longGetContract_(t, spot, ctx);
   let contractOk = false, risk = null, score = null, m = null, c = null;
   if (pick.ok) {
     contractOk = true; c = pick.pick; m = pick.m;
@@ -880,6 +950,10 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
     // Contract picks of other tabs share nothing here; CSP's cache is not read (different keys).
     const pending = {};
     const ctx = longMakeCtx_(rows.map(function (r) { return r.ticker; }).filter(function (v, i, a) { return a.indexOf(v) === i; }), now, slowCache, pending);
+    // Speed: parallel/batched prefetch. Both are best-effort: anything missed is fetched per row exactly as before.
+    const uniq = rows.map(function (r) { return r.ticker; }).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    try { ctx.quotes = longPrefetchQuotes_(uniq, ctx.token); } catch (e) { ctx.quotes = {}; }
+    try { longPrefetchBars_(uniq, ctx); } catch (e) { /* per-row fetch handles it */ }
     const outCols = LONG_OUTPUT_HEADERS.filter(function (h) { return map[h]; });
     const lastRunStamp = new Date();
 
