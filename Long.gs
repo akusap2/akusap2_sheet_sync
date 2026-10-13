@@ -141,12 +141,12 @@ const LONG_INPUT_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry'];            
 const LONG_HELD_WHEN_OPEN = ['Strike', 'Expiry'];                                // your entries while Qty is filled: never overwritten
 const LONG_EXTRA_HEADERS = ['Quality', 'Source', 'Type'];                        // written by Promote, not by the scan
 const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality',
-  'Earn Days', 'IV Rank', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Lev', 'Roll By',
-  'Stock Equiv $', 'Capital Saved $', 'Days', 'P/L $', 'Why', 'LastRun'];
+  'Earn Days', 'IV Rank', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
+  'Days', 'P/L $', 'Why', 'LastRun'];
 const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20',
-  'Bid', 'Ask', 'Volume', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
+  'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
 // Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
-const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %'];
+const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
 const LONG_HEADERS = LONG_VISIBLE_HEADERS.concat(LONG_DETAIL_HEADERS).concat(LONG_EXTRA_HEADERS.filter(function (h) { return LONG_VISIBLE_HEADERS.indexOf(h) === -1; }));   // Quality is visible, Source / Type hidden
 // Columns the scan writes (everything except your inputs and the promote-managed ones).
 const LONG_OUTPUT_HEADERS = LONG_HEADERS.concat(LONG_NO_COLUMN).filter(function (h) { return LONG_INPUT_HEADERS.indexOf(h) === -1 && LONG_EXTRA_HEADERS.indexOf(h) === -1; });
@@ -717,7 +717,7 @@ function longProcessRow_(inp, ctx) {
     out.Strike = inp.openStrike; out.Expiry = inp.openExpiry; out.DTE = c.dte;
     if (mark != null) out.Mid = mark;
     if (c.delta != null) out.Delta = c.delta;
-    out['Spread %'] = m.spreadPct; out.OI = c.oi; out.Volume = c.volume; out.Bid = c.bid; out.Ask = c.ask;
+    out['Spread %'] = m.spreadPct; out.OI = c.oi; out.Vol = c.volume; out.Bid = c.bid; out.Ask = c.ask;
     out['Carry %/yr'] = m.carry; out['Breakeven %'] = m.breakeven; out.Lev = m.lev; out['Extrinsic $'] = m.extrinsic;
     out['Roll By'] = new Date(inp.openExpiry.getTime() - cfg.exits.rollDte * 86400000);
     if (c.delta != null) {
@@ -741,7 +741,7 @@ function longProcessRow_(inp, ctx) {
   if (pick.ok) {
     contractOk = true; c = pick.pick; m = pick.m;
     out.Expiry = c.expiry; out.Strike = c.strike; out.DTE = c.dte; out.Delta = c.delta; out.Mid = m.mid; out['Spread %'] = m.spreadPct;
-    out.OI = c.oi; out.Volume = c.volume; out.Bid = c.bid; out.Ask = c.ask;
+    out.OI = c.oi; out.Vol = c.volume; out.Bid = c.bid; out.Ask = c.ask;
     out['Carry %/yr'] = m.carry; out['Breakeven %'] = m.breakeven; out.Lev = m.lev; out['Extrinsic $'] = m.extrinsic;
     out['Roll By'] = new Date(c.expiry.getTime() - cfg.exits.rollDte * 86400000);
     out['Stock Equiv $'] = c.delta * spot * 100; out['Capital Saved $'] = (c.delta * spot - m.mid) * 100;
@@ -751,7 +751,7 @@ function longProcessRow_(inp, ctx) {
   } else if (pick.near) {
     out.Strike = pick.near.strike; out.Expiry = pick.near.expiry;
     if (pick.near.oi != null) out.OI = pick.near.oi;
-    if (pick.near.volume != null) out.Volume = pick.near.volume;
+    if (pick.near.volume != null) out.Vol = pick.near.volume;
   }
   const x = { vs200: vs200, x50: x50, offHigh: offHigh, rsi: tech.rsi, ivr: ivr, bounce: tech.bounce, fall: tech.fall, lowAge: tech.lowAge,
     quality: inp.quality, isEtf: isEtf, risk: risk, contractOk: contractOk, contractWhy: pick.why, upside: upside,
