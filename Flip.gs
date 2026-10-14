@@ -86,7 +86,8 @@ const FLIP_CONFIG = {
   // --- runtime --------------------------------------------------------------------------------
   timeBudgetMs: 4.5 * 60 * 1000, sleepMs: 60,
   // --- schedule (US/Eastern) ------------------------------------------------------------------
-  schedule: { startHHmm: '09:35', endHHmm: '15:55', fullScanEveryMin: 30, gradeAfterHHmm: '16:10' },
+  // Fast (every 5 min): startHHmm-fastUntilHHmm and fastFromHHmm-endHHmm. Between them: one run every slowEveryMin.
+  schedule: { startHHmm: '09:31', endHHmm: '16:00', fastUntilHHmm: '11:01', fastFromHHmm: '15:30', slowEveryMin: 30, fullScanEveryMin: 30, gradeAfterHHmm: '16:10' },
   alerts: { buyRepeatMin: 120, exitRepeatMin: 60, readyRepeatMin: 240, alertReady: false },
   logCooldownMin: 60
 };
@@ -292,7 +293,7 @@ function flipAddMenu_() {
       .addItem('Send Test Flip Alert', 'sendTestFlipAlert_')
       .addItem('Turn Flip Alerts On / Off', 'toggleFlipAlerts_')
       .addSeparator()
-      .addItem('▶ Start Flip Schedule (every 5 min, market hours)', 'startFlipSchedule_')
+      .addItem('▶ Start Flip Schedule (5 min 9:31-11:01 & 3:30-4:00, 30 min between)', 'startFlipSchedule_')
       .addItem('■ Stop Flip Schedule', 'stopFlipSchedule_')
       .addItem('Schedule Status', 'flipScheduleStatus_')
       .addItem('Clear Stuck Run', 'flipClearStuckRun_'))
@@ -1614,8 +1615,9 @@ function startFlipSchedule_() {
   ScriptApp.newTrigger(FLIP_TICK_FN).timeBased().everyMinutes(5).create();
   const S = FLIP_CONFIG.schedule;
   notify_(ui, 'Flip schedule started',
-    'Runs every 5 minutes; outside Mon-Fri ' + S.startHHmm + '-' + S.endHHmm + ' ET each run exits in milliseconds.\n' +
-    'Each in-hours tick checks your held positions and today\'s candidates; every ' + S.fullScanEveryMin + ' minutes it does a full scan.\n' +
+    'Mon-Fri ET: every 5 minutes ' + S.startHHmm + '-' + S.fastUntilHHmm + ' and ' + S.fastFromHHmm + '-' + S.endHHmm + '; every ' + S.slowEveryMin + ' minutes in between.\n' +
+    'The trigger fires every 5 minutes; ticks that are not due exit in milliseconds. Google fires triggers within a few minutes of the mark, so times are approximate.\n' +
+    'Each run checks your held positions and today\'s candidates; a full scan (new contracts, earnings, sort) runs at least every ' + S.fullScanEveryMin + ' minutes.\n' +
     'Research promotion runs before the open; past signals are graded after ' + S.gradeAfterHHmm + '.\n' +
     'Phone alerts go through the Quick alert setup.');
 }
@@ -1666,6 +1668,11 @@ function flipScheduledTick_() {
     }
     return;
   }
+  const fast = p.hhmm <= S.fastUntilHHmm || p.hhmm >= S.fastFromHHmm;
+  const lastTick = parseInt(props.getProperty('FLIP_LAST_TICK') || '0', 10);
+  // Slow window: skip unless ~slowEveryMin has passed since the last in-market run (2.5 min tolerance for trigger jitter)
+  if (!fast && lastTick && new Date(lastTick).toDateString() === now.toDateString() && Date.now() - lastTick < S.slowEveryMin * 60000 - 150000) return;
+  props.setProperty('FLIP_LAST_TICK', String(Date.now()));
   const lastFull = parseInt(props.getProperty('FLIP_LAST_FULL') || '0', 10);
   const full = !lastFull || Date.now() - lastFull >= S.fullScanEveryMin * 60000 - 90000 || new Date(lastFull).toDateString() !== now.toDateString();
   const r = runFlipScan(full ? 250000 : 100000, false, { quiet: true, full: full });
