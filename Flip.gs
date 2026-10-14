@@ -1438,17 +1438,18 @@ function flipColorRows_(sheet, map, n) {
 }
 
 
-// Orders the rows by Jay tier (High > Medium > Low > none), then within each tier (STOP / SELL first, then HOLD, BUY, READY, BLOCKED, WAIT, SKIP) without a SortKey column on the sheet:
+// Orders the rows: live Jay High first, then live Jay Medium, then everything else (Low, "(not live)", blank, n/a) ordered only by your Action/Score key. Within each group (STOP / SELL first, then HOLD, BUY, READY, BLOCKED, WAIT, SKIP) without a SortKey column on the sheet:
 // a temporary column carries the keys for the sort and is deleted straight after. Rows keep their inputs and formulas.
 function flipSortRows_(sheet, map, data, keys, jayByIdx) {
   const n = data.length;
   if (n < 2) return;
   const a = map['Action'] - 1, sc = map['Score'] - 1;
-  // Jay tier comes first (High, then Medium, then Low, then no tier); the existing Action/Score order breaks ties inside each tier.
+  // Only live High and Medium are lifted to the top; Low / not-live / blank rows sort purely by Action + Score, so a Low can sit anywhere its score puts it.
   const jc = map['Jay'] ? map['Jay'] - 1 : -1;
   const jayTier = function (i, r) {
     const v = String((jayByIdx && jayByIdx[i] !== undefined) ? jayByIdx[i] : (jc >= 0 ? r[jc] : '')).toLowerCase();
-    return v.indexOf('high') === 0 ? 3 : (v.indexOf('medium') === 0 ? 2 : (v.indexOf('low') === 0 ? 1 : 0));
+    const live = v.indexOf('(not live)') < 0;
+    return live && v.indexOf('high') === 0 ? 2 : (live && v.indexOf('medium') === 0 ? 1 : 0);
   };
   const col = data.map(function (r, i) {
     const k = keys[i] !== undefined ? keys[i] : flipSortKey_(String(r[a] || ''), flipNum_(r[sc]) || 0, 0);
