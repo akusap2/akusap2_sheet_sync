@@ -972,6 +972,20 @@ function flipPickContract_(ticker, spot, sigmaDay, ctx) {
 }
 
 // Expiry text -> Date (cache stores yyyy-MM-dd).
+// Date typed in a sheet cell: keep the calendar day the sheet shows (see the note inside), pinned to noon.
+function flipCellDate_(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    // A date cell is midnight in the SPREADSHEET's time zone (GMT here), which differs from the script's (New York): midnight GMT is the
+    // previous evening in New York, so Jun 17 became Jun 16 and no contract matched. Take the calendar day as the sheet shows it, pin to noon.
+    try {
+      const sheetTz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      const p = Utilities.formatDate(v, sheetTz, 'yyyy-MM-dd').split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12, 0, 0);
+    } catch (e) { return v; }
+  }
+  return flipDate_(v);
+}
+
 function flipDate_(v) {
   if (v == null || v === '') return null;
   if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? null : v;
@@ -1211,8 +1225,8 @@ function flipParseInputs_(data, map, now) {
     const qty = num('Qty');
     const held = qty != null && qty > 0;
     const strike = num('Strike'), entry = num('Entry');
-    const expiry = flipDate_(map['Expiry'] ? r[map['Expiry'] - 1] : null);
-    const entryDate = flipDate_(map['Entry Date'] ? r[map['Entry Date'] - 1] : null);
+    const expiry = flipCellDate_(map['Expiry'] ? r[map['Expiry'] - 1] : null);
+    const entryDate = flipCellDate_(map['Entry Date'] ? r[map['Entry Date'] - 1] : null);
     rows.push({
       idx: i, ticker: t, held: held, qty: qty || 0, strike: strike, expiry: expiry, entry: entry, entryDate: entryDate,
       complete: !!(held && strike > 0 && expiry && entry > 0),

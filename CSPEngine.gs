@@ -795,7 +795,16 @@ function cspFetchIvRanks_(tickers, token) {
 
 function cspParseDate_(v) {
   if (v == null || v === '') return null;
-  if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? null : v;
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    if (isNaN(v.getTime())) return null;
+    // A date cell is midnight in the SPREADSHEET's time zone (GMT here), which differs from the script's (New York): midnight GMT is the
+    // previous evening in New York, so Jun 17 became Jun 16 and no contract matched. Take the calendar day as the sheet shows it, pin to noon.
+    try {
+      const sheetTz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      const p = Utilities.formatDate(v, sheetTz, 'yyyy-MM-dd').split('-');
+      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12, 0, 0);
+    } catch (e) { return v; }
+  }
   const d = new Date(String(v));
   return isNaN(d.getTime()) ? null : d;
 }
