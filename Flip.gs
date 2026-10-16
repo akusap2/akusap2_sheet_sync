@@ -1339,7 +1339,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const occ = [];
     heldRows.forEach(function (r) { if (r.complete) occ.push(buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C')); });
     Object.keys(env.picks).forEach(function (t) { const p = env.picks[t]; if (p && p.ok && p.c.symbol && occ.indexOf(p.c.symbol) === -1) occ.push(p.c.symbol); });
-    env.quotes = sess.open || heldRows.length ? fetchOptionQuotesMap_(occ) : {};
+    env.quotes = sess.open || heldRows.length ? flipCfQuotes_(occ) : {};
     // TastyTrade is first. Anything it did not return a usable bid/ask for falls back to Yahoo: held contracts always,
     // the picks' contracts only while the market is open (keeps closed-market scans fast).
     const heldOcc = heldRows.filter(function (r) { return r.complete; }).map(function (r) { return buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C'); });
@@ -1480,10 +1480,57 @@ function flipParseOcc_(sym) {
   if (!m) return null;
   return { t: m[1], exp: new Date(Date.UTC(2000 + parseInt(m[2], 10), parseInt(m[3], 10) - 1, parseInt(m[4], 10))), type: m[5], strike: parseInt(m[6], 10) / 1000 };
 }
+// Step 1: the Cloud Function (TastyTrade). Same call as fetchOptionQuotesMap_, but it says WHY when nothing comes back.
+function flipCfQuotes_(occ) {
+  if (!occ.length) return {};
+  let url = '', secret = '';
+  try { url = getCloudFunctionUrl_(); secret = getCloudFunctionSharedSecret_(); } catch (e) { /* handled below */ }
+  if (!url || !secret) { logToSheet_('Flip quotes: Cloud Function URL or shared secret is not set, so TastyTrade quotes via the Cloud Function are skipped.'); return {}; }
+  try {
+    const resp = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      payload: JSON.stringify({ apiKey: secret, occSymbols: occ }) });
+    if (resp.getResponseCode() !== 200) { logToSheet_('Flip quotes: Cloud Function HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().substring(0, 200)); return {}; }
+    const json = JSON.parse(resp.getContentText());
+    const res = json.tastyResults || {};
+    const got = Object.keys(res).length;
+    if (got < occ.length) {
+      const errs = Object.keys(json.tastyErrors || {}).length;
+      logToSheet_('Flip quotes: Cloud Function returned ' + got + ' of ' + occ.length + ' contracts' + (errs ? ' (' + errs + ' errors)' : '') +
+        (json.diagnostics && json.diagnostics.tasty ? ' | reason: ' + json.diagnostics.tasty : '') + '.');
+    }
+    return res;
+  } catch (e) {
+    logToSheet_('Flip quotes: Cloud Function call failed: ' + e);
+    return {};
+  }
+}
+
 function flipYahooFill_(quotes, syms) {
   const MAX = 25, t0 = Date.now();
-  const need = syms.filter(function (s, i) { const q = quotes[s]; return syms.indexOf(s) === i && !(q && q.bid > 0 && q.ask > 0); });
+  let need = syms.filter(function (s, i) { const q = quotes[s]; return syms.indexOf(s) === i && !(q && q.bid > 0 && q.ask > 0); });
   if (!need.length) return;
+  // Step 2: TastyTrade straight from Apps Script (same quotes, no Cloud Function in between).
+  let direct = 0;
+  try {
+    const token = getTastyTradeAccessToken_();
+    if (token) {
+      const dm = fetchTastyMarketDataBatch_(need, token);
+      need.forEach(function (s) {
+        const d = dm[s];
+        if (d && d.bid > 0 && d.ask > 0) {
+          const q = quotes[s] || {};
+          q.bid = d.bid; q.ask = d.ask; if (d.delta != null) q.delta = d.delta;
+          if (d.oi != null) q.openInterest = d.oi;
+          if (d.volume != null) q.volume = d.volume;
+          q.source = 'tasty-direct'; quotes[s] = q; direct++;
+        }
+      });
+    }
+  } catch (e) { logToSheet_('Flip quotes: direct TastyTrade call failed: ' + e); }
+  need = need.filter(function (s) { const q = quotes[s]; return !(q && q.bid > 0 && q.ask > 0); });
+  logToSheet_('Flip quotes: direct TastyTrade filled ' + direct + '; ' + need.length + ' still without a bid/ask' + (need.length ? ', trying Yahoo.' : '.'));
+  if (!need.length) return;
+  // Step 3: Yahoo.
   let tried = 0, got = 0;
   for (let i = 0; i < need.length && tried < MAX && Date.now() - t0 < 60000; i++) {
     const p = flipParseOcc_(need[i]);
@@ -1504,7 +1551,7 @@ function flipYahooFill_(quotes, syms) {
     }
     Utilities.sleep(150);
   }
-  logToSheet_('Flip quotes: TastyTrade had no usable bid/ask for ' + need.length + ' contract(s); Yahoo fallback tried ' + tried + ', filled ' + got + '.');
+  logToSheet_('Flip quotes: Yahoo fallback tried ' + tried + ', filled ' + got + '.');
 }
 
 function flipColorRows_(sheet, map, n) {
@@ -2186,7 +2233,7 @@ function debugFlipOneTicker() {
   env.ivFresh[t] = flipFreshIv_(ivMap[t], env);
   const f = feat[t];
   if (f) env.picks[t] = flipPickContract_(t, env.ivFresh[t] && env.ivFresh[t].lastPrice > 0 ? env.ivFresh[t].lastPrice : f.price, f.sigmaDay, ctx);
-  if (env.picks[t] && env.picks[t].ok && env.picks[t].c.symbol) { env.quotes = fetchOptionQuotesMap_([env.picks[t].c.symbol]); flipYahooFill_(env.quotes, [env.picks[t].c.symbol]); }
+  if (env.picks[t] && env.picks[t].ok && env.picks[t].c.symbol) { env.quotes = flipCfQuotes_([env.picks[t].c.symbol]); flipYahooFill_(env.quotes, [env.picks[t].c.symbol]); }
   const res = flipProcessCandidate_({ ticker: t, held: false }, env);
   flipCacheFlush_(pending);
   const lines = ['Market open: ' + sess.open + ' | SPY headwind: ' + env.spyHead + ' | intraday: ' + (env.ivFresh[t] ? 'fresh' : 'none/stale'),
