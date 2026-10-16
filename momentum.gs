@@ -7906,9 +7906,11 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
   // calls per row with a handful of calls for the whole sheet.
   const numDataRows = lastRow - DATA_START_ROW + 1;
   let allValues = [], allBackgrounds = [], allFontColors = [], allNotes = [], allNumberFormats = [];
+  let tickerSnap = [];   // tickers per row as read at the start: used to refuse a write-back if rows moved during the run
   if (numDataRows > 0) {
     const dataRange = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
     allValues = dataRange.getValues();
+    tickerSnap = allValues.map(function (r) { return String(r[map.ticker - 1] || '').trim().toUpperCase(); });
     allBackgrounds = dataRange.getBackgrounds();
     allFontColors = dataRange.getFontColors();
     allNotes = dataRange.getNotes();
@@ -9326,6 +9328,19 @@ function validateAndUpdate(sheetOverride, timeBudgetMsOverride, dryRun) {
     // dry-run (line below), since it's not relevant to this test and
     // keeps this run as minimal as possible.
     const dataRange = sheet.getRange(DATA_START_ROW, 1, numDataRows, lastCol);
+    // SAFETY: this run writes its start-of-run snapshot back by row position. If rows were moved, sorted, added or deleted
+    // while it ran, writing would scramble Strike / Expiry (and your other entries) against the tickers: so write nothing.
+    {
+      const nowT = sheet.getLastRow() - DATA_START_ROW + 1 >= numDataRows
+        ? sheet.getRange(DATA_START_ROW, map.ticker, numDataRows, 1).getValues() : null;
+      let same = !!nowT;
+      for (let i = 0; same && i < numDataRows; i++) if (String(nowT[i][0] || '').trim().toUpperCase() !== tickerSnap[i]) same = false;
+      if (!same) {
+        logToSheet_(sheet.getName() + ': sheet changed during the run (rows moved, sorted, added or deleted). Nothing was written, to protect your entries. Run it again.');
+        try { SpreadsheetApp.getActive().toast('The ' + sheet.getName() + ' tab changed while the run was going (rows moved or deleted), so nothing was written. Run it again.', 'Not saved', 15); } catch (e) { /* no UI */ }
+        return;
+      }
+    }
     // Formula cells are NOT written back (writing them re-sets the formula and forces a recalculation; GOOGLEFINANCE can come
     // back blank or #N/A when many are re-set at once). The only formulas this run changes are the wrapped StockPrice / L52 /
     // H52 / Cap ones in formulaOverrides, and only when their fallback number has moved.

@@ -306,7 +306,7 @@ function longFormatSheet_(sheet) {
   ['Entry', 'Price', 'Strike', 'Mid', 'Bid', 'Ask', '52w High', '52w Low', 'Analyst', 'Extrinsic $'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   fmt('Change', '$#,##0.00;-$#,##0.00;$0.00');
   fmt('Stock Equiv $', '$#,##0'); fmt('Capital Saved $', '$#,##0'); fmt('P/L $', '$#,##0;-$#,##0;$0');
-  ['Entry Date', 'Expiry', 'Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });
+  ['Expiry', 'Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });   // Entry Date is yours: its format is never changed
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
   ['Off High %', 'T200 %', 'X50 %', 'RS vs SPY %', 'Ret 1M %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RS vs SPY %', 'Ret 1M %', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality']
     .forEach(function (h) { fmt(h, '0.0'); });
@@ -1006,6 +1006,17 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
     }
 
     if (!dryRun) {
+      // SAFETY: snapshot + positional write. If rows moved / were added / deleted during the scan, write nothing.
+      const freshL = longRowsAligned_(sheet, width, data, map['Ticker'] - 1);
+      if (!freshL) {
+        logToSheet_('Long: sheet changed during the scan (rows moved, added or deleted). Nothing was written, to protect your entries. Run the scan again.');
+        notify_(ui, 'Long', 'The Long tab changed while the scan was running (rows moved or deleted), so nothing was written. Run the scan again.');
+        return;
+      }
+      rows.forEach(function (rw) {
+        if (!rw.holdCells) return;
+        LONG_HELD_WHEN_OPEN.forEach(function (h) { if (map[h]) data[rw.idx][map[h] - 1] = freshL[rw.idx][map[h] - 1]; });
+      });
       // Each contiguous group of output columns is written separately, so your input columns between them are never rewritten.
       const cols = outCols.map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });
       let g0 = 0;
@@ -1055,6 +1066,18 @@ function longParseDate_(v) {
   }
   const d = new Date(String(v));
   return isNaN(d.getTime()) ? null : d;
+}
+
+// Re-reads the rows the scan started from and returns them only if every ticker is still on the same row (nothing was moved,
+// sorted, inserted or deleted during the scan). The scan writes by row position, so a changed sheet must never be written to.
+function longRowsAligned_(sheet, width, data, tickerIdx) {
+  const n = data.length;
+  if (sheet.getLastRow() - 1 < n) return null;
+  const fresh = sheet.getRange(2, 1, n, width).getValues();
+  for (let i = 0; i < n; i++) {
+    if (String(fresh[i][tickerIdx] || '').trim().toUpperCase() !== String(data[i][tickerIdx] || '').trim().toUpperCase()) return null;
+  }
+  return fresh;
 }
 
 function longColorRows_(sheet, map, n) {

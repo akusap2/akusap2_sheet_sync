@@ -478,13 +478,25 @@ function cspApplyChangeRules_(sheet, map, onlyIfMissing) {
   } catch (e) { logToSheet_('CSP: could not apply Change colours: ' + (e && e.message ? e.message : e)); }
 }
 
+// Re-reads the rows the scan started from and returns them only if every ticker is still on the same row (nothing was moved,
+// sorted, inserted or deleted during the scan). The scan writes by row position, so a changed sheet must never be written to.
+function cspRowsAligned_(sheet, width, data, tickerIdx) {
+  const n = data.length;
+  if (sheet.getLastRow() - 1 < n) return null;
+  const fresh = sheet.getRange(2, 1, n, width).getValues();
+  for (let i = 0; i < n; i++) {
+    if (String(fresh[i][tickerIdx] || '').trim().toUpperCase() !== String(data[i][tickerIdx] || '').trim().toUpperCase()) return null;
+  }
+  return fresh;
+}
+
 function cspFormatSheet_(sheet) {
   const map = cspHeaderMap_(sheet);
   const maxRows = Math.max(sheet.getMaxRows() - 1, 1);
   function fmt(h, f) { if (map[h]) sheet.getRange(2, map[h], maxRows, 1).setNumberFormat(f); }
   fmt('Max Buy', '$#,##0.00'); fmt('Entry', '$#,##0.00'); fmt('Change', CSP_CHANGE_FORMAT);
   sheet.getRange(2, cspPnlCol_(map), maxRows, 1).setNumberFormat('[Green]$#,##0.00;[Red]-$#,##0.00;$0.00'); fmt('Open Strike', '$#,##0.00'); fmt('Open Credit', '$#,##0.00');
-  fmt('Open Expiry', 'yyyy-mm-dd'); fmt('Open Date', 'yyyy-mm-dd');
+  // Open Expiry / Open Date are yours: their format is never changed.
   fmt('Price', '$#,##0.00'); fmt('Strike', '$#,##0.00'); fmt('Bid', '$#,##0.00'); fmt('Ask', '$#,##0.00'); fmt('Mid', '$#,##0.00');
   fmt('Credit $', '$#,##0'); fmt('Cash Req', '$#,##0'); fmt('Breakeven', '$#,##0.00');
   fmt('TP25 Buyback', '$#,##0.00'); fmt('TP50 Buyback', '$#,##0.00'); fmt('Review Level', '$#,##0.00'); fmt('Open Mark', '$#,##0.00');
@@ -1250,6 +1262,19 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
   }
 
   if (!dryRun) {
+    // SAFETY: the scan works from a snapshot taken at the start and writes by row position. If rows moved / were added / deleted
+    // meanwhile (Promote, a manual sort, another run), writing would scramble Strike / Expiry against the tickers: so write nothing.
+    const freshC = cspRowsAligned_(sheet, width, data, map['Ticker'] - 1);
+    if (!freshC) {
+      PropertiesService.getScriptProperties().deleteProperty('CSP_RUNNING');
+      logToSheet_('CSP: sheet changed during the scan (rows moved, added or deleted). Nothing was written, to protect your entries. Run the scan again.');
+      notify_(ui, 'CSP', 'The CSP tab changed while the scan was running (rows moved or deleted), so nothing was written. Run the scan again.');
+      return { processed: 0, counts: counts, aborted: true };
+    }
+    rows.forEach(function (rw) {
+      if (!rw.holdCells) return;
+      CSP_HELD_WHEN_OPEN.forEach(function (h) { if (map[h]) data[rw.idx][map[h] - 1] = freshC[rw.idx][map[h] - 1]; });
+    });
     // Write each contiguous group of output columns separately, so your input columns (Open Qty, Open Date, ...)
     // that sit between them are never rewritten.
     const cols = outCols.map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });

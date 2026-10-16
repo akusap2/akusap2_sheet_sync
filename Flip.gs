@@ -524,7 +524,7 @@ function flipFormatSheet_(sheet) {
   ['Risk $'].forEach(function (h) { fmt(h, '$#,##0'); });
   if (flipPnlCol_(map)) sheet.getRange(2, flipPnlCol_(map), maxRows, 1).setNumberFormat('$#,##0;-$#,##0;$0');
   fmt('Change', FLIP_CHANGE_FORMAT);
-  ['Entry Date', 'Expiry', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });
+  ['Expiry', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });   // Entry Date is yours: its format is never changed
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
   ['Off High %', 'T200 %', 'SMA20 %', 'RS5 %', 'ATR %', 'Sigma Day %', 'Spread %', 'Time Val %', 'Decay %/d', 'IV', 'VW %', 'Need %', 'P Hit %', 'BE Win %',
     'Edge Needed', 'Stop %', 'P/L %', 'Day %', 'Fit', 'Lev', 'Score', 'RVOL', 'Delta', 'AUP', 'ADN', 'RSI'].forEach(function (h) { fmt(h, '0.0'); });
@@ -738,7 +738,7 @@ function flipHeldAction_(h, cfg) {
   cfg = cfg || FLIP_CONFIG;
   const money = h.plPct != null ? (h.plPct >= 0 ? '+' : '') + h.plPct.toFixed(1) + '%' : 'no quote';
   const base = money + ', day ' + h.days;
-  if (h.plPct == null) return { action: 'REVIEW', why: 'no option quote (check Strike / Expiry): ' + base };
+  if (h.plPct == null) return { action: 'REVIEW', why: (h.noQuoteWhy || 'no option quote from TastyTrade or Yahoo (check Strike / Expiry)') + ': ' + base };
   if (h.stopPct != null && h.plPct <= -h.stopPct) return { action: 'STOP', why: 'down ' + money + ', past the stop (-' + h.stopPct.toFixed(1) + '%): get out, ' + base };
   if (h.days >= cfg.hardStaleDays && h.plPct < cfg.targetPct) return { action: 'TIME-STOP', why: 'day ' + h.days + ' (max ' + cfg.hardStaleDays + '): close it, ' + money };
   if (h.plPct >= cfg.targetPct) return { action: 'SELL', why: 'target reached ' + money + ' (net of the selling spread)' };
@@ -1089,7 +1089,7 @@ function flipProcessHeld_(rw, env) {
   res['Days'] = days;
   if (plPct != null) { res['P/L %'] = flipR1_(plPct); res['P/L $'] = Math.round((bid - rw.entry) * 100 * rw.qty); res['Open Mark'] = flipR2_(bid); }
   const exit = (iv && plPct != null) ? evaluateQuickExit_(iv, plPct, env.S) : { exit: false, fading: false };
-  const act = flipHeldAction_({ plPct: plPct, days: days, stopPct: stopPct, stopPrice: rw.entry * (1 - stopPct / 100), exit: exit, rsi: iv ? iv.rsi1m : null, earnDays: earnDays }, C);
+  const act = flipHeldAction_({ noQuoteWhy: (q && !bid) ? 'quote found but it has no bid yet (market closed or illiquid), so P/L waits' : null, plPct: plPct, days: days, stopPct: stopPct, stopPrice: rw.entry * (1 - stopPct / 100), exit: exit, rsi: iv ? iv.rsi1m : null, earnDays: earnDays }, C);
   res['Action'] = act.action; res['Why'] = act.why; res._held = true; res._plPct = plPct;
   // Score for a position you hold: the same 0-100 scoring a new entry gets, applied to the setup as it stands today (not an entry signal).
   try {
@@ -1326,6 +1326,10 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     heldRows.forEach(function (r) { if (r.complete) occ.push(buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C')); });
     Object.keys(env.picks).forEach(function (t) { const p = env.picks[t]; if (p && p.ok && p.c.symbol && occ.indexOf(p.c.symbol) === -1) occ.push(p.c.symbol); });
     env.quotes = sess.open || heldRows.length ? fetchOptionQuotesMap_(occ) : {};
+    // TastyTrade is first. Anything it did not return a usable bid/ask for falls back to Yahoo: held contracts always,
+    // the picks' contracts only while the market is open (keeps closed-market scans fast).
+    const heldOcc = heldRows.filter(function (r) { return r.complete; }).map(function (r) { return buildOccSymbol_(r.ticker, r.expiry, r.strike, 'C'); });
+    flipYahooFill_(env.quotes, heldOcc.concat(sess.open ? occ.filter(function (x) { return heldOcc.indexOf(x) === -1; }) : []));
 
     // Open book -> portfolio guard.
     heldRows.forEach(function (r) {
@@ -1373,15 +1377,10 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
       // (Promote, a manual sort, another run), writing the snapshot back by position would scramble Strike / Expiry against the
       // tickers. So re-read the sheet now: abort the write if the tickers no longer line up, and for held rows always keep
       // the Strike / Expiry that are in the sheet right now (they are yours; the scan never owns them).
-      const freshT = sheet.getRange(2, 1, Math.max(1, sheet.getLastRow() - 1), width).getValues();
-      const tc = map['Ticker'] - 1;
-      let aligned = freshT.length === data.length;
-      for (let i = 0; aligned && i < data.length; i++) {
-        if (String(freshT[i][tc] || '').trim().toUpperCase() !== String(data[i][tc] || '').trim().toUpperCase()) aligned = false;
-      }
-      if (!aligned) {
+      const freshT = flipRowsAligned_(sheet, width, data, map['Ticker'] - 1);
+      if (!freshT) {
         logToSheet_('Flip: sheet changed during the scan (rows moved, added or deleted). Nothing was written, to protect Strike / Expiry. Run the scan again.');
-        notify_(ui, 'Flip', 'The Flip tab changed while the scan was running (rows moved, added or deleted), so nothing was written. Run the scan again.');
+        notify_(ui, 'Flip', 'The Flip tab changed while the scan was running (rows moved or deleted), so nothing was written. Run the scan again.');
         return null;
       }
       rows.forEach(function (rw) {
@@ -1446,6 +1445,52 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
   } finally {
     props.deleteProperty('FLIP_RUNNING');
   }
+}
+
+// Re-reads the rows the scan started from and returns them only if every ticker is still on the same row (nothing was moved,
+// sorted, inserted or deleted during the scan). The scan writes by row position, so a changed sheet must never be written to.
+function flipRowsAligned_(sheet, width, data, tickerIdx) {
+  const n = data.length;
+  if (sheet.getLastRow() - 1 < n) return null;
+  const fresh = sheet.getRange(2, 1, n, width).getValues();
+  for (let i = 0; i < n; i++) {
+    if (String(fresh[i][tickerIdx] || '').trim().toUpperCase() !== String(data[i][tickerIdx] || '').trim().toUpperCase()) return null;
+  }
+  return fresh;
+}
+
+// Option-quote fallback: TastyTrade (via the Cloud Function) is always tried first; for any contract it did not give a usable
+// bid and ask, ask Yahoo. Mutates `quotes` (OCC symbol -> quote). Capped so a bad day cannot eat the run time.
+function flipParseOcc_(sym) {
+  const m = /^(\S+)\s*(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(String(sym || ''));
+  if (!m) return null;
+  return { t: m[1], exp: new Date(Date.UTC(2000 + parseInt(m[2], 10), parseInt(m[3], 10) - 1, parseInt(m[4], 10))), type: m[5], strike: parseInt(m[6], 10) / 1000 };
+}
+function flipYahooFill_(quotes, syms) {
+  const MAX = 25, t0 = Date.now();
+  const need = syms.filter(function (s, i) { const q = quotes[s]; return syms.indexOf(s) === i && !(q && q.bid > 0 && q.ask > 0); });
+  if (!need.length) return;
+  let tried = 0, got = 0;
+  for (let i = 0; i < need.length && tried < MAX && Date.now() - t0 < 60000; i++) {
+    const p = flipParseOcc_(need[i]);
+    if (!p) continue;
+    tried++;
+    let y = null;
+    try { y = fetchYahooQuote_(p.t, p.exp, p.strike, p.type); } catch (e) { y = null; }
+    if (y && ((y.bid > 0 && y.ask > 0) || y.mark > 0)) {
+      const q = quotes[need[i]] || {};
+      if (y.bid != null) q.bid = y.bid;
+      if (y.ask != null) q.ask = y.ask;
+      if (y.mark != null) q.mark = y.mark;
+      if (y.oi != null && q.openInterest == null) q.openInterest = y.oi;
+      if (y.volume != null && q.volume == null) q.volume = y.volume;
+      q.source = 'yahoo';
+      quotes[need[i]] = q;
+      got++;
+    }
+    Utilities.sleep(150);
+  }
+  logToSheet_('Flip quotes: TastyTrade had no usable bid/ask for ' + need.length + ' contract(s); Yahoo fallback tried ' + tried + ', filled ' + got + '.');
 }
 
 function flipColorRows_(sheet, map, n) {
@@ -2127,7 +2172,7 @@ function debugFlipOneTicker() {
   env.ivFresh[t] = flipFreshIv_(ivMap[t], env);
   const f = feat[t];
   if (f) env.picks[t] = flipPickContract_(t, env.ivFresh[t] && env.ivFresh[t].lastPrice > 0 ? env.ivFresh[t].lastPrice : f.price, f.sigmaDay, ctx);
-  if (env.picks[t] && env.picks[t].ok && env.picks[t].c.symbol) env.quotes = fetchOptionQuotesMap_([env.picks[t].c.symbol]);
+  if (env.picks[t] && env.picks[t].ok && env.picks[t].c.symbol) { env.quotes = fetchOptionQuotesMap_([env.picks[t].c.symbol]); flipYahooFill_(env.quotes, [env.picks[t].c.symbol]); }
   const res = flipProcessCandidate_({ ticker: t, held: false }, env);
   flipCacheFlush_(pending);
   const lines = ['Market open: ' + sess.open + ' | SPY headwind: ' + env.spyHead + ' | intraday: ' + (env.ivFresh[t] ? 'fresh' : 'none/stale'),
