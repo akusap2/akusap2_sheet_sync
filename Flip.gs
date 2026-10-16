@@ -1369,6 +1369,25 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     }
 
     if (!dryRun) {
+      // SAFETY: the scan works from a snapshot taken at the start. If rows moved or were added / deleted / sorted meanwhile
+      // (Promote, a manual sort, another run), writing the snapshot back by position would scramble Strike / Expiry against the
+      // tickers. So re-read the sheet now: abort the write if the tickers no longer line up, and for held rows always keep
+      // the Strike / Expiry that are in the sheet right now (they are yours; the scan never owns them).
+      const freshT = sheet.getRange(2, 1, Math.max(1, sheet.getLastRow() - 1), width).getValues();
+      const tc = map['Ticker'] - 1;
+      let aligned = freshT.length === data.length;
+      for (let i = 0; aligned && i < data.length; i++) {
+        if (String(freshT[i][tc] || '').trim().toUpperCase() !== String(data[i][tc] || '').trim().toUpperCase()) aligned = false;
+      }
+      if (!aligned) {
+        logToSheet_('Flip: sheet changed during the scan (rows moved, added or deleted). Nothing was written, to protect Strike / Expiry. Run the scan again.');
+        notify_(ui, 'Flip', 'The Flip tab changed while the scan was running (rows moved, added or deleted), so nothing was written. Run the scan again.');
+        return null;
+      }
+      rows.forEach(function (rw) {
+        if (!rw.held) return;
+        FLIP_HELD_WHEN_OPEN.forEach(function (h) { if (map[h]) data[rw.idx][map[h] - 1] = freshT[rw.idx][map[h] - 1]; });
+      });
       const cols = outCols.map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });
       let g0 = 0;
       while (g0 < cols.length) {
