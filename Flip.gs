@@ -1526,6 +1526,13 @@ function flipYahooFill_(quotes, syms) {
         }
       });
     }
+    else logToSheet_('Flip quotes: no TastyTrade access token from Apps Script (see any "TastyTrade:" line in this log).');
+    if (token && !direct && need.length) {
+      // Say exactly what TastyTrade answers for one contract, so the failure is visible instead of silent.
+      const r = UrlFetchApp.fetch('https://api.tastyworks.com/market-data/by-type?equity-option=' + encodeURIComponent(need[0]),
+        { method: 'get', muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + token, Accept: 'application/json', 'User-Agent': (typeof TASTY_USER_AGENT !== 'undefined' ? TASTY_USER_AGENT : 'flip') } });
+      logToSheet_('Flip quotes: TastyTrade market-data test for ' + need[0] + ' -> HTTP ' + r.getResponseCode() + ' ' + r.getContentText().substring(0, 250));
+    }
   } catch (e) { logToSheet_('Flip quotes: direct TastyTrade call failed: ' + e); }
   need = need.filter(function (s) { const q = quotes[s]; return !(q && q.bid > 0 && q.ask > 0); });
   logToSheet_('Flip quotes: direct TastyTrade filled ' + direct + '; ' + need.length + ' still without a bid/ask' + (need.length ? ', trying Yahoo.' : '.'));

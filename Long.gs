@@ -1030,6 +1030,8 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
       longColorRows_(sheet, map, data.length);
       longApplyChangeRules_(sheet, map, true);
       if (map['SortKey']) sheet.getRange(2, 1, data.length, width).sort({ column: map['SortKey'], ascending: false });
+      // News watch on the options you hold (a note on the Ticker cell). After the sort, so it lands on the final row. Never breaks a scan.
+      if (!timedOut && Date.now() - startMs < budgetMs) { try { longUpdateNewsNotes_(sheet, map, data.length); } catch (e) { logToSheet_('Long news watch skipped: ' + (e && e.message ? e.message : e)); } }
       longFlushCache_(pending);
     }
   } finally {
@@ -1078,6 +1080,92 @@ function longRowsAligned_(sheet, width, data, tickerIdx) {
     if (String(fresh[i][tickerIdx] || '').trim().toUpperCase() !== String(data[i][tickerIdx] || '').trim().toUpperCase()) return null;
   }
   return fresh;
+}
+
+/* ============================================================================
+ * NEWS WATCH (held rows only): significant recent headlines, as a note on the Ticker cell
+ * ----------------------------------------------------------------------------
+ * Source: Finnhub company news (the Finnhub key you already use). Only rows with Qty filled are checked, one call per ticker,
+ * cached 4 hours, so a normal scan adds nothing after the first. It is information for you: it never changes an Action.
+ * "Significant" = a headline with an analyst move, earnings / guidance, a deal, a legal / regulatory item, a big price move or a
+ * leadership change, from the last 7 days. This is keyword matching, not a judgement of what is good or bad for the price.
+ * ========================================================================== */
+const LONG_NEWS = { days: 7, maxItems: 5, cacheSec: 4 * 3600, mark: '📰' };
+const LONG_NEWS_RULES = [
+  { re: /\b(upgrad|downgrad|price target|raises? target|lowers? target|cuts? target|initiat|reiterat|outperform|underperform)/i, tag: 'ANALYST', w: 3 },
+  { re: /\b(earnings|guidance|outlook|forecast|revenue|profit|beats?|misses?|quarter|results)\b/i, tag: 'EARNINGS', w: 3 },
+  { re: /\b(acquir|acquisition|merger|buyout|takeover|spin-?off|stake|offering|dilut|buyback|repurchase|dividend|split)/i, tag: 'DEAL', w: 3 },
+  { re: /\b(lawsuit|sued|probe|investigat|\bSEC\b|subpoena|recall|fraud|antitrust|ban|tariff|sanction|bankrupt|default|delist|halt)/i, tag: 'LEGAL/RISK', w: 3 },
+  { re: /\b(plunge|plummet|tumble|sink|crash|soar|surge|jump|rally|skyrocket|slump|spike|record high|all-time)/i, tag: 'BIG MOVE', w: 2 },
+  { re: /\b(ceo|cfo|chairman|resign|steps down|appoint|layoff|contract|partnership|approval|fda|order|win|wins)\b/i, tag: 'COMPANY', w: 2 }
+];
+
+function longNewsFetch_(ticker, key, now) {
+  const to = Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd');
+  const from = Utilities.formatDate(new Date(now.getTime() - LONG_NEWS.days * 86400000), 'America/New_York', 'yyyy-MM-dd');
+  const url = 'https://finnhub.io/api/v1/company-news?symbol=' + encodeURIComponent(ticker) + '&from=' + from + '&to=' + to + '&token=' + encodeURIComponent(key);
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  if (resp.getResponseCode() !== 200) throw new Error('Finnhub news HTTP ' + resp.getResponseCode());
+  const arr = JSON.parse(resp.getContentText());
+  return Array.isArray(arr) ? arr : [];
+}
+
+function longNewsNoteText_(ticker, items, now) {
+  const seen = {}, scored = [];
+  items.forEach(function (it) {
+    const h = String(it.headline || '').trim();
+    if (!h) return;
+    const k = h.toLowerCase().replace(/[^a-z0-9]+/g, ' ').substring(0, 70);
+    if (seen[k]) return;
+    seen[k] = 1;
+    const text = h + ' ' + String(it.summary || '').substring(0, 200);
+    const tags = [];
+    let w = 0;
+    LONG_NEWS_RULES.forEach(function (r) { if (r.re.test(text)) { tags.push(r.tag); w += r.w; } });
+    if (w >= 3) scored.push({ h: h, src: it.source || '', t: (it.datetime || 0) * 1000, tags: tags, w: w });
+  });
+  scored.sort(function (a, b) { return b.w - a.w || b.t - a.t; });
+  const stamp = Utilities.formatDate(now, 'America/New_York', 'MMM d h:mm a');
+  const head = LONG_NEWS.mark + ' ' + ticker + ' news, last ' + LONG_NEWS.days + ' days (checked ' + stamp + ' ET)';
+  if (!scored.length) return head + '\n\nNothing significant in ' + items.length + ' headline(s). Keyword screen only.';
+  const lines = scored.slice(0, LONG_NEWS.maxItems).map(function (x) {
+    const d = x.t ? Utilities.formatDate(new Date(x.t), 'America/New_York', 'MMM d') : '';
+    return '• ' + d + ' [' + x.tags.join(', ') + '] ' + x.h + (x.src ? ' (' + x.src + ')' : '');
+  });
+  return head + '\n\n' + lines.join('\n') + '\n\nKeyword screen, not a verdict: read the story before acting.';
+}
+
+function longUpdateNewsNotes_(sheet, map, nRows) {
+  if (!map['Ticker'] || !map['Qty'] || nRows < 1) return;
+  const key = typeof getFinnhubApiKey_ === 'function' ? getFinnhubApiKey_() : '';
+  if (!key) return;
+  const cache = CacheService.getScriptCache();
+  const now = new Date();
+  const tick = sheet.getRange(2, map['Ticker'], nRows, 1).getValues();
+  const qty = sheet.getRange(2, map['Qty'], nRows, 1).getValues();
+  const noteRng = sheet.getRange(2, map['Ticker'], nRows, 1);
+  const notes = noteRng.getNotes();
+  let changed = false, fetched = 0;
+  const t0 = Date.now();
+  for (let i = 0; i < nRows; i++) {
+    const t = String(tick[i][0] || '').trim().toUpperCase();
+    const q = parseFloat(qty[i][0]);
+    const mine = !notes[i][0] || String(notes[i][0]).indexOf(LONG_NEWS.mark) === 0;   // never overwrite a note you wrote yourself
+    if (!t || !mine) continue;
+    if (!(q > 0)) { if (notes[i][0]) { notes[i][0] = ''; changed = true; } continue; }   // sold: drop the news note
+    let text = cache.get('LONG_NEWS_' + t);
+    if (!text) {
+      if (fetched >= 12 || Date.now() - t0 > 45000) continue;
+      try {
+        text = longNewsNoteText_(t, longNewsFetch_(t, key, now), now);
+        cache.put('LONG_NEWS_' + t, text, LONG_NEWS.cacheSec);
+      } catch (e) { logToSheet_('Long news watch: ' + t + ': ' + (e && e.message ? e.message : e)); continue; }
+      fetched++;
+      Utilities.sleep(120);
+    }
+    if (notes[i][0] !== text) { notes[i][0] = text; changed = true; }
+  }
+  if (changed) noteRng.setNotes(notes);
 }
 
 function longColorRows_(sheet, map, n) {
