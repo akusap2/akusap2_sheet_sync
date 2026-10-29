@@ -34,7 +34,7 @@ const EARN_CACHE_SHEET = 'EarnCache';
 const EARN_TICK_FN = 'earnScheduledTick_';
 
 const EARN_CONFIG = {
-  lookaheadDays: 7,              // earnings within this many calendar days
+  lookaheadDays: 14,             // earnings within this many calendar days
   maxNames: 45,                  // per scan, nearest report first
   timeBudgetMs: 4.5 * 60 * 1000,
   sleepMs: 80,
