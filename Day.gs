@@ -1,0 +1,904 @@
+/* ============================================================================
+ * DayTrade.gs  —  the "Day" tab: open in the morning, flat by the close.
+ * ----------------------------------------------------------------------------
+ * Apps Script only (no Cloud Function redeploy). Own tab ("Day"), own hidden sheets (DayLog), own menu, own schedule. Shares only helpers from
+ * momentum.gs / Earnings.gs and the Tasty / Yahoo / Finnhub rate limits.
+ *
+ * THE SETUP (all rules are code you can read below, nothing is hidden):
+ *   1. STOCKS IN PLAY. Day traders only trade names that are unusually active today. Measured as relative volume (RVOL): volume in the first
+ *      5 minutes vs the average of the same 5 minutes over the previous 14 sessions. Before the open, the same idea on pre-market volume plus the
+ *      overnight gap and any earnings today. Price >= $5, ATR >= $0.50, average volume >= 1M, so fills are cheap.
+ *   2. OPENING RANGE BREAKOUT (ORB), 5 minutes. After 9:35 the first 5-minute candle decides the side: green -> LONG above its high, red ->
+ *      SHORT below its low. Stop = 10% of the 14-day ATR from the trigger. Nothing else is traded.
+ *   3. FILTERS used for ranking: gap in the same direction, price on the right side of VWAP, SPY/QQQ pointing the same way, catalyst.
+ *   4. RISK: 1% of the account per trade, positions capped at 1/5 of the account (times your leverage setting), no new entries after 11:30,
+ *      everything closed by 15:50 ET. Same-day only: this tab never suggests holding overnight.
+ *   5. LEARNING LOOP: every day at 16:05 the sheet replays what each shortlisted signal would have done (stop-first, with slippage) into the
+ *      DayLog sheet, whether or not you took it. "Day Stats" in the menu shows win rate and average R by score bucket. If the numbers are
+ *      not positive after ~30 days, do not trade it with real money.
+ *
+ * EVIDENCE (see the project doc day_tab_proposal for sources):
+ *   - Zarattini, Barbon, Aziz (SSRN 4729284; 2016-2023, >7,000 US stocks): 5-minute ORB on the top-20 "stocks in play" by RVOL, Sharpe ~2.8,
+ *     1,600%+ total. Costs and slippage assumptions are not stated on their summary page and the QuantConnect replication ignores them.
+ *   - Day traders as a group lose: Brazil futures 2013-15, 97% of those trading 300+ days lost money (Chague et al.); Taiwan, >80% lose in a
+ *     typical half-year and aggregate returns were negative every year (Barber et al.). A good backtest is not a good account.
+ *   - PDT: SEC approved FINRA's replacement of the $25,000 day-trading minimum on 2026-04-14 (intraday margin standard), but brokers phase it in
+ *     over up to 18 months. Check what your broker enforces today.
+ *
+ * NOT FINANCIAL ADVICE. Day trading loses money for most people. Start with paper results (DayLog), then tiny size.
+ * ========================================================================== */
+
+const DAY_SHEET_NAME = 'Day';
+const DAY_LOG_SHEET = 'DayLog';
+const DAY_TICK_FN = 'dayScheduledTick_';
+
+const DAY_CONFIG = {
+  orMinutes: 5,                 // opening range length
+  minPrice: 5, minAtr: 0.5, minAvgVol: 1000000,
+  minRvol: 1.0,                 // OR RVOL needed to be a tradable "stock in play" (higher ranks higher)
+  minGapPct: 1.0,               // pre-market watch list: |gap| or a catalyst
+  stopAtrFrac: 0.10,            // stop distance = this x 14-day ATR (the paper's value)
+  targetR: 2,                   // 'TARGET' alert at this many R; the paper just holds to the close
+  chaseR: 0.5,                  // a trigger more than this many R behind price is LATE, not BUY
+  entryCutoff: '11:30',         // no new entries after this ET time
+  closeBeforeMin: 10,           // CLOSE alert this many minutes before the close
+  riskPct: 1,                   // % of account risked per trade
+  maxPositions: 5,
+  defaultAccount: 10000,        // overridden by menu "Set Account Size"
+  slipPerShare: 0.02,           // replay slippage, each side
+  minRtoSlip: 5,                // stop distance must be at least this many times the per-share slippage (ATR >= $1.00 at the default 10% stop)
+  maxNames: 90, shortlist: 15, sleepMs: 60,
+  timeBudgetMs: 4.5 * 60 * 1000,
+  optionHints: true,            // top few signals also show a near-the-money option on the same side
+  optionHintMax: 3,
+  alertTopN: 5,
+  tickMinutes: 5
+};
+
+const DAY_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'Side', 'Setup', 'Score', 'Trigger', 'Stop', 'Target', 'Size',
+  'Gap %', 'RVOL', 'Pre RVOL', 'ATR %', 'VW %', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low', 'Spread %', 'Catalyst', 'Tape',
+  'P/L $', 'P/L %', 'R', 'Why', 'Option', 'LastRun', 'SortKey'];
+const DAY_ENTRY_COL = 5;
+const DAY_ENTRY_FORMULA = '=sumproduct(E2:E92,F2:F92)';
+
+/* ============================================================================
+ * PURE TIME + BAR MATH (no Apps Script services: unit-tested offline)
+ * ========================================================================== */
+
+// US Eastern offset in hours (-4 EDT / -5 EST) for a UTC millisecond timestamp. DST: 2nd Sunday of March 02:00 local -> 1st Sunday of Nov 02:00 local.
+function dayEtOffset_(ms) {
+  const y = new Date(ms).getUTCFullYear();
+  const nthSunday = function (month, n) {
+    const d = new Date(Date.UTC(y, month, 1));
+    const first = (7 - d.getUTCDay()) % 7;
+    return 1 + first + (n - 1) * 7;
+  };
+  const start = Date.UTC(y, 2, nthSunday(2, 2), 7, 0, 0);    // 02:00 EST = 07:00 UTC
+  const end = Date.UTC(y, 10, nthSunday(10, 1), 6, 0, 0);    // 02:00 EDT = 06:00 UTC
+  return ms >= start && ms < end ? -4 : -5;
+}
+
+// Yahoo chart JSON result -> [{ms, ymd, m, o, h, l, c, v}] ascending, m = minute of day in New York.
+function dayParseBars_(res) {
+  if (!res || !res.timestamp || !res.indicators || !res.indicators.quote || !res.indicators.quote[0]) return [];
+  const q = res.indicators.quote[0], out = [];
+  for (let i = 0; i < res.timestamp.length; i++) {
+    const c = q.close ? q.close[i] : null;
+    if (c == null || !(c > 0)) continue;
+    const ms = res.timestamp[i] * 1000;
+    const d = new Date(ms + dayEtOffset_(ms) * 3600000);
+    out.push({ ms: ms, ymd: d.toISOString().slice(0, 10), m: d.getUTCHours() * 60 + d.getUTCMinutes(),
+      o: q.open && q.open[i] != null ? q.open[i] : c, h: q.high && q.high[i] != null ? q.high[i] : c, l: q.low && q.low[i] != null ? q.low[i] : c,
+      c: c, v: q.volume && q.volume[i] != null ? q.volume[i] : 0 });
+  }
+  return out;
+}
+
+const DAY_OPEN_M = 570, DAY_CLOSE_M = 960;     // 09:30, 16:00
+function dayHm_(m) { return ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + (m % 60)).slice(-2); }
+function dayMinutes_(hm) { const p = String(hm).split(':'); return parseInt(p[0], 10) * 60 + parseInt(p[1], 10); }
+function dayMean_(a) { return a.length ? a.reduce(function (s, x) { return s + x; }, 0) / a.length : null; }
+function dayR2_(v) { return v == null || isNaN(v) ? '' : Math.round(v * 100) / 100; }
+
+// Everything that comes from PRIOR sessions: needs the 1-month 5-minute history. Cached for the day so live ticks only fetch today.
+function dayBaseline_(bars, todayYmd, orMin) {
+  const by = {}, order = [];
+  bars.forEach(function (b) {
+    if (b.ymd >= todayYmd) return;
+    if (!by[b.ymd]) { by[b.ymd] = []; order.push(b.ymd); }
+    by[b.ymd].push(b);
+  });
+  const sess = [];
+  order.forEach(function (ymd) {
+    const reg = by[ymd].filter(function (b) { return b.m >= DAY_OPEN_M && b.m < DAY_CLOSE_M; });
+    if (reg.length < 20) return;                 // holiday stub / bad data
+    const pre = by[ymd].filter(function (b) { return b.m < DAY_OPEN_M; });
+    sess.push({
+      ymd: ymd, o: reg[0].o, h: Math.max.apply(null, reg.map(function (b) { return b.h; })), l: Math.min.apply(null, reg.map(function (b) { return b.l; })),
+      c: reg[reg.length - 1].c, v: reg.reduce(function (s, b) { return s + b.v; }, 0),
+      orV: reg.filter(function (b) { return b.m < DAY_OPEN_M + orMin; }).reduce(function (s, b) { return s + b.v; }, 0),
+      pre: pre
+    });
+  });
+  if (sess.length < 3) return null;
+  const last = sess.slice(-14);
+  let trSum = 0, trN = 0;
+  for (let i = 1; i < sess.length; i++) {
+    if (i < sess.length - 14) continue;
+    const s = sess[i], pc = sess[i - 1].c;
+    trSum += Math.max(s.h - s.l, Math.abs(s.h - pc), Math.abs(s.l - pc)); trN++;
+  }
+  const prev = sess[sess.length - 1];
+  return { prevYmd: prev.ymd, prevClose: prev.c, prevHigh: prev.h, prevLow: prev.l,
+    atr: trN ? trSum / trN : null, avgVol: dayMean_(last.map(function (s) { return s.v; })), baseOrVol: dayMean_(last.map(function (s) { return s.orV; })),
+    prePast: last.map(function (s) { return s.pre; }), sessions: sess.length };
+}
+
+// Pre-market volume today (up to minute `cut`) vs the same window over prior sessions.
+function dayPreRvol_(base, todayBars, cut) {
+  if (!base || !base.prePast) return null;
+  const sumTo = function (arr) { return arr.filter(function (b) { return b.m < cut; }).reduce(function (s, b) { return s + b.v; }, 0); };
+  const today = sumTo(todayBars);
+  const past = dayMean_(base.prePast.map(sumTo));
+  return past > 0 ? today / past : null;
+}
+
+// Today's numbers from today's bars (pre-market + regular so far).
+function dayToday_(bars, todayYmd, nowM, orMin, base) {
+  const t = bars.filter(function (b) { return b.ymd === todayYmd; });
+  const out = { n: t.length, last: t.length ? t[t.length - 1].c : null, orDone: false };
+  if (!t.length) return out;
+  const pre = t.filter(function (b) { return b.m < DAY_OPEN_M; });
+  const reg = t.filter(function (b) { return b.m >= DAY_OPEN_M && b.m < DAY_CLOSE_M; });
+  if (pre.length) {
+    out.preHigh = Math.max.apply(null, pre.map(function (b) { return b.h; }));
+    out.preLow = Math.min.apply(null, pre.map(function (b) { return b.l; }));
+    out.preLast = pre[pre.length - 1].c; out.preVol = pre.reduce(function (s, b) { return s + b.v; }, 0);
+    out.preRvol = dayPreRvol_(base, pre, Math.min(nowM, DAY_OPEN_M));
+  }
+  if (reg.length) {
+    out.open = reg[0].o;
+    let pv = 0, vv = 0;
+    reg.forEach(function (b) { pv += (b.h + b.l + b.c) / 3 * b.v; vv += b.v; });
+    out.vwap = vv > 0 ? pv / vv : null;
+    out.dayHigh = Math.max.apply(null, reg.map(function (b) { return b.h; }));
+    out.dayLow = Math.min.apply(null, reg.map(function (b) { return b.l; }));
+    const orBars = reg.filter(function (b) { return b.m < DAY_OPEN_M + orMin; });
+    // the range is final only once the window has fully passed
+    if (orBars.length && nowM >= DAY_OPEN_M + orMin) {
+      out.orDone = true;
+      out.orO = orBars[0].o; out.orC = orBars[orBars.length - 1].c;
+      out.orH = Math.max.apply(null, orBars.map(function (b) { return b.h; })); out.orL = Math.min.apply(null, orBars.map(function (b) { return b.l; }));
+      out.orV = orBars.reduce(function (s, b) { return s + b.v; }, 0);
+      out.rvol = base && base.baseOrVol > 0 ? out.orV / base.baseOrVol : null;
+    }
+  }
+  if (base && base.prevClose > 0) {
+    const ref = out.open != null ? out.open : out.preLast;
+    out.gapPct = ref != null ? (ref / base.prevClose - 1) * 100 : null;
+  }
+  return out;
+}
+
+/* ============================================================================
+ * SIGNAL, SIZE, HELD-POSITION ACTION, REPLAY (pure)
+ * ========================================================================== */
+
+// tape: 'UP' | 'DOWN' | 'FLAT'. cat: catalyst text or ''. Returns the full state for one name.
+function daySignal_(base, td, price, nowM, cfg, tape, cat) {
+  const s = { state: 'SKIP', side: '', score: 0, setup: '', why: '' };
+  if (!base || !(base.prevClose > 0)) { s.why = 'not enough price history'; return s; }
+  const atrPct = base.atr && price ? base.atr / price * 100 : null;
+  s.atrPct = atrPct;
+  if (!(price >= cfg.minPrice)) { s.why = 'price under $' + cfg.minPrice; return s; }
+  if (!(base.atr >= cfg.minAtr)) { s.why = 'ATR $' + dayR2_(base.atr) + ' under $' + cfg.minAtr + ': not enough range to pay for costs'; return s; }
+  const Rtest = cfg.stopAtrFrac * base.atr;
+  if (Rtest < cfg.minRtoSlip * cfg.slipPerShare) { s.why = 'stop distance $' + dayR2_(Rtest) + ' is under ' + cfg.minRtoSlip + 'x the assumed slippage per share: costs would eat the edge'; return s; }
+  if (!(base.avgVol >= cfg.minAvgVol)) { s.why = 'average volume ' + Math.round(base.avgVol / 1000) + 'k under ' + Math.round(cfg.minAvgVol / 1000) + 'k'; return s; }
+  const gap = td.gapPct;
+  const R = Math.max(cfg.stopAtrFrac * base.atr, 0.01);
+  s.R = R;
+  const pts = function (side) {
+    let p = 0;
+    const rv = td.orDone ? td.rvol : td.preRvol;
+    if (rv != null) p += Math.min(rv, 5) / 5 * 35;
+    if (gap != null) { const g = Math.abs(gap); p += (side === 'LONG' ? gap > 0 : gap < 0) ? Math.min(g, 5) / 5 * 15 : -Math.min(g, 5) / 5 * 8; }
+    p += Math.min(atrPct == null ? 0 : atrPct, 3) / 3 * 10;
+    if (td.vwap != null) p += (side === 'LONG' ? price > td.vwap : price < td.vwap) ? 10 : -5;
+    if (tape === 'UP') p += side === 'LONG' ? 10 : -10; else if (tape === 'DOWN') p += side === 'SHORT' ? 10 : -10;
+    if (cat) p += 10;
+    p += base.avgVol >= 5000000 ? 5 : 2;
+    return Math.max(0, Math.min(100, p));
+  };
+  if (nowM < DAY_OPEN_M) {                                      // PRE-MARKET: build the watch list
+    if (gap == null) { s.why = 'no pre-market prints yet'; return s; }
+    const pr = td.preRvol;
+    const watch = Math.abs(gap) >= cfg.minGapPct || !!cat || (pr != null && pr >= 2);
+    if (!watch) { s.state = 'SKIP'; s.why = 'gap ' + dayR2_(gap) + '% and no catalyst: not in play'; return s; }
+    s.side = gap >= 0 ? 'LONG' : 'SHORT';
+    s.state = 'WATCH'; s.setup = 'PRE-MKT ' + (gap >= 0 ? 'GAP UP' : 'GAP DOWN');
+    s.score = pts(s.side);
+    s.trigger = s.side === 'LONG' ? td.preHigh : td.preLow;       // provisional: replaced by the opening range after 9:35
+    s.why = 'gap ' + dayR2_(gap) + '%' + (pr != null ? ', pre-mkt volume ' + dayR2_(pr) + 'x normal' : '') + (cat ? ', ' + cat : '') + '. Real trigger = 5-minute opening range, set at 9:35';
+    return s;
+  }
+  if (!td.orDone) { s.state = 'FORMING'; s.why = 'opening range forms until ' + dayHm_(DAY_OPEN_M + cfg.orMinutes) + ' ET'; s.side = gap != null && gap < 0 ? 'SHORT' : 'LONG'; s.score = pts(s.side); return s; }
+  if (td.orC === td.orO) { s.state = 'SKIP'; s.why = 'doji opening candle: no direction'; return s; }
+  s.side = td.orC > td.orO ? 'LONG' : 'SHORT';
+  const rv = td.rvol;
+  if (rv == null) { s.why = 'no volume baseline'; return s; }
+  if (rv < cfg.minRvol) { s.state = 'SKIP'; s.why = 'RVOL ' + dayR2_(rv) + ' under ' + cfg.minRvol + ': not a stock in play today'; s.score = pts(s.side); return s; }
+  const sign = s.side === 'LONG' ? 1 : -1;
+  s.trigger = s.side === 'LONG' ? td.orH : td.orL;
+  s.stop = s.trigger - sign * R;
+  s.target = s.trigger + sign * cfg.targetR * R;
+  s.score = pts(s.side);
+  s.setup = 'ORB ' + cfg.orMinutes + 'm ' + s.side;
+  const beyond = (price - s.trigger) * sign;                     // R units past the trigger
+  const beyondR = beyond / R;
+  const lateM = dayMinutes_(cfg.entryCutoff);
+  if ((sign === 1 && price < td.orL) || (sign === -1 && price > td.orH)) { s.state = 'FAILED'; s.why = 'price went through the other side of the opening range: the setup is dead'; return s; }
+  if (beyond < 0) {
+    s.state = nowM > lateM ? 'NO NEW' : 'WAIT';
+    s.why = 'waiting for ' + (s.side === 'LONG' ? 'a break above ' : 'a break below ') + dayR2_(s.trigger) + ' (' + dayR2_(-beyond) + ' away); RVOL ' + dayR2_(rv);
+    return s;
+  }
+  if (nowM > lateM) { s.state = 'NO NEW'; s.why = 'past ' + cfg.entryCutoff + ' ET: no new entries'; return s; }
+  if (beyondR > cfg.chaseR) { s.state = 'LATE'; s.why = 'already ' + dayR2_(beyondR) + 'R past the trigger: chasing'; return s; }
+  s.state = s.side === 'LONG' ? 'BUY' : 'SHORT';
+  s.why = 'broke the 5-minute range ' + (s.side === 'LONG' ? 'high' : 'low') + ' ' + dayR2_(s.trigger) + ' on RVOL ' + dayR2_(rv) + (gap != null ? ', gap ' + dayR2_(gap) + '%' : '');
+  return s;
+}
+
+// Shares: risk-based, capped by buying power per position (account x leverage / maxPositions).
+function daySize_(account, cfg, price, R, leverage) {
+  if (!(account > 0) || !(price > 0) || !(R > 0)) return 0;
+  const byRisk = Math.floor(account * cfg.riskPct / 100 / R);
+  const byCap = Math.floor(account * (leverage || 1) / cfg.maxPositions / price);
+  return Math.max(0, Math.min(byRisk, byCap));
+}
+
+// A position you hold (qty > 0 long, < 0 short). Stop = entry -/+ 1R, moves to break-even after +1R (and stays).
+function dayHeldAction_(h, price, base, nowM, closeM, cfg, todayYmd) {
+  const R = base && base.atr ? Math.max(cfg.stopAtrFrac * base.atr, 0.01) : null;
+  const sign = h.qty >= 0 ? 1 : -1;
+  const out = { R: R, sign: sign };
+  if (!(h.entry > 0)) { out.action = 'HOLD'; out.why = 'no Entry price typed'; return out; }
+  out.pl = (price - h.entry) * h.qty;
+  out.plPct = (price - h.entry) / h.entry * 100 * sign;
+  if (R == null) { out.action = nowM >= closeM - cfg.closeBeforeMin ? 'CLOSE' : 'HOLD'; out.why = 'no ATR: stop not computed'; return out; }
+  out.r = (price - h.entry) * sign / R;
+  out.stop = h.entry - sign * R;
+  out.target = h.entry + sign * cfg.targetR * R;
+  const carried = h.entryYmd && h.entryYmd < todayYmd;
+  if (nowM >= closeM - cfg.closeBeforeMin) { out.action = 'CLOSE'; out.why = 'end of day: flat before the close' + (carried ? ' (carried from ' + h.entryYmd + ')' : ''); return out; }
+  if (carried) { out.action = 'CLOSE'; out.why = 'opened ' + h.entryYmd + ': this tab is same-day only'; return out; }
+  if (out.r >= 1) out.stop = h.entry;                              // break-even after +1R
+  if ((out.stop - price) * sign >= 0) { out.action = 'STOP'; out.why = 'price ' + dayR2_(price) + ' hit the stop ' + dayR2_(out.stop) + (out.r >= 0 ? ' (break-even)' : ''); return out; }
+  if (out.r >= cfg.targetR) { out.action = 'TARGET'; out.why = dayR2_(out.r) + 'R: take profit or trail the stop up to the last 5-minute low'; return out; }
+  if (nowM >= closeM - 30) { out.action = 'CLOSE SOON'; out.why = 'within 30 minutes of the close'; return out; }
+  out.action = 'HOLD'; out.why = dayR2_(out.r) + 'R, stop ' + dayR2_(out.stop);
+  return out;
+}
+
+// What the signal would have done today. regBars: today's regular-session 5m bars ascending. Pessimistic: if a bar could have both triggered
+// the entry and hit the stop, the stop wins; stop fills at the stop (or the open if it gapped through); exit at the close otherwise.
+function dayReplay_(regBars, sig, cfg) {
+  const sign = sig.side === 'LONG' ? 1 : -1, R = sig.R, lateM = dayMinutes_(cfg.entryCutoff), orEnd = DAY_OPEN_M + cfg.orMinutes;
+  let entry = null, stop = null, exit = null, reason = '', mfe = 0;
+  for (let i = 0; i < regBars.length; i++) {
+    const b = regBars[i];
+    if (b.m < orEnd) continue;
+    if (entry == null) {
+      if (b.m > lateM) break;
+      const hit = sign === 1 ? b.h >= sig.trigger : b.l <= sig.trigger;
+      if (!hit) continue;
+      entry = sign === 1 ? Math.max(b.o, sig.trigger) : Math.min(b.o, sig.trigger);
+      entry += sign * cfg.slipPerShare;
+      stop = sig.trigger - sign * R;
+      if ((sign === 1 && b.l <= stop) || (sign === -1 && b.h >= stop)) { exit = stop - sign * cfg.slipPerShare; reason = 'STOP'; break; }
+      mfe = Math.max(mfe, ((sign === 1 ? b.h : -b.l) - (sign === 1 ? entry : -entry)) / R);
+      continue;
+    }
+    if ((sign === 1 && b.l <= stop) || (sign === -1 && b.h >= stop)) {
+      const gapped = (sign === 1 && b.o < stop) || (sign === -1 && b.o > stop);
+      exit = (gapped ? b.o : stop) - sign * cfg.slipPerShare; reason = 'STOP'; break;
+    }
+    mfe = Math.max(mfe, sign === 1 ? (b.h - entry) / R : (entry - b.l) / R);
+  }
+  if (entry == null) return { taken: false };
+  if (exit == null) { const last = regBars[regBars.length - 1]; exit = last.c - sign * cfg.slipPerShare; reason = 'CLOSE'; }
+  return { taken: true, entry: entry, exit: exit, reason: reason, r: (exit - entry) * sign / R, pnlPct: (exit - entry) * sign / entry * 100, mfeR: mfe };
+}
+
+function dayStats_(rows) {
+  const done = rows.filter(function (r) { return r.taken && isFinite(r.r); });
+  if (!done.length) return { n: 0 };
+  const wins = done.filter(function (r) { return r.r > 0; });
+  const bucket = function (lo, hi) {
+    const b = done.filter(function (r) { return r.score >= lo && r.score < hi; });
+    return { n: b.length, avgR: b.length ? dayMean_(b.map(function (r) { return r.r; })) : null, win: b.length ? b.filter(function (r) { return r.r > 0; }).length / b.length : null };
+  };
+  return { n: done.length, win: wins.length / done.length, avgR: dayMean_(done.map(function (r) { return r.r; })),
+    avgWinR: wins.length ? dayMean_(wins.map(function (r) { return r.r; })) : null,
+    avgLossR: done.length - wins.length ? dayMean_(done.filter(function (r) { return r.r <= 0; }).map(function (r) { return r.r; })) : null,
+    b0: bucket(0, 50), b50: bucket(50, 65), b65: bucket(65, 101) };
+}
+
+/* ============================================================================
+ * SETUP / MENU / SCHEDULE
+ * ========================================================================== */
+
+function setupDay() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(DAY_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(DAY_SHEET_NAME);
+  dayWriteHeaders_(sheet);
+  if (!ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'dayAddMenu_'; })) ScriptApp.newTrigger('dayAddMenu_').forSpreadsheet(ss).onOpen().create();
+  try { dayAddMenu_(); } catch (e) { /* appears on next open */ }
+  notify_(tryGetUi_(), 'Day tab set up',
+    'Created the Day tab. Menu "⚡ Day" appears after you reload the sheet.\n\nNext:\n  1. ⚡ Day > Set Account Size\n  2. ⚡ Day > Debug One Ticker (try NVDA): confirms the intraday data source works\n' +
+    '  3. ⚡ Day > Run Scan Now\n  4. ⚡ Day > Start Schedule (every ' + DAY_CONFIG.tickMinutes + ' min, only acts 8:30-16:10 ET on trading days)\n\n' +
+    'Type Ticker / Entry Date / Entry / Qty on a row for a trade you took (Qty negative for a short). The tab then manages it: STOP, TARGET, CLOSE.');
+}
+
+function dayAddMenu_() {
+  SpreadsheetApp.getUi().createMenu('⚡ Day')
+    .addItem('Run Scan Now', 'dayScanNow_')
+    .addItem('Set Account Size…', 'daySetAccount_')
+    .addItem('Add Extra Tickers…', 'dayAddExtraTickers_')
+    .addSeparator()
+    .addItem('▶ Start Schedule', 'startDaySchedule_')
+    .addItem('■ Stop Schedule', 'stopDaySchedule_')
+    .addItem('Schedule Status', 'dayScheduleStatus_')
+    .addSeparator()
+    .addItem('Day Stats (paper results)', 'dayShowStats_')
+    .addItem('Replay Today Now', 'dayEodNow_')
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Debug').addItem('One Ticker (full trail)', 'debugDayOneTicker'))
+    .addToUi();
+}
+
+function dayHeaderMap_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const rng = sheet.getRange(1, 1, 1, lastCol);
+  const vals = rng.getValues()[0], forms = rng.getFormulas()[0];
+  const known = {}; DAY_HEADERS.forEach(function (h) { known[h] = true; });
+  const map = {};
+  vals.forEach(function (v, i) {
+    const k = String(v == null ? '' : v).trim();
+    if (known[k] && k !== 'Entry' && k !== 'P/L $' && !map[k]) map[k] = i + 1;
+    // header cells that hold your formula: =sumproduct( is Entry, =sum( is P/L $
+    if (!map.Entry && /^=\s*sumproduct\s*\(/i.test(forms[i] || '')) map.Entry = i + 1;
+    else if (!map['P/L $'] && /^=\s*sum\s*\(/i.test(forms[i] || '')) map['P/L $'] = i + 1;
+  });
+  if (!map.Entry) vals.forEach(function (v, i) { if (!map.Entry && String(v).trim() === 'Entry') map.Entry = i + 1; });
+  if (!map['P/L $']) vals.forEach(function (v, i) { if (!map['P/L $'] && String(v).trim() === 'P/L $') map['P/L $'] = i + 1; });
+  return map;
+}
+
+function dayColLetter_(c) { let s = ''; while (c > 0) { const r = (c - 1) % 26; s = String.fromCharCode(65 + r) + s; c = Math.floor((c - 1) / 26); } return s; }
+
+// Written once, on an empty sheet. After that your layout rules: the scan follows the labels in row 1.
+function dayWriteHeaders_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  if (sheet.getRange(1, 1, 1, lastCol).getValues()[0].some(function (v) { return String(v || '').trim() !== ''; })) return;
+  const n = DAY_HEADERS.length, plc = DAY_HEADERS.indexOf('P/L $') + 1;
+  DAY_HEADERS.forEach(function (h, i) { if (i !== DAY_ENTRY_COL - 1 && i !== plc - 1) sheet.getRange(1, i + 1).setValue(h); });
+  const e1 = sheet.getRange(1, DAY_ENTRY_COL); e1.setFormula(DAY_ENTRY_FORMULA);
+  const p1 = sheet.getRange(1, plc); p1.setFormula('=sum(' + dayColLetter_(plc) + '2:' + dayColLetter_(plc) + '92)');
+  const rng = sheet.getRange(1, 1, 1, n);
+  rng.setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3');           // same look as Flip: orange = you type, green = script
+  [1, 4, 6].forEach(function (c) { sheet.getRange(1, c).setBackground('#fff2cc'); });
+  [e1, p1].forEach(function (c) { c.setBackground('#00ff00').setFontSize(9).setHorizontalAlignment('center').setNumberFormat('0'); });
+  sheet.getRange(1, 2, 1, 2).setHorizontalAlignment('center'); sheet.getRange(1, 6).setHorizontalAlignment('center');
+  [59, 51, 58, 55, 58, 38, 72].forEach(function (w, i) { sheet.setColumnWidth(i + 1, w); });
+  sheet.setRowHeight(1, 29); sheet.setFrozenRows(1); sheet.setFrozenColumns(1);
+}
+
+function daySetAccount_() {
+  const ui = SpreadsheetApp.getUi(), props = PropertiesService.getScriptProperties();
+  const r = ui.prompt('Account size for sizing', 'Dollars you trade with (used for the Size column: 1% risk per trade, max 1/5 of the account per position).\nCurrent: ' + (props.getProperty('DAY_ACCOUNT') || DAY_CONFIG.defaultAccount) +
+    '\n\nLeverage: add " x2" or " x4" after the number only if your broker really gives that intraday buying power, e.g. "10000 x4".', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const m = r.getResponseText().replace(/[,$]/g, '').match(/^\s*([\d.]+)\s*(?:x\s*([\d.]+))?\s*$/i);
+  if (!m || !(parseFloat(m[1]) > 0)) { notify_(ui, 'Day', 'Not understood. Example: 10000 or 10000 x4'); return; }
+  props.setProperty('DAY_ACCOUNT', m[1]); props.setProperty('DAY_LEVERAGE', m[2] ? m[2] : '1');
+  notify_(ui, 'Day', 'Account ' + m[1] + ', leverage x' + (m[2] || '1') + ' saved.');
+}
+function dayAccount_() {
+  const p = PropertiesService.getScriptProperties();
+  return { account: parseFloat(p.getProperty('DAY_ACCOUNT')) || DAY_CONFIG.defaultAccount, leverage: parseFloat(p.getProperty('DAY_LEVERAGE')) || 1 };
+}
+function dayAddExtraTickers_() {
+  const ui = SpreadsheetApp.getUi(), props = PropertiesService.getScriptProperties();
+  const r = ui.prompt('Extra tickers for the Day scan', 'Comma-separated, added to the built-in universe (replaces the old extra list).\nCurrent: ' + (props.getProperty('DAY_EXTRA') || '(none)'), ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const list = r.getResponseText().toUpperCase().split(/[\s,;]+/).filter(function (x) { return /^[A-Z.\-]{1,6}$/.test(x); });
+  props.setProperty('DAY_EXTRA', list.join(','));
+  notify_(ui, 'Day', 'Extra tickers saved: ' + (list.join(', ') || '(none)'));
+}
+
+function dayRemoveTriggers_() { let n = 0; ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === DAY_TICK_FN) { ScriptApp.deleteTrigger(t); n++; } }); return n; }
+function startDaySchedule_() {
+  dayRemoveTriggers_();
+  ScriptApp.newTrigger(DAY_TICK_FN).timeBased().everyMinutes(DAY_CONFIG.tickMinutes).create();
+  notify_(tryGetUi_(), 'Day schedule started', 'Runs every ' + DAY_CONFIG.tickMinutes + ' minutes but only works 8:30-16:10 ET on trading days (pre-market list, 9:36 full scan, then the shortlist and your positions, 16:05 paper replay).');
+}
+function stopDaySchedule_() { notify_(tryGetUi_(), 'Day schedule', 'Stopped (' + dayRemoveTriggers_() + ' trigger(s) removed).'); }
+function dayScheduleStatus_() {
+  const p = PropertiesService.getScriptProperties();
+  const on = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === DAY_TICK_FN; }).length;
+  const a = dayAccount_();
+  notify_(tryGetUi_(), 'Day schedule status', 'Schedule: ' + (on ? 'ON' : 'OFF') + '\nLast pre-market scan: ' + (p.getProperty('DAY_LAST_PRE') || 'never') + '\nLast full scan: ' + (p.getProperty('DAY_LAST_FULL') || 'never') +
+    '\nLast paper replay: ' + (p.getProperty('DAY_LAST_EOD') || 'never') + '\nAccount: ' + a.account + ' x' + a.leverage + '\nPhone alerts: ' + (getAlertConfig_().ready ? 'ready' : 'NOT set up (menu: Quick and Leap > Phone Alerts)'));
+}
+
+/* ============================================================================
+ * DATA
+ * ========================================================================== */
+
+function dayUniverse_() {
+  const set = {};
+  const add = function (arr) { (arr || []).forEach(function (t) { const s = String(t || '').trim().toUpperCase(); if (/^[A-Z.\-]{1,6}$/.test(s)) set[s] = true; }); };
+  try { if (typeof RESEARCH_UNIVERSE !== 'undefined') add(RESEARCH_UNIVERSE); } catch (e) { /* optional */ }
+  try { if (typeof CSP_STOCK_UNIVERSE !== 'undefined') add(CSP_STOCK_UNIVERSE); } catch (e) { /* optional */ }
+  try { if (typeof FLIP_UNIVERSE !== 'undefined') add(FLIP_UNIVERSE); } catch (e) { /* optional */ }
+  try { if (typeof LONG_STOCK_UNIVERSE !== 'undefined') add(LONG_STOCK_UNIVERSE); } catch (e) { /* optional */ }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ['Quick', 'Leap', 'Research', 'CSP', 'Flip', 'Long'].forEach(function (name) {
+    try {
+      const sh = ss.getSheetByName(name);
+      if (!sh || sh.getLastRow() < 2) return;
+      const hdr = sh.getRange(1, 1, 1, Math.min(sh.getLastColumn(), 6)).getValues()[0];
+      let c = hdr.indexOf('Ticker'); if (c < 0) c = 0;
+      add(sh.getRange(2, c + 1, sh.getLastRow() - 1, 1).getValues().map(function (r) { return r[0]; }));
+    } catch (e) { /* skip */ }
+  });
+  add((PropertiesService.getScriptProperties().getProperty('DAY_EXTRA') || '').split(','));
+  add(['SPY', 'QQQ']);
+  return Object.keys(set);
+}
+
+// one Yahoo call: today's session only (live ticks) or the full month (baseline).
+function dayFetchBars_(ticker, full) {
+  const range = full ? '1mo' : '1d';
+  const hosts = ['query1', 'query2'];
+  for (let h = 0; h < hosts.length; h++) {
+    try {
+      const resp = UrlFetchApp.fetch('https://' + hosts[h] + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=' + range + '&interval=5m&includePrePost=true',
+        { method: 'get', muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' } });
+      if (resp.getResponseCode() !== 200) continue;
+      const r = (JSON.parse(resp.getContentText()).chart || {}).result;
+      const bars = dayParseBars_(r && r[0]);
+      if (bars.length) return bars;
+    } catch (e) { Logger.log('day bars ' + ticker + ': ' + e); }
+  }
+  return null;
+}
+
+// Baseline (prior sessions) cached for the day so live ticks only need today's small call.
+function dayBaselineFor_(ticker, todayYmd, bars) {
+  const cache = CacheService.getScriptCache(), key = 'DAYB2_' + todayYmd + '_' + ticker;
+  if (!bars) { const hit = cache.get(key); if (hit) { try { return JSON.parse(hit); } catch (e) { /* refetch */ } } return null; }
+  const b = dayBaseline_(bars, todayYmd, DAY_CONFIG.orMinutes);
+  if (b) {
+    const slim = {}; Object.keys(b).forEach(function (k) { if (k !== 'prePast') slim[k] = b[k]; });
+    try { cache.put(key, JSON.stringify(slim), 6 * 3600); } catch (e) { /* too big: ignore */ }
+  }
+  return b;
+}
+
+// Live prices for many stocks at once. { SYM: { price, prevClose, bid, ask } }
+function dayQuotes_(tickers, token) {
+  const out = {};
+  if (!token) return out;
+  for (let i = 0; i < tickers.length; i += 40) {
+    const chunk = tickers.slice(i, i + 40);
+    try {
+      const resp = fetchTastyWithRetry_('https://api.tastyworks.com/market-data/by-type?' + chunk.map(function (s) { return 'equity=' + encodeURIComponent(s); }).join('&'), token);
+      if (resp.getResponseCode() !== 200) continue;
+      (((JSON.parse(resp.getContentText()).data) || {}).items || []).forEach(function (it) {
+        const f = function (v) { const x = v != null ? parseFloat(v) : NaN; return isNaN(x) ? null : x; };
+        const bid = f(it.bid), ask = f(it.ask), last = f(it.last), mark = f(it.mark);
+        const price = last > 0 ? last : (mark > 0 ? mark : (bid > 0 && ask > 0 ? (bid + ask) / 2 : null));
+        const pc = f(it['prev-close'] != null ? it['prev-close'] : (it['previous-close'] != null ? it['previous-close'] : it['close-price']));
+        if (it.symbol && price) out[String(it.symbol).toUpperCase()] = { price: price, prevClose: pc, bid: bid, ask: ask };
+      });
+    } catch (e) { Logger.log('day quotes: ' + e); }
+  }
+  return out;
+}
+
+function dayCatalysts_(todayYmd, fromYmd) {
+  const out = {};
+  try {
+    const key = getFinnhubApiKey_();
+    if (!key) return out;
+    const resp = fetchWithRetry_(FINNHUB_BASE_URL + '/calendar/earnings?from=' + fromYmd + '&to=' + todayYmd + '&token=' + encodeURIComponent(key), { method: 'get', muteHttpExceptions: true, headers: { Accept: 'application/json' } }, 2, 800);
+    if (resp.getResponseCode() !== 200) return out;
+    ((JSON.parse(resp.getContentText()).earningsCalendar) || []).forEach(function (e) {
+      if (!e.symbol || !e.date) return;
+      if (e.date === todayYmd && e.hour === 'bmo') out[String(e.symbol).toUpperCase()] = 'earnings today (before open)';
+      else if (e.date < todayYmd && e.hour === 'amc') out[String(e.symbol).toUpperCase()] = 'earnings last evening';
+    });
+  } catch (e) { Logger.log('day catalysts: ' + e); }
+  return out;
+}
+
+// Near-the-money option on the signal side (same-day or nearest expiry). Returns text or ''.
+function dayOptionHint_(ticker, side, price, token) {
+  try {
+    const chain = fetchTastyOptionChainNested_(ticker, token);
+    if (!chain) return '';
+    const today = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+    const exp = chain.filter(function (e) { return Utilities.formatDate(e.date, 'America/New_York', 'yyyy-MM-dd') >= today; })[0];
+    if (!exp) return '';
+    let best = null;
+    exp.strikes.forEach(function (s) { if (!best || Math.abs(s.strike - price) < Math.abs(best.strike - price)) best = s; });
+    const sym = best && (side === 'LONG' ? best.callSymbol : best.putSymbol);
+    if (!sym) return '';
+    const q = fetchTastyMarketDataBatch_([sym], token);
+    const m = q && q[sym];
+    if (!m || !(m.ask > 0)) return (side === 'LONG' ? 'C ' : 'P ') + best.strike + ' ' + Utilities.formatDate(exp.date, 'America/New_York', 'MMMd') + ' (no quote)';
+    const sp = m.bid > 0 ? (m.ask - m.bid) / ((m.ask + m.bid) / 2) * 100 : null;
+    return (side === 'LONG' ? 'C ' : 'P ') + best.strike + ' ' + Utilities.formatDate(exp.date, 'America/New_York', 'MMMd') + ' ask ' + dayR2_(m.ask) + (sp != null ? ' spread ' + dayR2_(sp) + '%' : '') + (sp != null && sp > 10 ? ' WIDE' : '');
+  } catch (e) { return ''; }
+}
+
+/* ============================================================================
+ * THE SCAN
+ * ========================================================================== */
+
+function dayNowParts_(now) {
+  const ymd = Utilities.formatDate(now, 'America/New_York', 'yyyy-MM-dd');
+  return { ymd: ymd, m: dayMinutes_(Utilities.formatDate(now, 'America/New_York', 'HH:mm')), dow: Utilities.formatDate(now, 'America/New_York', 'u'),
+    closeM: US_MARKET_EARLY_CLOSES[ymd] ? 780 : DAY_CLOSE_M };
+}
+function dayReadHeld_(sheet, map) {
+  const held = {};
+  const n = sheet.getLastRow() - 1;
+  if (n < 1 || !map.Ticker || !map.Qty) return held;
+  const top = Math.max.apply(null, [map.Ticker, map.Qty, map['Entry Date'] || 1, map.Entry || 1]);
+  sheet.getRange(2, 1, n, top).getValues().forEach(function (r) {
+    const t = String(r[map.Ticker - 1] || '').trim().toUpperCase(), qty = Number(r[map.Qty - 1]);
+    if (!t || !qty || held[t]) return;
+    const ed = map['Entry Date'] ? r[map['Entry Date'] - 1] : '';
+    let ymd = '';
+    if (ed instanceof Date) ymd = Utilities.formatDate(ed, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+    held[t] = { qty: qty, entry: map.Entry ? Number(r[map.Entry - 1]) : 0, entryDate: ed, entryYmd: ymd };
+  });
+  return held;
+}
+
+// mode: 'PRE' (watch list, full month of bars), 'FULL' (at the open: rank everything), 'LIVE' (shortlist + your positions)
+function dayRun_(mode, opts) {
+  opts = opts || {};
+  const startMs = Date.now(), C = DAY_CONFIG;
+  const ui = opts.quiet ? null : tryGetUi_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet(), sheet = ss.getSheetByName(DAY_SHEET_NAME);
+  if (!sheet) { notify_(ui, 'Day', 'No "' + DAY_SHEET_NAME + '" tab. Run setupDay once from the Apps Script editor.'); return null; }
+  const props = PropertiesService.getScriptProperties();
+  const running = parseInt(props.getProperty('DAY_RUNNING') || '0', 10);
+  if (running && Date.now() - running < 8 * 60000) { notify_(ui, 'Day', 'A scan is already running.'); return null; }
+  props.setProperty('DAY_RUNNING', String(Date.now()));
+  try {
+    dayWriteHeaders_(sheet);
+    const now = new Date(), np = dayNowParts_(now), acct = dayAccount_();
+    const token = getTastyTradeAccessToken_();
+    if (!token) { notify_(ui, 'Day', 'No TastyTrade token (see ScriptLog).'); return null; }
+    const map0 = dayHeaderMap_(sheet);
+    const held0 = dayReadHeld_(sheet, map0);
+    let short = {};
+    try { const s = JSON.parse(props.getProperty('DAY_SHORT') || '{}'); if (s.ymd === np.ymd) short = s; } catch (e) { short = {}; }
+
+    // which names to look at
+    let names;
+    if (mode === 'LIVE') {
+      names = Object.keys(held0).concat((short.list || []).map(function (x) { return x.t; })).concat(['SPY', 'QQQ']);
+    } else {
+      const uni = dayUniverse_();
+      names = Object.keys(held0).concat(uni);
+    }
+    const seen = {}; names = names.filter(function (t) { if (seen[t]) return false; seen[t] = true; return true; }).slice(0, C.maxNames);
+    const quotes = dayQuotes_(names, token);
+    const prevTrading = Utilities.formatDate(new Date(now.getTime() - 4 * 86400000), 'America/New_York', 'yyyy-MM-dd');
+    const cats = mode === 'LIVE' ? (short.cats || {}) : dayCatalysts_(np.ymd, prevTrading);
+
+    const full = mode !== 'LIVE';
+    const res = {}, counts = {};
+    let timedOut = false;
+    for (let i = 0; i < names.length; i++) {
+      if (Date.now() - startMs > C.timeBudgetMs) { timedOut = true; break; }
+      const t = names[i];
+      // history call only when the day's baseline is not cached yet (or in PRE / FULL); live ticks fetch just today
+      let base = full ? null : dayBaselineFor_(t, np.ymd, null);
+      const needHistory = full || !base;
+      let bars = dayFetchBars_(t, needHistory);
+      if (bars && needHistory) base = dayBaselineFor_(t, np.ymd, bars);
+      if (!bars) { res[t] = { t: t, state: 'SKIP', why: 'no intraday data from Yahoo' }; continue; }
+      const td = dayToday_(bars, np.ymd, np.m, C.orMinutes, base);
+      const q = quotes[t];
+      const price = q && q.price ? q.price : td.last;
+      res[t] = { t: t, base: base, td: td, price: price, q: q };
+      Utilities.sleep(C.sleepMs);
+    }
+
+    // tape from SPY + QQQ: both above (below) VWAP and their opening candles agree
+    const tapeOf = function (t) { const r = res[t]; if (!r || !r.td || r.td.vwap == null || !r.price) return 0; return r.price > r.td.vwap ? 1 : -1; };
+    const tapeSum = tapeOf('SPY') + tapeOf('QQQ');
+    const tape = np.m < DAY_OPEN_M ? ((res.SPY && res.SPY.td && res.SPY.td.gapPct != null && res.QQQ && res.QQQ.td) ? (res.SPY.td.gapPct + (res.QQQ.td.gapPct || 0) > 0.3 ? 'UP' : (res.SPY.td.gapPct + (res.QQQ.td.gapPct || 0) < -0.3 ? 'DOWN' : 'FLAT')) : 'FLAT') : (tapeSum >= 2 ? 'UP' : (tapeSum <= -2 ? 'DOWN' : 'FLAT'));
+
+    const rows = [];
+    names.forEach(function (t) {
+      const r = res[t];
+      if (!r) return;
+      const row = { Ticker: t, LastRun: now, Tape: tape };
+      const h = held0[t];
+      if (!r.base) { row.Action = h ? 'HOLD' : 'SKIP'; row.Why = r.why || 'no history'; row.SortKey = h ? 9000 : 10; if (r.price) row.Price = dayR2_(r.price); rows.push(row); return; }
+      const price = r.price, td = r.td;
+      row.Price = dayR2_(price);
+      const pc = (r.q && r.q.prevClose) || r.base.prevClose;
+      if (pc) row.Change = dayR2_(price - pc);
+      row['Prev Close'] = dayR2_(r.base.prevClose);
+      row['ATR %'] = dayR2_(r.base.atr / price * 100);
+      if (td.gapPct != null) row['Gap %'] = dayR2_(td.gapPct);
+      if (td.rvol != null) row.RVOL = dayR2_(td.rvol);
+      if (td.preRvol != null) row['Pre RVOL'] = dayR2_(td.preRvol);
+      if (td.vwap) row['VW %'] = dayR2_((price / td.vwap - 1) * 100);
+      if (td.orDone) { row['OR High'] = dayR2_(td.orH); row['OR Low'] = dayR2_(td.orL); }
+      if (td.preHigh != null) { row['Pre High'] = dayR2_(td.preHigh); row['Pre Low'] = dayR2_(td.preLow); }
+      if (r.q && r.q.bid > 0 && r.q.ask > 0) row['Spread %'] = dayR2_((r.q.ask - r.q.bid) / price * 100);
+      if (cats[t]) row.Catalyst = cats[t];
+      const sg = daySignal_(r.base, td, price, np.m, C, tape, cats[t] || '');
+      r.sig = sg;
+      if (t === 'SPY' || t === 'QQQ') { row.Action = 'TAPE'; row.Why = 'market gauge: ' + tape; row.SortKey = 5; rows.push(row); return; }
+      row.Side = sg.side; row.Setup = sg.setup; row.Score = dayR2_(sg.score);
+      if (sg.trigger != null) row.Trigger = dayR2_(sg.trigger);
+      if (sg.stop != null) { row.Stop = dayR2_(sg.stop); row.Target = dayR2_(sg.target); }
+      if (sg.R && sg.state !== 'SKIP') { const sz = daySize_(acct.account, C, price, sg.R, acct.leverage); row.Size = sz; }
+      row.Action = sg.state; row.Why = sg.why;
+      row.SortKey = ({ BUY: 5000, SHORT: 5000, WAIT: 3000, WATCH: 3000, FORMING: 2500, LATE: 1500, 'NO NEW': 1000, FAILED: 500, SKIP: 100 })[sg.state] + sg.score;
+      if (h) {
+        const ha = dayHeldAction_({ qty: h.qty, entry: h.entry, entryYmd: h.entryYmd }, price, r.base, np.m, np.closeM, C, np.ymd);
+        row.Action = ha.action; row.Why = ha.why; row.Side = h.qty > 0 ? 'LONG' : 'SHORT';
+        if (ha.stop != null) { row.Stop = dayR2_(ha.stop); row.Target = dayR2_(ha.target); }
+        if (ha.pl != null) { row['P/L $'] = dayR2_(ha.pl); row['P/L %'] = dayR2_(ha.plPct); row.R = dayR2_(ha.r); }
+        row.Size = ''; row.SortKey = 9000 + (({ CLOSE: 5, STOP: 4, TARGET: 3, 'CLOSE SOON': 2 })[ha.action] || 0);
+        row._held = ha;
+      }
+      rows.push(row);
+    });
+
+    // shortlist: at the open (FULL) fix the day's list; keep the best candidates for the live ticks
+    if (mode === 'FULL' && np.m >= DAY_OPEN_M + C.orMinutes) {
+      const cand = rows.filter(function (r) { return r.Score != null && r.Score !== '' && ['BUY', 'SHORT', 'WAIT', 'LATE', 'NO NEW'].indexOf(r.Action) >= 0 && !held0[r.Ticker]; })
+        .sort(function (a, b) { return b.Score - a.Score; }).slice(0, C.shortlist);
+      short = { ymd: np.ymd, cats: cats, list: cand.map(function (r) {
+        const x = res[r.Ticker], sg = x.sig;
+        return { t: r.Ticker, side: sg.side, trigger: sg.trigger, R: sg.R, score: dayR2_(sg.score), rvol: r.RVOL, gap: r['Gap %'] };
+      }) };
+      props.setProperty('DAY_SHORT', JSON.stringify(short));
+      props.setProperty('DAY_LAST_FULL', np.ymd + ' ' + Utilities.formatDate(now, 'America/New_York', 'HH:mm'));
+    }
+    if (mode === 'PRE') props.setProperty('DAY_LAST_PRE', np.ymd + ' ' + Utilities.formatDate(now, 'America/New_York', 'HH:mm'));
+
+    // option hints on the best live signals only
+    if (C.optionHints && np.m >= DAY_OPEN_M) {
+      rows.filter(function (r) { return (r.Action === 'BUY' || r.Action === 'SHORT') && !held0[r.Ticker]; }).sort(function (a, b) { return b.Score - a.Score; }).slice(0, C.optionHintMax)
+        .forEach(function (r) { r.Option = dayOptionHint_(r.Ticker, r.Side, r.Price, token); });
+    }
+
+    // rows order: held first (9000+), then ranked; SPY/QQQ gauges last
+    rows.sort(function (a, b) { return (b.SortKey || 0) - (a.SortKey || 0); });
+    const shown = rows.filter(function (r) { return r.Action !== 'SKIP' || held0[r.Ticker]; });
+    const skipped = rows.length - shown.length;
+
+    // write by header label, as the sheet is now; re-read what you hold right before writing so a cell you just typed survives
+    const wmap = dayHeaderMap_(sheet);
+    const heldNow = dayReadHeld_(sheet, wmap);
+    shown.forEach(function (r) { const h = heldNow[r.Ticker]; if (h) { r['Entry Date'] = h.entryDate; r.Entry = h.entry || ''; r.Qty = h.qty; } });
+    // a name you hold that this run did not look at (timed out / not in names) still keeps its row
+    Object.keys(heldNow).forEach(function (t) { if (!shown.some(function (r) { return r.Ticker === t; })) shown.unshift({ Ticker: t, 'Entry Date': heldNow[t].entryDate, Entry: heldNow[t].entry, Qty: heldNow[t].qty, Action: 'HOLD', Why: 'not scanned this time', LastRun: now }); });
+    const labels = DAY_HEADERS.filter(function (h) { return wmap[h]; }).sort(function (a, b) { return wmap[a] - wmap[b]; });
+    const runs = [];
+    labels.forEach(function (h) { const lr = runs[runs.length - 1]; if (lr && wmap[h] === lr.start + lr.labels.length) lr.labels.push(h); else runs.push({ start: wmap[h], labels: [h] }); });
+    const last = sheet.getLastRow();
+    runs.forEach(function (run) {
+      if (last > 1) sheet.getRange(2, run.start, last - 1, run.labels.length).clearContent().clearNote();
+      if (!shown.length) return;
+      sheet.getRange(2, run.start, shown.length, run.labels.length).setValues(shown.map(function (r) { return run.labels.map(function (h) { return r[h] === undefined || r[h] === null ? '' : r[h]; }); }));
+    });
+    if (shown.length) dayFormat_(sheet, shown.length, wmap);
+
+    const alertNote = opts.alert === false ? '' : daySendAlerts_(mode, np, shown, held0, tape, short, opts);
+    const c = {}; shown.forEach(function (r) { c[r.Action] = (c[r.Action] || 0) + 1; });
+    const msg = (timedOut ? '⏱️ Stopped at the time limit.\n' : '') + mode + ' scan of ' + names.length + ' names, tape ' + tape + '\n' + Object.keys(c).map(function (k) { return k + ': ' + c[k]; }).join('   ') +
+      (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '');
+    logToSheet_('Day scan ' + msg.replace(/\n/g, ' | '));
+    notify_(ui, 'Day scan', msg);
+    return { mode: mode, rows: shown.length, timedOut: timedOut };
+  } finally {
+    props.deleteProperty('DAY_RUNNING');
+  }
+}
+
+function dayFormat_(sheet, n, map) {
+  const fmt = function (h, f) { if (map[h]) sheet.getRange(2, map[h], n, 1).setNumberFormat(f); };
+  const center = function (h) { if (map[h]) sheet.getRange(2, map[h], n, 1).setHorizontalAlignment('center'); };
+  fmt('Price', '$#,##0.00'); fmt('Change', '$#,##0.00;-$#,##0.00;$0.00'); fmt('Entry Date', 'm"/"d'); fmt('Entry', '$#,##0.00'); fmt('Qty', 'General');
+  ['Price', 'Change', 'Entry Date', 'Entry', 'Qty'].forEach(center);
+  ['Trigger', 'Stop', 'Target', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low'].forEach(function (h) { fmt(h, '$#,##0.00'); });
+  ['Gap %', 'VW %', 'ATR %', 'Spread %', 'P/L %'].forEach(function (h) { fmt(h, '0.00'); });
+  fmt('RVOL', '0.0'); fmt('Pre RVOL', '0.0'); fmt('Score', '0'); fmt('R', '0.0'); fmt('P/L $', '$#,##0.00;-$#,##0.00;$0.00'); fmt('LastRun', 'hh:mm');
+  if (map.Change) {
+    const rules = sheet.getConditionalFormatRules();
+    if (!rules.some(function (r) { const g = r.getRanges(); return g.length && g[0].getColumn() === map.Change && g[0].getNumColumns() === 1; })) {
+      const target = sheet.getRange(2, map.Change, Math.max(sheet.getMaxRows() - 1, 1), 1);
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([target]).build());
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(0).setFontColor('#1d7620').setRanges([target]).build());
+      sheet.setConditionalFormatRules(rules);
+    }
+  }
+  if (map.Action) {
+    const act = sheet.getRange(2, map.Action, n, 1).getValues();
+    const colors = { BUY: '#b7e1cd', SHORT: '#f4cccc', WATCH: '#fff2cc', WAIT: '#fff2cc', FORMING: '#fff2cc', LATE: '#eeeeee', 'NO NEW': '#eeeeee', FAILED: '#eeeeee', HOLD: '#cfe2f3',
+      STOP: '#e06666', TARGET: '#93c47d', CLOSE: '#f6b26b', 'CLOSE SOON': '#fce5cd', TAPE: '#d9d9d9' };
+    sheet.getRange(2, map.Action, n, 1).setBackgrounds(act.map(function (v) { return [colors[v[0]] || null]; }));
+  }
+}
+
+/* ============================================================================
+ * ALERTS (same phone setup as Quick / Flip / Earnings)
+ * ========================================================================== */
+
+function daySendAlerts_(mode, np, shown, held, tape, short, opts) {
+  const cfg = getAlertConfig_();
+  if (!cfg.ready) return 'phone alerts not set up';
+  const props = PropertiesService.getScriptProperties();
+  let st = {};
+  try { st = JSON.parse(props.getProperty('DAY_ALERT_STATE') || '{}'); } catch (e) { st = {}; }
+  if (st.ymd !== np.ymd) st = { ymd: np.ymd, keys: {} };
+  const lines = [], titleBits = [];
+  const once = function (k) { if (st.keys[k]) return false; st.keys[k] = 1; return true; };
+  const fmtSig = function (r) { return r.Ticker + ' ' + r.Action + ' @' + r.Trigger + ' stop ' + r.Stop + ' tgt ' + r.Target + ' size ' + r.Size + ' | RVOL ' + r.RVOL + ' gap ' + (r['Gap %'] === undefined ? '' : r['Gap %']) + '% | score ' + r.Score + (r.Option ? ' | ' + r.Option : ''); };
+  if (mode === 'PRE' && np.m >= 9 * 60 + 15 && once('brief')) {
+    const w = shown.filter(function (r) { return r.Action === 'WATCH'; }).slice(0, DAY_CONFIG.alertTopN);
+    titleBits.push('watch list');
+    lines.push('Tape ' + tape + '. Pre-market movers (real trigger is the 9:35 range):');
+    w.forEach(function (r) { lines.push(r.Ticker + ' ' + r.Side + ' gap ' + r['Gap %'] + '% preRVOL ' + r['Pre RVOL'] + (r.Catalyst ? ' [' + r.Catalyst + ']' : '') + ' score ' + r.Score); });
+    if (!w.length) lines.push('none');
+  }
+  if (np.m >= DAY_OPEN_M + DAY_CONFIG.orMinutes) {
+    shown.filter(function (r) { return (r.Action === 'BUY' || r.Action === 'SHORT') && !held[r.Ticker]; }).sort(function (a, b) { return b.Score - a.Score; }).slice(0, DAY_CONFIG.alertTopN).forEach(function (r) {
+      if (once('sig|' + r.Ticker + '|' + r.Side)) { titleBits.push(r.Action + ' ' + r.Ticker); lines.push(fmtSig(r)); }
+    });
+    shown.filter(function (r) { return held[r.Ticker]; }).forEach(function (r) {
+      if (['STOP', 'TARGET', 'CLOSE'].indexOf(r.Action) >= 0 && once('pos|' + r.Ticker + '|' + r.Action)) { titleBits.push(r.Action + ' ' + r.Ticker); lines.push(r.Ticker + ' ' + r.Action + ': ' + r.Why + ' | P/L $' + (r['P/L $'] === undefined ? '' : r['P/L $'])); }
+    });
+  }
+  if (!lines.length) { props.setProperty('DAY_ALERT_STATE', JSON.stringify(st)); return ''; }
+  const r = sendPhoneAlert_(cfg, 'Day: ' + titleBits.slice(0, 4).join(', '), lines.join('\n') + '\nNot advice. Flat by 15:50.', titleBits.some(function (b) { return /STOP|CLOSE|BUY|SHORT/.test(b); }));
+  if (!r.ok) { logToSheet_('Day alert failed: ' + r.detail); return 'alert failed (' + r.detail + ')'; }
+  props.setProperty('DAY_ALERT_STATE', JSON.stringify(st));
+  return 'alert sent (' + lines.length + ' line(s))';
+}
+
+/* ============================================================================
+ * SCHEDULE TICK
+ * ========================================================================== */
+
+function dayScheduledTick_() {
+  const now = new Date(), np = dayNowParts_(now);
+  if (np.dow === '6' || np.dow === '7' || US_MARKET_HOLIDAYS[np.ymd]) return;
+  const m = np.m, props = PropertiesService.getScriptProperties();
+  const running = parseInt(props.getProperty('DAY_RUNNING') || '0', 10);
+  if (running && Date.now() - running < 8 * 60000) return;
+  if (m < 8 * 60 + 30 || m > np.closeM + 15) return;
+  const last = function (k) { return props.getProperty(k) || ''; };
+  if (m < DAY_OPEN_M - 5) {                                           // 08:30-09:24: pre-market list a few times, brief at 09:15+
+    const lp = last('DAY_LAST_PRE_M');
+    const due = !lp || lp.indexOf(np.ymd) !== 0 || (m - parseInt(lp.split(' ')[1], 10) >= 25) || (m >= 9 * 60 + 15 && lp.split(' ')[2] !== 'B');
+    if (!due) return;
+    dayRun_('PRE', { quiet: true });
+    props.setProperty('DAY_LAST_PRE_M', np.ymd + ' ' + m + (m >= 9 * 60 + 15 ? ' B' : ''));
+    return;
+  }
+  if (m < DAY_OPEN_M + DAY_CONFIG.orMinutes + 1) return;               // 09:25-09:35: opening range is forming, nothing to compute yet
+  if (m <= np.closeM + 4 && m >= np.closeM) { return; }
+  if (m < np.closeM) {
+    if (last('DAY_LAST_FULL').indexOf(np.ymd) !== 0) { dayRun_('FULL', { quiet: true }); return; }
+    let short = {}; try { short = JSON.parse(props.getProperty('DAY_SHORT') || '{}'); } catch (e) { short = {}; }
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_SHEET_NAME);
+    const hasHeld = sheet ? Object.keys(dayReadHeld_(sheet, dayHeaderMap_(sheet))).length > 0 : false;
+    const lateM = dayMinutes_(DAY_CONFIG.entryCutoff);
+    if (m > lateM && !hasHeld) return;                                 // nothing left to manage: save quota
+    if (!hasHeld && (!short.list || !short.list.length)) return;
+    dayRun_('LIVE', { quiet: true });
+    return;
+  }
+  if (m >= np.closeM + 5 && last('DAY_LAST_EOD') !== np.ymd) dayEod_({ quiet: true });
+}
+
+/* ============================================================================
+ * END OF DAY: paper replay of the day's shortlist -> DayLog
+ * ========================================================================== */
+
+function dayEodNow_() { dayEod_({}); }
+function dayEod_(opts) {
+  const ui = opts && opts.quiet ? null : tryGetUi_();
+  const props = PropertiesService.getScriptProperties(), np = dayNowParts_(new Date());
+  let short = {}; try { short = JSON.parse(props.getProperty('DAY_SHORT') || '{}'); } catch (e) { short = {}; }
+  if (short.ymd !== np.ymd || !short.list || !short.list.length) { notify_(ui, 'Day replay', 'No shortlist was saved today (the 9:36 scan did not run), so nothing to replay.'); props.setProperty('DAY_LAST_EOD', np.ymd); return; }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let log = ss.getSheetByName(DAY_LOG_SHEET);
+  if (!log) { log = ss.insertSheet(DAY_LOG_SHEET); log.getRange(1, 1, 1, 13).setValues([['Date', 'Ticker', 'Side', 'Score', 'RVOL', 'Gap %', 'Trigger', 'Entry', 'Exit', 'Reason', 'R', 'MFE R', 'PnL %']]).setFontWeight('bold'); log.setFrozenRows(1); }
+  const existing = {}; if (log.getLastRow() > 1) log.getRange(2, 1, log.getLastRow() - 1, 2).getValues().forEach(function (r) { existing[String(r[0]).slice(0, 10) + '|' + r[1]] = 1; });
+  const out = [], lines = [];
+  short.list.forEach(function (s) {
+    if (existing[np.ymd + '|' + s.t]) return;
+    const bars = dayFetchBars_(s.t, false);
+    if (!bars) return;
+    const reg = bars.filter(function (b) { return b.ymd === np.ymd && b.m >= DAY_OPEN_M && b.m < DAY_CLOSE_M; });
+    if (reg.length < 20) return;
+    const rp = dayReplay_(reg, { side: s.side, trigger: s.trigger, R: s.R }, DAY_CONFIG);
+    out.push([np.ymd, s.t, s.side, s.score, s.rvol, s.gap, s.trigger, rp.taken ? dayR2_(rp.entry) : '', rp.taken ? dayR2_(rp.exit) : '', rp.taken ? rp.reason : 'NO ENTRY', rp.taken ? dayR2_(rp.r) : '', rp.taken ? dayR2_(rp.mfeR) : '', rp.taken ? dayR2_(rp.pnlPct) : '']);
+    if (rp.taken) lines.push(s.t + ' ' + s.side + ' ' + dayR2_(rp.r) + 'R (' + rp.reason + ')');
+    Utilities.sleep(DAY_CONFIG.sleepMs);
+  });
+  if (out.length) log.getRange(log.getLastRow() + 1, 1, out.length, 13).setValues(out);
+  props.setProperty('DAY_LAST_EOD', np.ymd);
+  const taken = out.filter(function (r) { return r[9] !== 'NO ENTRY'; });
+  const avgR = taken.length ? dayMean_(taken.map(function (r) { return Number(r[10]); })) : null;
+  const msg = 'Paper replay: ' + taken.length + ' of ' + out.length + ' shortlisted signals triggered; average ' + (avgR == null ? 'n/a' : dayR2_(avgR) + 'R') + '.\n' + lines.slice(0, 12).join('\n');
+  logToSheet_('Day replay ' + msg.replace(/\n/g, ' | '));
+  notify_(ui, 'Day replay', msg);
+  const cfg = getAlertConfig_();
+  if (cfg.ready && out.length && opts && opts.quiet) sendPhoneAlert_(cfg, 'Day paper replay', msg, false);
+}
+
+function dayShowStats_() {
+  const log = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_LOG_SHEET);
+  if (!log || log.getLastRow() < 2) { notify_(tryGetUi_(), 'Day stats', 'No paper results yet. They appear after the first trading day with the schedule on (16:05 replay).'); return; }
+  const rows = log.getRange(2, 1, log.getLastRow() - 1, 13).getValues().map(function (r) { return { taken: r[9] !== 'NO ENTRY' && r[10] !== '', score: Number(r[3]), r: Number(r[10]) }; });
+  const s = dayStats_(rows);
+  if (!s.n) { notify_(tryGetUi_(), 'Day stats', 'No triggered signals yet.'); return; }
+  const p = function (v) { return v == null ? 'n/a' : Math.round(v * 100) + '%'; };
+  const b = function (x) { return x.n + ' trades, avg ' + (x.avgR == null ? 'n/a' : dayR2_(x.avgR) + 'R') + ', win ' + p(x.win); };
+  notify_(tryGetUi_(), 'Day stats (paper, after slippage)',
+    s.n + ' triggered signals\nWin rate ' + p(s.win) + '   Avg R ' + dayR2_(s.avgR) + '   Avg win ' + dayR2_(s.avgWinR) + 'R   Avg loss ' + dayR2_(s.avgLossR) + 'R\n\nBy score:\n  under 50: ' + b(s.b0) + '\n  50-65: ' + b(s.b50) + '\n  65+: ' + b(s.b65) +
+    '\n\nRule of thumb: do not risk real money until there are 30+ triggered signals and the average R is clearly above zero.');
+}
+
+/* ============================================================================
+ * DEBUG
+ * ========================================================================== */
+
+function dayScanNow_() {
+  const np = dayNowParts_(new Date());
+  const mode = np.m < DAY_OPEN_M ? 'PRE' : (np.m < DAY_OPEN_M + DAY_CONFIG.orMinutes + 1 ? 'PRE' : 'FULL');
+  dayRun_(mode, { alert: false });
+}
+
+function debugDayOneTicker() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Day debug', 'Ticker:', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const t = r.getResponseText().trim().toUpperCase(), now = new Date(), np = dayNowParts_(now), lines = [];
+  const token = getTastyTradeAccessToken_();
+  lines.push('TastyTrade token: ' + (token ? 'ok' : 'MISSING'));
+  const bars = dayFetchBars_(t, true);
+  lines.push('Yahoo 5-minute bars (1 month, with pre/post): ' + (bars ? bars.length + ' bars, latest ' + bars[bars.length - 1].ymd + ' ' + dayHm_(bars[bars.length - 1].m) + ' ET' : 'FAILED'));
+  if (!bars) { ui.alert('Day debug: ' + t, lines.join('\n'), ui.ButtonSet.OK); return; }
+  const base = dayBaseline_(bars, np.ymd, DAY_CONFIG.orMinutes);
+  lines.push(base ? 'Baseline: prev close ' + dayR2_(base.prevClose) + ', ATR14 $' + dayR2_(base.atr) + ', avg volume ' + Math.round(base.avgVol) + ', avg opening-5-min volume ' + Math.round(base.baseOrVol) + ' (' + base.sessions + ' sessions)' : 'Baseline: not enough sessions');
+  const td = dayToday_(bars, np.ymd, np.m, DAY_CONFIG.orMinutes, base);
+  lines.push('Today: ' + td.n + ' bars; gap ' + dayR2_(td.gapPct) + '%; pre-mkt RVOL ' + dayR2_(td.preRvol) + '; opening range ' + (td.orDone ? dayR2_(td.orL) + ' - ' + dayR2_(td.orH) + ' RVOL ' + dayR2_(td.rvol) : 'not complete') + '; VWAP ' + dayR2_(td.vwap));
+  const q = dayQuotes_([t], token)[t];
+  lines.push('TastyTrade quote: ' + (q ? dayR2_(q.price) + ' (bid ' + q.bid + ' ask ' + q.ask + ')' : 'none (using last Yahoo bar)'));
+  if (base) {
+    const price = q ? q.price : td.last;
+    const sg = daySignal_(base, td, price, np.m, DAY_CONFIG, 'FLAT', '');
+    lines.push('Signal: ' + sg.state + (sg.side ? ' ' + sg.side : '') + ' score ' + dayR2_(sg.score) + (sg.trigger != null ? ' trigger ' + dayR2_(sg.trigger) : '') + (sg.stop != null ? ' stop ' + dayR2_(sg.stop) : '') + '\nWhy: ' + sg.why);
+  }
+  ui.alert('Day debug: ' + t, lines.join('\n'), ui.ButtonSet.OK);
+}

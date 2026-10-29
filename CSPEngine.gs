@@ -682,6 +682,12 @@ function cspResolveHeldPut_(ticker, expiry, strike, ctx) {
 function cspOpenAction_(o, cfg) {
   if (o.dte == null) return { action: '', why: '' };
   if (o.dte <= 0) return { action: 'EXPIRING', why: 'at or past expiry — check assignment' };
+  // Typo guard: a put whose strike is far below the stock cannot have paid a fat credit. When Strike / Expiry / Entry disagree like this,
+  // the mark and P/L belong to a different contract than the one you hold, so never call TAKE PROFIT (or anything else) from them.
+  if (o.spot != null && o.strike != null && o.credit != null && o.strike > 0 && o.strike < 0.65 * o.spot && o.credit / o.strike >= 0.02) {
+    return { action: 'REVIEW', why: 'CHECK STRIKE / ENTRY: strike ' + o.strike + ' is ' + round2_((1 - o.strike / o.spot) * 100) + '% below the stock (' + round2_(o.spot) + ') yet your credit ' + round2_(o.credit) +
+      ' is ' + round2_(o.credit / o.strike * 100) + '% of the strike; a put that far out of the money does not pay that. Strike, Expiry or Entry is probably mistyped, so the P/L shown is for the wrong contract' };
+  }
   if (o.pl != null && o.pl >= cfg.tp2Pct) return { action: 'TAKE PROFIT', why: 'captured ' + round2_(o.pl) + '% of credit (target ' + cfg.tp2Pct + '%)' };
   if (o.pl != null && o.pl >= cfg.tp1Pct) return { action: 'TAKE PROFIT', why: 'captured ' + round2_(o.pl) + '% of credit (quick target ' + cfg.tp1Pct + '%)' };
   if (o.spot != null && o.strike != null && o.spot < o.strike) {
@@ -1318,7 +1324,32 @@ function runCspScan(timeBudgetMsOverride, dryRun, opts) {
     cspApplyChangeRules_(sheet, map, true);
     // Sort whole rows (inputs travel with their outputs): take-profit, review, SELL, WAIT, SKIP.
     if (map['SortKey']) {
+      // Held rows are fingerprinted (ticker | Open Date | Entry) with their Strike / Expiry before the sort and checked after it. If a
+      // sort ever leaves a Strike or Expiry on the wrong row, it is put back and the before / after is written to ScriptLog.
+      const hk = function (r) { return [r[map['Ticker'] - 1], map['Open Date'] ? r[map['Open Date'] - 1] : '', map['Entry'] ? r[map['Entry'] - 1] : ''].map(function (v) { return v instanceof Date ? v.getTime() : String(v); }).join('|'); };
+      const snap = {};
+      try {
+        sheet.getRange(2, 1, data.length, width).getValues().forEach(function (r) {
+          if (Number(r[map['Open Qty'] - 1]) > 0) snap[hk(r)] = { strike: r[map['Strike'] - 1], expiry: r[map['Expiry'] - 1] };
+        });
+      } catch (e) { /* snapshot is best-effort */ }
       sheet.getRange(2, 1, data.length, width).sort({ column: map['SortKey'], ascending: false });
+      try {
+        const post = sheet.getRange(2, 1, data.length, width).getValues();
+        const fixes = [];
+        post.forEach(function (r, i) {
+          const sn = snap[hk(r)];
+          if (!sn) return;
+          const ts = function (v) { return v instanceof Date ? v.getTime() : String(v); };
+          if (ts(r[map['Strike'] - 1]) !== ts(sn.strike) || ts(r[map['Expiry'] - 1]) !== ts(sn.expiry)) fixes.push({ row: i + 2, t: r[map['Ticker'] - 1], was: [r[map['Strike'] - 1], r[map['Expiry'] - 1]], now: sn });
+        });
+        fixes.forEach(function (f) {
+          sheet.getRange(f.row, map['Strike']).setValue(f.now.strike);
+          sheet.getRange(f.row, map['Expiry']).setValue(f.now.expiry);
+          logToSheet_('CSP: Strike / Expiry of ' + f.t + ' (row ' + f.row + ') moved during the sort (was ' + f.was.join(' / ') + '); restored to ' + f.now.strike + ' / ' + f.now.expiry + '.');
+        });
+        if (fixes.length) notify_(ui, 'CSP', 'Restored Strike / Expiry on ' + fixes.length + ' held row(s) that the sort had mixed up (details in ScriptLog).');
+      } catch (e) { logToSheet_('CSP: post-sort check failed: ' + (e && e.message ? e.message : e)); }
     }
     cspFlushCache_(pending);
   }
