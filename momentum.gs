@@ -1494,6 +1494,7 @@ function onOpen() {
   // Research, Hedge and DeepDive live here: the daily actions at the top, the rest under More.
   const ui = SpreadsheetApp.getUi();
   mixedAddMenu_();
+  if (typeof txAddMenu_ === 'function') txAddMenu_();
 
   // Deep Dive has its own top-level menu (separate from Quick and Leap).
   ui.createMenu('🔬 Deep Dive')

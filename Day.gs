@@ -51,6 +51,9 @@ const DAY_CONFIG = {
   timeBudgetMs: 4.5 * 60 * 1000,
   optionHints: true,            // BUY / SHORT (and the best WAIT) rows also get an option to buy: call for LONG, put for SHORT
   optionHintMax: 6,
+  // Auto_Trade hand-off: BUY / SHORT rows that got an option plan are appended to the Auto_Trade tab for you to review.
+  // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
+  autoTrade: { enabled: false, sheet: 'Auto_Trade', status: 'Review', minQty: 1 },
   optMinDte: 2,                 // never the 0-1 day contract: theta and spreads are brutal; use the first expiry at least this many days out
   optTargetDelta: 0.60,         // slightly in the money: moves like the stock, less premium wasted on time value
   optMaxSpreadPct: 10,          // (ask-bid)/mid, unless the spread is 5 cents or less
@@ -365,6 +368,7 @@ function dayAddMenu_() {
     .addItem('Set Account Size…', 'daySetAccount_')
     .addItem('Add Extra Tickers…', 'dayAddExtraTickers_')
     .addItem('Add Option Columns (once)', 'dayAddOptionColumns_')
+    .addItem('Send Signals to Auto_Trade Now', 'dayPushNow_')
     .addSeparator()
     .addItem('▶ Start Schedule', 'startDaySchedule_')
     .addItem('■ Stop Schedule', 'stopDaySchedule_')
@@ -627,6 +631,89 @@ function dayOptionProposal_(ticker, side, price, R, token, acct) {
 }
 
 /* ============================================================================
+ * AUTO_TRADE HAND-OFF
+ * ========================================================================== */
+
+// Pure mapping: a Day row with an option plan -> the cell values of one Auto_Trade order. Returns null if it is not an order.
+function dayAutoTradeOrder_(r, minQty) {
+  if (!r || (r.Action !== 'BUY' && r.Action !== 'SHORT')) return null;
+  const oa = r['Opt Action'];
+  if (oa !== 'BUY CALL' && oa !== 'BUY PUT') return null;
+  const strike = Number(r['Opt Strike']), qty = Number(r['Opt Qty']), limit = Number(r['Opt Limit']);
+  if (!(strike > 0) || !(qty >= (minQty || 1)) || !(limit > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(String(r['Opt Expiry']))) return null;
+  const cp = oa === 'BUY CALL' ? 'C' : 'P';
+  return { ticker: String(r.Ticker).toUpperCase(), cp: cp, expiry: String(r['Opt Expiry']), strike: strike,
+    strikeText: '$' + (Math.round(strike * 100) / 100) + cp, orderType: 'BTO', lots: qty,
+    limit: Math.round(limit * 100) / 100, stop: Math.round(Number(r['Opt Stop']) * 100) / 100, target: Math.round(Number(r['Opt Target']) * 100) / 100 };
+}
+
+function dayAtHeaderMap_(sheet) {
+  const map = {};
+  sheet.getRange(1, 1, 1, Math.max(1, sheet.getLastColumn())).getValues()[0].forEach(function (h, i) {
+    const k = String(h || '').toLowerCase().replace(/[^a-z#]/g, '');
+    if (k && !map[k]) map[k] = i + 1;
+  });
+  return { rank: map.rank, ticker: map.ticker, expiry: map.expiry, strike: map.strike, type: map.ordertype, lots: map['#lot'] || map.lot || map.lots,
+    limit: map.limitprice || map.limit, stop: map.stoploss, profit: map.profitsell, status: map.status };
+}
+
+// Appends orders for BUY / SHORT rows. One order per ticker+side per day (a row you delete is not re-added). Returns a short note.
+function dayPushToAutoTrade_(rows, ymd) {
+  const A = DAY_CONFIG.autoTrade;
+  const orders = rows.map(function (r) { return dayAutoTradeOrder_(r, A.minQty); }).filter(Boolean);
+  if (!orders.length) return '';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(A.sheet);
+  if (!sh) return 'Auto_Trade: tab "' + A.sheet + '" not found';
+  const m = dayAtHeaderMap_(sh);
+  const need = ['ticker', 'expiry', 'strike', 'type', 'lots', 'limit'].filter(function (k) { return !m[k]; });
+  if (need.length) return 'Auto_Trade: header(s) not found: ' + need.join(', ');
+  const props = PropertiesService.getScriptProperties();
+  let st = {}; try { st = JSON.parse(props.getProperty('DAY_AT_PUSHED') || '{}'); } catch (e) {}
+  if (st.ymd !== ymd) st = { ymd: ymd, keys: [] };
+  const fresh = orders.filter(function (o) { return st.keys.indexOf(o.ticker + '|' + o.cp) < 0; });
+  if (!fresh.length) return '';
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) return 'Auto_Trade: busy, will retry next scan';
+  try {
+    // first empty row judged by the Ticker column (the tab has formulas / validation far below the data)
+    const tcol = sh.getRange(1, m.ticker, Math.max(2, sh.getLastRow()), 1).getValues();
+    let lastRow = 1; tcol.forEach(function (v, i) { if (String(v[0]).trim() !== '') lastRow = i + 1; });
+    let rank = 0; if (m.rank && lastRow > 1) sh.getRange(2, m.rank, lastRow - 1, 1).getValues().forEach(function (v) { if (Number(v[0]) > rank) rank = Number(v[0]); });
+    const tz = ss.getSpreadsheetTimeZone();
+    fresh.forEach(function (o) {
+      const row = ++lastRow;
+      if (lastRow > 2) sh.getRange(2, 1, 1, sh.getLastColumn()).copyTo(sh.getRange(row, 1, 1, sh.getLastColumn()), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+      const put = function (c, v) { if (c) sh.getRange(row, c).setValue(v); };
+      put(m.rank, ++rank); put(m.ticker, o.ticker);
+      put(m.expiry, Utilities.parseDate(o.expiry + ' 12:00', tz, 'yyyy-MM-dd HH:mm')); if (m.expiry) sh.getRange(row, m.expiry).setNumberFormat('m/d/yyyy');
+      put(m.strike, o.strikeText); put(m.type, o.orderType); put(m.lots, o.lots);
+      put(m.limit, o.limit); if (m.limit) sh.getRange(row, m.limit).setNumberFormat('$#,##0.00');
+      // option-premium exit prices from the Day plan (the tab's own stop/profit formulas assume a call; this is right for a put too)
+      if (m.stop && o.stop > 0) { put(m.stop, o.stop); sh.getRange(row, m.stop).setNumberFormat('$#,##0.00'); }
+      if (m.profit && o.target > 0) { put(m.profit, o.target); sh.getRange(row, m.profit).setNumberFormat('$#,##0.00'); }
+      put(m.status, A.status);
+      st.keys.push(o.ticker + '|' + o.cp);
+    });
+    props.setProperty('DAY_AT_PUSHED', JSON.stringify(st));
+  } finally { lock.releaseLock(); }
+  return 'Auto_Trade: added ' + fresh.map(function (o) { return o.ticker + ' ' + o.strikeText + ' x' + o.lots; }).join(', ') + ' (Status "' + A.status + '")';
+}
+
+// Menu: push whatever BUY / SHORT option plans are on the Day tab right now
+function dayPushNow_() {
+  const ui = tryGetUi_();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) { notify_(ui, 'Day', 'Nothing on the Day tab yet.'); return; }
+  const map = dayHeaderMap_(sheet);
+  const vals = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const rows = vals.map(function (v) { const o = {}; Object.keys(map).forEach(function (h) { o[h] = v[map[h] - 1]; });
+    if (o['Opt Expiry'] instanceof Date) o['Opt Expiry'] = Utilities.formatDate(o['Opt Expiry'], SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy-MM-dd'); return o; });
+  const ymd = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+  notify_(ui, 'Day → Auto_Trade', dayPushToAutoTrade_(rows, ymd) || 'No new BUY / SHORT option plans to add (already sent today, or none with an option plan).');
+}
+
+/* ============================================================================
  * THE SCAN
  * ========================================================================== */
 
@@ -782,6 +869,12 @@ function dayRun_(mode, opts) {
         });
     }
 
+    // hand the live BUY / SHORT option plans to Auto_Trade (appends only; never touches your existing rows)
+    let pushNote = '';
+    if (C.optionHints && C.autoTrade && C.autoTrade.enabled && np.m >= DAY_OPEN_M && np.m < DAY_CLOSE_M) {
+      try { pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd); } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
+    }
+
     // rows order: held first (9000+), then ranked; SPY/QQQ gauges last
     rows.sort(function (a, b) { return (b.SortKey || 0) - (a.SortKey || 0); });
     const shown = rows.filter(function (r) { return r.Action !== 'SKIP' || held0[r.Ticker]; });
@@ -807,7 +900,7 @@ function dayRun_(mode, opts) {
     const alertNote = opts.alert === false ? '' : daySendAlerts_(mode, np, shown, held0, tape, short, opts);
     const c = {}; shown.forEach(function (r) { c[r.Action] = (c[r.Action] || 0) + 1; });
     const msg = (timedOut ? '⏱️ Stopped at the time limit.\n' : '') + mode + ' scan of ' + names.length + ' names, tape ' + tape + '\n' + Object.keys(c).map(function (k) { return k + ': ' + c[k]; }).join('   ') +
-      (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '');
+      (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '') + (pushNote ? '\n' + pushNote : '');
     logToSheet_('Day scan ' + msg.replace(/\n/g, ' | '));
     notify_(ui, 'Day scan', msg);
     return { mode: mode, rows: shown.length, timedOut: timedOut };
