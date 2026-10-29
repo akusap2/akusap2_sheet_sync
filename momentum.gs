@@ -1426,11 +1426,10 @@ function quickScheduleStatus_() {
 // keeps the top-level menus to the actions actually used day to day.
 // Applies to any new debug tool added to this project going forward,
 // across any of its menus (Quick and Leap, DeepDive, Hedge, Research).
-function onOpen() {
-  // Main menu. CSP and Flip keep their own menus (cspAddMenu_ / flipAddMenu_ via installable triggers in their files).
-  // Research, Hedge and DeepDive live here: the daily actions at the top, the rest under More.
+// Quick and Leap menu as a menu object (it now lives inside the "Mixed" menu).
+function quickLeapMenu_() {
   const ui = SpreadsheetApp.getUi();
-  ui.createMenu('Quick and Leap')
+  return ui.createMenu('Quick and Leap')
     .addItem('🎯 Scan Chain by Delta / OI', 'scanOptionChainForBestOi')
     .addItem('▶ Validate & Update All Rows', 'validateAndUpdate')
     .addItem('🚀 Place Trades (TastyTrade)', 'placeTradesFromSheet')
@@ -1477,7 +1476,24 @@ function onOpen() {
       .addSeparator()
       .addItem('Research: Dry Run (no writes)', 'runDailyResearchDryRun')
       .addItem('Research: Promote Dry Run (no writes)', 'promoteResearchPicksForTabDryRun'))
-    .addToUi();
+    ;
+}
+
+// ONE top-level "Mixed" menu holding Quick and Leap, CSP and Earnings (fewer menus across the top of the sheet).
+// cspAddMenu_ / earnAddMenu_ stay as functions (their old on-open triggers still call them) but only build this menu when run by hand.
+function mixedAddMenu_() {
+  const m = SpreadsheetApp.getUi().createMenu('Mixed');
+  m.addSubMenu(quickLeapMenu_());
+  if (typeof cspMenu_ === 'function') m.addSubMenu(cspMenu_());
+  if (typeof earnMenu_ === 'function') m.addSubMenu(earnMenu_());
+  m.addToUi();
+}
+
+function onOpen() {
+  // "Mixed" menu = Quick and Leap + CSP + Earnings (see mixedAddMenu_). Flip, Long and Day keep their own menus (installable triggers in their files).
+  // Research, Hedge and DeepDive live here: the daily actions at the top, the rest under More.
+  const ui = SpreadsheetApp.getUi();
+  mixedAddMenu_();
 
   // Deep Dive has its own top-level menu (separate from Quick and Leap).
   ui.createMenu('🔬 Deep Dive')

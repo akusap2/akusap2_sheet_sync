@@ -269,8 +269,14 @@ function setupCsp() {
     '  3. 💵 CSP > CSP Alerts & Schedule > Start CSP Schedule (hourly checks + Telegram alerts)');
 }
 
-function cspAddMenu_() {
-  SpreadsheetApp.getUi()
+// Old installable on-open trigger target: the menu is built by onOpen -> mixedAddMenu_ now. Called by hand (setupCsp) it rebuilds the Mixed menu.
+function cspAddMenu_(e) {
+  if (e && e.authMode) return;
+  mixedAddMenu_();
+}
+
+function cspMenu_() {
+  return SpreadsheetApp.getUi()
     .createMenu('💵 CSP')
     .addItem('Run CSP Scan', 'runCspScan')
     .addItem('Promote Research Picks to CSP', 'runCspPromote')
@@ -289,7 +295,7 @@ function cspAddMenu_() {
       .addItem('Quality Score (one ticker)', 'debugCspQuality')
       .addItem('Scan Dry Run (no writes)', 'runCspScanDryRun')
       .addItem('Promote Dry Run (no writes)', 'runCspPromoteDryRun'))
-    .addToUi();
+    ;
 }
 
 function runCspScanDryRun() { return runCspScan(null, true); }

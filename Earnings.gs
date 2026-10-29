@@ -214,8 +214,14 @@ function setupEarnings() {
     '  2. 📅 Earnings > Run Earnings Scan\n  3. 📅 Earnings > Start Schedule (once a day + phone alert)');
 }
 
-function earnAddMenu_() {
-  SpreadsheetApp.getUi()
+// Old installable on-open trigger target: the menu is built by onOpen -> mixedAddMenu_ now. Called by hand (setupEarnings) it rebuilds the Mixed menu.
+function earnAddMenu_(e) {
+  if (e && e.authMode) return;
+  mixedAddMenu_();
+}
+
+function earnMenu_() {
+  return SpreadsheetApp.getUi()
     .createMenu('📅 Earnings')
     .addItem('Run Earnings Scan', 'runEarningsScan')
     .addItem('Run Scan + Send Phone Alert', 'earnScanAndAlert_')
@@ -228,7 +234,7 @@ function earnAddMenu_() {
     .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Earnings Debug')
       .addItem('One Ticker (full trail)', 'debugEarnOneTicker')
       .addItem('Clear History Cache', 'earnClearCache_'))
-    .addToUi();
+    ;
 }
 
 // Headers are written ONCE, on an empty sheet. After that your layout rules: delete a column, move columns, add your own, and the scan
