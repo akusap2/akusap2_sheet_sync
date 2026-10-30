@@ -53,7 +53,7 @@ const DAY_CONFIG = {
   optionHintMax: 6,
   // Auto_Trade hand-off: BUY / SHORT rows that got an option plan are appended to the Auto_Trade tab for you to review.
   // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
-  autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1 },
+  autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1, includeWait: false, lots: 1 },   // includeWait: also add WAIT rows (not triggered yet)
   optMinDte: 2,                 // never the 0-1 day contract: theta and spreads are brutal; use the first expiry at least this many days out
   optTargetDelta: 0.60,         // slightly in the money: moves like the stock, less premium wasted on time value
   optMaxSpreadPct: 10,          // (ask-bid)/mid, unless the spread is 5 cents or less
@@ -364,11 +364,10 @@ function setupDay() {
 
 function dayAddMenu_() {
   SpreadsheetApp.getUi().createMenu('⚡ Day')
-    .addItem('Run Scan Now', 'dayScanNow_')
+    .addItem('Run Scan + Send to Auto_Trade', 'dayScanNow_')
     .addItem('Set Account Size…', 'daySetAccount_')
     .addItem('Add Extra Tickers…', 'dayAddExtraTickers_')
     .addItem('Add Option Columns (once)', 'dayAddOptionColumns_')
-    .addItem('Send Signals to Auto_Trade Now', 'dayPushNow_')
     .addSeparator()
     .addItem('▶ Start Schedule', 'startDaySchedule_')
     .addItem('■ Stop Schedule', 'stopDaySchedule_')
@@ -634,16 +633,19 @@ function dayOptionProposal_(ticker, side, price, R, token, acct) {
  * AUTO_TRADE HAND-OFF
  * ========================================================================== */
 
-// Pure mapping: a Day row with an option plan -> the cell values of one Auto_Trade order. Returns null if it is not an order.
-function dayAutoTradeOrder_(r, minQty) {
-  if (!r || (r.Action !== 'BUY' && r.Action !== 'SHORT')) return null;
+// Pure mapping (BUY / SHORT / WAIT rows; a WAIT row is an order for "only if it triggers"): a Day row with an option plan -> the cell values of one Auto_Trade order. Returns null if it is not an order.
+function dayAutoTradeOrder_(r, minQty, includeWait, fixedLots) {
+  if (!r || (r.Action !== 'BUY' && r.Action !== 'SHORT' && !(includeWait && r.Action === 'WAIT'))) return null;
   const oa = r['Opt Action'];
   if (oa !== 'BUY CALL' && oa !== 'BUY PUT') return null;
-  const strike = Number(r['Opt Strike']), qty = Number(r['Opt Qty']), limit = Number(r['Opt Limit']);
+  const strike = Number(r['Opt Strike']), limit = Number(r['Opt Limit']);
+  let qty = fixedLots >= 1 ? fixedLots : Number(r['Opt Qty']), oneLot = false;
+  // a triggered signal whose plan says 0 contracts (one contract is bigger than the per-position share of the account) still goes over as 1 lot: you decide in review
+  if (!(qty >= 1) && r.Action !== 'WAIT') { qty = 1; oneLot = true; }
   if (!(strike > 0) || !(qty >= (minQty || 1)) || !(limit > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(String(r['Opt Expiry']))) return null;
   const cp = oa === 'BUY CALL' ? 'C' : 'P';
   return { ticker: String(r.Ticker).toUpperCase(), cp: cp, expiry: String(r['Opt Expiry']), strike: strike,
-    strikeText: '$' + (Math.round(strike * 100) / 100) + cp, orderType: 'BTO', lots: qty,
+    strikeText: (Math.round(strike * 100) / 100) + cp, orderType: 'BTO', lots: qty, oneLot: oneLot,
     limit: Math.round(limit * 100) / 100, stop: Math.round(Number(r['Opt Stop']) * 100) / 100, target: Math.round(Number(r['Opt Target']) * 100) / 100 };
 }
 
@@ -660,7 +662,7 @@ function dayAtHeaderMap_(sheet) {
 // Appends orders for BUY / SHORT rows. One order per ticker+side per day (a row you delete is not re-added). Returns a short note.
 function dayPushToAutoTrade_(rows, ymd) {
   const A = DAY_CONFIG.autoTrade;
-  const orders = rows.map(function (r) { return dayAutoTradeOrder_(r, A.minQty); }).filter(Boolean);
+  const orders = rows.map(function (r) { return dayAutoTradeOrder_(r, A.minQty, A.includeWait, A.lots); }).filter(Boolean);
   if (!orders.length) return '';
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(A.sheet);
@@ -680,13 +682,15 @@ function dayPushToAutoTrade_(rows, ymd) {
     const tcol = sh.getRange(1, m.ticker, Math.max(2, sh.getLastRow()), 1).getValues();
     let lastRow = 1; tcol.forEach(function (v, i) { if (String(v[0]).trim() !== '') lastRow = i + 1; });
     let rank = 0; if (m.rank && lastRow > 1) sh.getRange(2, m.rank, lastRow - 1, 1).getValues().forEach(function (v) { if (Number(v[0]) > rank) rank = Number(v[0]); });
-    const tz = ss.getSpreadsheetTimeZone();
     fresh.forEach(function (o) {
+      // noon UTC is the same calendar day in every US zone and in GMT, so no time-zone argument is needed
+      const ep = o.expiry.split('-');
+      const expDate = new Date(Date.UTC(+ep[0], +ep[1] - 1, +ep[2], 12, 0, 0));
       const row = ++lastRow;
       if (lastRow > 2) sh.getRange(2, 1, 1, sh.getLastColumn()).copyTo(sh.getRange(row, 1, 1, sh.getLastColumn()), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
       const put = function (c, v) { if (c) sh.getRange(row, c).setValue(v); };
       put(m.rank, ++rank); put(m.ticker, o.ticker);
-      put(m.expiry, Utilities.parseDate(o.expiry + ' 12:00', tz, 'yyyy-MM-dd HH:mm')); if (m.expiry) sh.getRange(row, m.expiry).setNumberFormat('m/d/yyyy');
+      put(m.expiry, expDate); if (m.expiry) sh.getRange(row, m.expiry).setNumberFormat('m/d/yyyy');
       put(m.strike, o.strikeText); put(m.type, o.orderType); put(m.lots, o.lots);
       put(m.limit, o.limit); if (m.limit) sh.getRange(row, m.limit).setNumberFormat('$#,##0.00');
       // option-premium exit prices from the Day plan (the tab's own stop/profit formulas assume a call; this is right for a put too)
@@ -697,7 +701,7 @@ function dayPushToAutoTrade_(rows, ymd) {
     });
     props.setProperty('DAY_AT_PUSHED', JSON.stringify(st));
   } finally { lock.releaseLock(); }
-  return 'Auto_Trade: added ' + fresh.map(function (o) { return o.ticker + ' ' + o.strikeText + ' x' + o.lots; }).join(', ') + ' (Status "' + A.status + '")';
+  return 'Auto_Trade: added ' + fresh.map(function (o) { return o.ticker + ' ' + o.strikeText + ' x' + o.lots + (o.oneLot ? ' (plan said 0 contracts: one costs more than the per-position share, check size)' : ''); }).join(', ') + ' (Status "' + A.status + '")';
 }
 
 // Menu: push whatever BUY / SHORT option plans are on the Day tab right now
