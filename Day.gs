@@ -53,7 +53,7 @@ const DAY_CONFIG = {
   optionHintMax: 6,
   // Auto_Trade hand-off: BUY / SHORT rows that got an option plan are appended to the Auto_Trade tab for you to review.
   // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
-  autoTrade: { enabled: false, sheet: 'Auto_Trade', status: 'Review', minQty: 1 },
+  autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1 },
   optMinDte: 2,                 // never the 0-1 day contract: theta and spreads are brutal; use the first expiry at least this many days out
   optTargetDelta: 0.60,         // slightly in the money: moves like the stock, less premium wasted on time value
   optMaxSpreadPct: 10,          // (ask-bid)/mid, unless the spread is 5 cents or less
