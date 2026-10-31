@@ -6,7 +6,7 @@
  * TASTY_REFRESH_TOKEN as everything else. The refresh token must have the
  * "trade" scope, otherwise TastyTrade answers 403 on order calls.
  *
- * NOTHING is sent unless a row's Status is exactly "Ready" and you click
+ * NOTHING is sent unless a row's Status is exactly "Review" (what the Day tab writes) and you click
  * Place Orders and confirm. "Dry Run" checks the same rows against
  * TastyTrade's dry-run endpoint (buying-power effect, warnings) and sends nothing.
  *
@@ -21,7 +21,8 @@
  *   Only one of them filled becomes OTO (entry, then that exit).
  *   Strike "$8C" / "$7.5P" = option; Strike empty = stock.
  *
- * Status flow: Draft/Review (ignored) -> Ready -> Sent | Rejected | Error | CHECK
+ * Status flow: Review -> Sent | Rejected | Error | CHECK, then Sent -> Filled / In Position / Closed / Cancelled ...
+ *   Any Status other than Review (Draft, Hold, Sent, Filled ...) is never sent. Set a row to Draft to keep it out of the next Place Orders.
  *   then "Refresh Order Status" updates Sent rows to Filled / Cancelled / ...
  *   CHECK = TastyTrade did not answer clearly: look at TastyTrade before re-sending.
  * ============================================================================
@@ -29,7 +30,7 @@
 
 const TX_CONFIG = {
   sheet: 'Auto_Trade',
-  readyStatus: 'Ready',
+  readyStatus: 'Review',   // ONLY rows with this Status are sent; once sent the Status changes, so a row can never go out twice
   maxLots: 10,             // per order
   maxOrderValue: 3000,     // $ cost cap for a BTO (limit x 100 x lots; stock: limit x shares)
   maxOrdersPerRun: 10,
@@ -49,18 +50,21 @@ const TX_TYPES = {
   STC: { action: 'Sell to Close', effect: 'Credit' },
   STP: { action: 'Sell to Close', effect: 'Credit' }
 };
-const TX_TERMINAL = ['Filled', 'Cancelled', 'Canceled', 'Rejected', 'Expired', 'Removed', 'Error'];
+const TX_TERMINAL = ['Closed', 'Filled', 'Cancelled', 'Canceled', 'Rejected', 'Expired', 'Removed', 'Error'];
 
 function txAddMenu_() {
   SpreadsheetApp.getUi().createMenu('🚀 Auto Trade')
     .addItem('Set Up Auto_Trade Sheet', 'txSetupSheet')
     .addSeparator()
-    .addItem('Dry Run (check Ready rows, sends nothing)', 'dryRunTradesFromSheet')
-    .addItem('Place Orders (Ready rows)', 'placeTradesFromSheet')
+    .addItem('Dry Run (check Review rows, sends nothing)', 'dryRunTradesFromSheet')
+    .addItem('Place Orders (Review rows)', 'placeTradesFromSheet')
     .addItem('Refresh Order Status', 'refreshOrderStatus')
+    .addItem('▶ Start Auto-Refresh (every 5 min)', 'txStartRefresh')
+    .addItem('■ Stop Auto-Refresh', 'txStopRefresh')
     .addItem('Cancel Order of Selected Row', 'txCancelSelected')
     .addSeparator()
     .addItem('Set Account Number…', 'txSetAccount')
+    .addItem('Check Token Permissions', 'txCheckToken')
     .addToUi();
 }
 
@@ -86,7 +90,9 @@ function txParseStrike_(v) {
 function txYymmdd_(v, tz) {
   let y, mo, d;
   if (v instanceof Date) {
-    const p = Utilities.formatDate(v, tz, 'yyyy-MM-dd').split('-'); y = +p[0]; mo = +p[1]; d = +p[2];
+    // a date cell is midnight in the sheet's own zone (04:00-08:00 UTC for US zones, 00:00 for GMT) or noon UTC when this script wrote it;
+    // +6h then reading the UTC date gives the right calendar day for all of those without asking for the sheet's time zone
+    const u = new Date(v.getTime() + 6 * 3600000); y = u.getUTCFullYear(); mo = u.getUTCMonth() + 1; d = u.getUTCDate();
   } else {
     const s = String(v || '').trim();
     let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
@@ -190,10 +196,11 @@ function txErrText_(res) {
   const e = res.json && res.json.error;
   if (e) {
     const sub = (e.errors || []).map(function (x) { return x.message || x.code; }).join('; ');
-    return 'HTTP ' + res.code + ': ' + (e.message || e.code || '') + (sub ? ' — ' + sub : '');
+    return 'HTTP ' + res.code + ': ' + (e.message || e.code || '') + (sub ? ' — ' + sub : '') + (res.code === 403 ? '  [run Auto Trade > Check Token Permissions]' : '');
   }
   return 'HTTP ' + res.code + ': ' + String(res.text || '').substring(0, 200);
 }
+
 
 function txAccount_(ui) {
   const props = PropertiesService.getScriptProperties();
@@ -205,6 +212,30 @@ function txAccount_(ui) {
   if (list.length === 1) { props.setProperty('TASTY_ACCOUNT', list[0]); return list[0]; }
   if (!list.length) throw new Error('TastyTrade returned no accounts');
   throw new Error('several accounts (' + list.join(', ') + ') — use Auto Trade > Set Account Number');
+}
+
+// Shows what TastyTrade says about the token this script is actually using (no secrets shown): which permissions it carries.
+function txCheckToken() {
+  const ui = tryGetUi_(), props = PropertiesService.getScriptProperties();
+  CacheService.getScriptCache().remove('TASTY_ACCESS_TOKEN');
+  const secret = props.getProperty('TASTY_CLIENT_SECRET'), refresh = props.getProperty('TASTY_REFRESH_TOKEN');
+  if (!secret || !refresh) { notify_(ui, 'Token check', 'TASTY_CLIENT_SECRET or TASTY_REFRESH_TOKEN is not set in Script Properties.'); return; }
+  const resp = UrlFetchApp.fetch('https://api.tastyworks.com/oauth/token', { method: 'post', contentType: 'application/json', headers: { 'User-Agent': TASTY_USER_AGENT },
+    payload: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refresh, client_secret: secret }), muteHttpExceptions: true });
+  const lines = ['Refresh token in use ends with: ...' + String(refresh).slice(-5), 'Token request: HTTP ' + resp.getResponseCode()];
+  let j = null; try { j = JSON.parse(resp.getContentText()); } catch (e) { lines.push(resp.getContentText().substring(0, 200)); }
+  if (j) {
+    Object.keys(j).forEach(function (k) { if (['access_token', 'refresh_token', 'id_token'].indexOf(k) < 0) lines.push(k + ': ' + JSON.stringify(j[k])); });
+    const t = String(j.access_token || '').split('.');
+    if (t.length === 3) {
+      try {
+        const pl = JSON.parse(Utilities.newBlob(Utilities.base64DecodeWebSafe(t[1].replace(/=+$/, ''))).getDataAsString());
+        ['scope', 'scp', 'scopes', 'exp', 'iss'].forEach(function (k) { if (pl[k] !== undefined) lines.push('token ' + k + ': ' + JSON.stringify(pl[k])); });
+      } catch (e) { lines.push('(could not read the token contents)'); }
+    }
+  }
+  lines.push('', 'You need "trade" in the scope list. If it only says "read", the refresh token in Script Properties is an old one: create a new grant with trade ticked and paste that token.');
+  notify_(ui, 'Token check', lines.join('\n'));
 }
 
 function txSetAccount() {
@@ -243,11 +274,11 @@ function txSetupSheet() {
   hdr.setFontWeight('bold').setHorizontalAlignment('center').setFontFamily('Arial').setFontSize(9);
   const n = 300;
   if (m.type) sh.getRange(2, m.type, n, 1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['BTO', 'STO', 'BTC', 'STC', 'STP'], true).setAllowInvalid(false).build());
-  if (m.status) sh.getRange(2, m.status, n, 1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['Draft', 'Review', TX_CONFIG.readyStatus, 'Sent', 'Live', 'Filled', 'Cancel sent', 'Cancelled', 'Rejected', 'Error', 'CHECK'], true).setAllowInvalid(true).build());
+  if (m.status) sh.getRange(2, m.status, n, 1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['Draft', TX_CONFIG.readyStatus, 'Sent', 'Live', 'In Position', 'Closed', 'Filled', 'Cancel sent', 'Cancelled', 'Rejected', 'Error', 'CHECK'], true).setAllowInvalid(true).build());
   if (m.expiry) sh.getRange(2, m.expiry, n, 1).setNumberFormat('m/d/yyyy');
   ['limit', 'stop', 'profit'].forEach(function (k) { if (m[k]) sh.getRange(2, m[k], n, 1).setNumberFormat('$#,##0.00'); });
   if (m.result) sh.setColumnWidth(m.result, 380);
-  notify_(tryGetUi_(), 'Auto_Trade', 'Auto_Trade is ready. Type an order, set Status to "' + TX_CONFIG.readyStatus + '", then Dry Run, then Place Orders.');
+  notify_(tryGetUi_(), 'Auto_Trade', 'Auto_Trade is ready. Rows with Status "' + TX_CONFIG.readyStatus + '" are what Dry Run / Place Orders send.');
 }
 
 function txReadRows_(sh, m) {
@@ -282,7 +313,7 @@ function txRun_(dry) {
     const m = txHeaderMap_(sh);
     const missing = ['ticker', 'strike', 'type', 'lots', 'limit', 'status', 'id', 'result'].filter(function (k) { return !m[k]; });
     if (missing.length) { notify_(ui, 'Auto Trade', 'Missing column(s): ' + missing.join(', ') + '. Run Auto Trade > Set Up Auto_Trade Sheet.'); return; }
-    const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    const tz = null;   // not needed: txYymmdd_ reads the UTC calendar day
     const today = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
     const ready = txReadRows_(sh, m).filter(function (r) { return r.status.toLowerCase() === TX_CONFIG.readyStatus.toLowerCase() && r.type !== ''; });
     if (!ready.length) { notify_(ui, 'Auto Trade', 'No rows with Status "' + TX_CONFIG.readyStatus + '".'); return; }
@@ -293,7 +324,7 @@ function txRun_(dry) {
       if (o.error) { bad.push(r.row); txPut_(sh, r.row, m, 'Error', '', o.error); return; }
       o.row = r.row; specs.push(o);
     });
-    if (ready.length > TX_CONFIG.maxOrdersPerRun) bad.push('(' + (ready.length - TX_CONFIG.maxOrdersPerRun) + ' more Ready rows left for the next run)');
+    if (ready.length > TX_CONFIG.maxOrdersPerRun) bad.push('(' + (ready.length - TX_CONFIG.maxOrdersPerRun) + ' more Review rows left for the next run)');
 
     const token = specs.length ? getTastyTradeAccessToken_() : null;
     if (specs.length && !token) { notify_(ui, 'Auto Trade', 'No TastyTrade token — nothing sent.'); return; }
@@ -323,6 +354,8 @@ function txRun_(dry) {
     const stamp = Utilities.formatDate(new Date(), 'America/New_York', 'MMdd-HHmmss');
     const summary = [];
     ok.forEach(function (o) {
+      // last look at the cell: if it is no longer "Review" (you changed it while the dialog was open) it is not sent
+      if (String(sh.getRange(o.row, m.status).getValue()).trim().toLowerCase() !== TX_CONFIG.readyStatus.toLowerCase()) { summary.push('row ' + o.row + ' skipped: Status changed'); return; }
       const built = txBuildOrder_(o, TX_CONFIG, 'AT-' + o.row + '-' + stamp);
       const path = '/accounts/' + encodeURIComponent(acct) + '/' + built.path + (dry ? '/dry-run' : '');
       let res;
@@ -371,34 +404,86 @@ function txFillText_(order) {
   return q ? ' @ ' + (v / q).toFixed(2) : '';
 }
 
+// Status of a bracket (complex order) from TastyTrade's reply: entry first, then the exits
+function txComplexStatus_(d) {
+  const trig = d['trigger-order'] || {};
+  const kids = d.orders || [];
+  const kidDone = ['Filled', 'Cancelled', 'Canceled', 'Rejected', 'Expired', 'Removed'];
+  const trigSt = trig.status || d.status || '';
+  if (trigSt !== 'Filled') return { status: trigSt || '?', text: 'entry ' + (trigSt || '?') };
+  const open = kids.filter(function (k) { return kidDone.indexOf(k.status) < 0; });
+  const filled = kids.filter(function (k) { return k.status === 'Filled'; });
+  const entry = 'entry filled' + txFillText_(trig);
+  if (open.length) return { status: 'In Position', text: entry + ' | exits: ' + kids.map(function (k) { return k.status; }).join(', ') };
+  if (filled.length) return { status: 'Closed', text: entry + ' | exit filled' + txFillText_(filled[0]) };
+  return { status: 'Filled', text: entry };
+}
+
+// One pass over the open orders. Returns { open, checked, changes[] }. Writes Status + Result for each.
+function txRefresh_() {
+  const sh = txSheet_(), m = txHeaderMap_(sh);
+  if (!m.id || !m.status || !m.result) return { error: 'Run Auto Trade > Set Up Auto_Trade Sheet first.' };
+  const rows = txReadRows_(sh, m).filter(function (r) { return r.id && TX_TERMINAL.indexOf(r.status) < 0; });
+  const out = { open: rows.length, checked: 0, changes: [] };
+  if (!rows.length) return out;
+  const acct = txAccount_();
+  const hhmm = Utilities.formatDate(new Date(), 'America/New_York', 'HH:mm');
+  rows.forEach(function (r) {
+    const res = txFetch_('get', txOrderPath_(acct, r.id));
+    const d = res.json && res.json.data;
+    if (res.code !== 200 || !d) { txPut_(sh, r.row, m, null, null, 'status check failed: ' + txErrText_(res) + ' ' + hhmm); return; }
+    let st, text;
+    if (r.id.indexOf('C:') === 0) { const c = txComplexStatus_(d); st = c.status; text = c.text; }
+    else { st = d.status || r.status; text = st + txFillText_(d); }
+    txPut_(sh, r.row, m, st, null, text + ' ' + hhmm);
+    out.checked++;
+    if (st !== r.status) out.changes.push({ row: r.row, ticker: String(r.ticker).toUpperCase(), from: r.status, to: st, text: text });
+    Utilities.sleep(120);
+  });
+  return out;
+}
+
 function refreshOrderStatus() {
   const ui = tryGetUi_();
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(20000)) return;
   try {
-    const sh = txSheet_(), m = txHeaderMap_(sh);
-    if (!m.id || !m.status || !m.result) { notify_(ui, 'Auto Trade', 'Run Auto Trade > Set Up Auto_Trade Sheet first.'); return; }
-    const rows = txReadRows_(sh, m).filter(function (r) { return r.id && TX_TERMINAL.indexOf(r.status) < 0; });
-    if (!rows.length) { notify_(ui, 'Auto Trade', 'No open orders to refresh.'); return; }
-    const acct = txAccount_(ui);
-    let n = 0;
-    rows.forEach(function (r) {
-      const res = txFetch_('get', txOrderPath_(acct, r.id));
-      const d = res.json && res.json.data;
-      if (res.code !== 200 || !d) { txPut_(sh, r.row, m, null, null, 'status check failed: ' + txErrText_(res)); return; }
-      if (r.id.indexOf('C:') === 0) {
-        const trig = d['trigger-order'] || {};
-        const kids = (d.orders || []).map(function (o) { return o.status; });
-        txPut_(sh, r.row, m, trig.status || d.status || r.status, null, 'entry ' + (trig.status || '?') + txFillText_(trig) + (kids.length ? ' | exits: ' + kids.join(', ') : '') + ' ' + Utilities.formatDate(new Date(), 'America/New_York', 'HH:mm'));
-      } else {
-        txPut_(sh, r.row, m, d.status || r.status, null, (d.status || '?') + txFillText_(d) + ' ' + Utilities.formatDate(new Date(), 'America/New_York', 'HH:mm'));
-      }
-      n++;
-      Utilities.sleep(120);
-    });
-    notify_(ui, 'Auto Trade', 'Refreshed ' + n + ' of ' + rows.length + ' open order(s).');
+    const r = txRefresh_();
+    if (r.error) { notify_(ui, 'Auto Trade', r.error); return; }
+    if (!r.open) { notify_(ui, 'Auto Trade', 'No open orders to refresh.'); return; }
+    notify_(ui, 'Auto Trade', 'Refreshed ' + r.checked + ' of ' + r.open + ' open order(s).' + (r.changes.length ? '\n' + r.changes.map(function (c) { return c.ticker + ': ' + c.from + ' -> ' + c.to; }).join('\n') : ''));
   } catch (e) { notify_(ui, 'Auto Trade', 'Failed: ' + (e && e.message ? e.message : e)); }
   finally { lock.releaseLock(); }
+}
+
+// Timer entry point: weekdays 09:25-16:15 ET, only does anything when an order is open, alerts + logs only on a change
+function txRefreshTick_() {
+  const now = new Date();
+  if (['6', '7'].indexOf(Utilities.formatDate(now, 'America/New_York', 'u')) >= 0) return;
+  const hm = Utilities.formatDate(now, 'America/New_York', 'HH:mm').split(':'), mins = +hm[0] * 60 + +hm[1];
+  if (mins < 565 || mins > 975) return;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    const r = txRefresh_();
+    if (r.error || !r.changes || !r.changes.length) return;
+    const msg = r.changes.map(function (c) { return c.ticker + ' ' + c.from + ' -> ' + c.to + (c.text ? ' (' + c.text + ')' : ''); }).join('\n');
+    logToSheet_('Auto Trade status: ' + msg.replace(/\n/g, ' | '));
+    const cfg = getAlertConfig_();
+    if (cfg.ready) sendPhoneAlert_(cfg, 'Auto Trade: ' + r.changes.map(function (c) { return c.ticker + ' ' + c.to; }).join(', '), msg, true);
+  } catch (e) { logToSheet_('Auto Trade status refresh failed: ' + (e && e.message ? e.message : e)); }
+  finally { lock.releaseLock(); }
+}
+
+function txStartRefresh() {
+  txStopRefresh(true);
+  ScriptApp.newTrigger('txRefreshTick_').timeBased().everyMinutes(5).create();
+  notify_(tryGetUi_(), 'Auto Trade', 'Order status now refreshes every 5 minutes on weekdays 09:25-16:15 ET (only when an order is open). Fills, exits and rejections are written to the sheet and sent to your phone alert.');
+}
+function txStopRefresh(silent) {
+  let n = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'txRefreshTick_') { ScriptApp.deleteTrigger(t); n++; } });
+  if (silent !== true) notify_(tryGetUi_(), 'Auto Trade', n ? 'Auto-refresh stopped.' : 'Auto-refresh was not running.');
 }
 
 function txCancelSelected() {
