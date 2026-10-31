@@ -64,6 +64,7 @@ function txAddMenu_() {
     .addItem('Cancel Order of Selected Row', 'txCancelSelected')
     .addSeparator()
     .addItem('Set Account Number…', 'txSetAccount')
+    .addItem('Set TastyTrade Token…', 'txSetToken')
     .addItem('Check Token Permissions', 'txCheckToken')
     .addToUi();
 }
@@ -212,6 +213,20 @@ function txAccount_(ui) {
   if (list.length === 1) { props.setProperty('TASTY_ACCOUNT', list[0]); return list[0]; }
   if (!list.length) throw new Error('TastyTrade returned no accounts');
   throw new Error('several accounts (' + list.join(', ') + ') — use Auto Trade > Set Account Number');
+}
+
+// Paste the new refresh token (and the client secret only if you made a new OAuth client); blank keeps the stored value. Then checks it.
+function txSetToken() {
+  const ui = SpreadsheetApp.getUi(), props = PropertiesService.getScriptProperties();
+  const a = ui.prompt('New TastyTrade refresh token', 'Paste the refresh token from "Create Grant" (the grant must have trade ticked). Leave empty to keep the current one.', ui.ButtonSet.OK_CANCEL);
+  if (a.getSelectedButton() !== ui.Button.OK) return;
+  const b = ui.prompt('Client secret (only if you created a NEW OAuth client)', 'Leave empty to keep the current secret.', ui.ButtonSet.OK_CANCEL);
+  if (b.getSelectedButton() !== ui.Button.OK) return;
+  const rt = a.getResponseText().trim(), cs = b.getResponseText().trim();
+  if (rt) props.setProperty('TASTY_REFRESH_TOKEN', rt);
+  if (cs) props.setProperty('TASTY_CLIENT_SECRET', cs);
+  CacheService.getScriptCache().remove('TASTY_ACCESS_TOKEN');
+  txCheckToken();
 }
 
 // Shows what TastyTrade says about the token this script is actually using (no secrets shown): which permissions it carries.
