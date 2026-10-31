@@ -53,7 +53,9 @@ const DAY_CONFIG = {
   optionHintMax: 6,
   // Auto_Trade hand-off: BUY / SHORT rows that got an option plan are appended to the Auto_Trade tab for you to review.
   // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
-  autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1, includeWait: false, lots: 1 },   // includeWait: also add WAIT rows (not triggered yet)
+  // Time Machine odds (port of the day-trader-skill replay): BUY / SHORT rows get target-first / stop-first odds from the stock's own last 60 days of 5-minute bars
+  odds: { enabled: true, replays: 5000, window: 2, minSessions: 20, maxPerScan: 4, maxManual: 8, seed: 19 },
+  autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1, includeWait: false, lots: 1, requireFavorable: true },   // includeWait: also add WAIT rows (not triggered yet)
   optMinDte: 2,                 // never the 0-1 day contract: theta and spreads are brutal; use the first expiry at least this many days out
   optTargetDelta: 0.60,         // slightly in the money: moves like the stock, less premium wasted on time value
   optMaxSpreadPct: 10,          // (ask-bid)/mid, unless the spread is 5 cents or less
@@ -75,9 +77,10 @@ const DAY_CONFIG = {
 // Added to the Day tab in version 2. They are NOT written into your existing header row automatically: menu "Add Option Columns" appends
 // the ones you don't have (once; delete any you don't want and they stay deleted).
 const DAY_OPTION_HEADERS = ['Opt Action', 'Opt Expiry', 'Opt Strike', 'Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Qty', 'Opt Delta', 'Opt Spread %', 'Opt OI'];
+const DAY_ODDS_HEADERS = ['TM Target %', 'TM Stop %', 'TM Open %', 'TM Avg R', 'TM History', 'TM Verdict'];
 const DAY_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'Side', 'Setup', 'Score', 'Trigger', 'Stop', 'Target', 'Size',
   'Gap %', 'RVOL', 'Pre RVOL', 'ATR %', 'VW %', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low', 'Spread %', 'Catalyst', 'Tape',
-  'P/L $', 'P/L %', 'R', 'Why', 'Option'].concat(DAY_OPTION_HEADERS).concat(['LastRun', 'SortKey']);
+  'P/L $', 'P/L %', 'R', 'Why', 'Option'].concat(DAY_OPTION_HEADERS).concat(DAY_ODDS_HEADERS).concat(['LastRun', 'SortKey']);
 const DAY_ENTRY_COL = 5;
 const DAY_ENTRY_FORMULA = '=sumproduct(E2:E92,F2:F92)';
 
@@ -303,7 +306,11 @@ function dayHeldAction_(h, price, base, nowM, closeM, cfg, todayYmd) {
 
 // What the signal would have done today. regBars: today's regular-session 5m bars ascending. Pessimistic: if a bar could have both triggered
 // the entry and hit the stop, the stop wins; stop fills at the stop (or the open if it gapped through); exit at the close otherwise.
-function dayReplay_(regBars, sig, cfg) {
+// mode 'close' (default, the Time Machine rule): enter at the CLOSE of the first 5-minute bar that closes beyond the opening range (skipped as LATE if that close is
+// already more than chaseR x R past the trigger, as the Day tab would say LATE); the stop is checked from the NEXT bar on, stop-first inside a bar.
+// mode 'trigger' (the old rule): enter inside the breakout bar and let that same bar stop you out - biased towards losses.
+function dayReplay_(regBars, sig, cfg, mode) {
+  mode = mode || 'close';
   const sign = sig.side === 'LONG' ? 1 : -1, R = sig.R, lateM = dayMinutes_(cfg.entryCutoff), orEnd = DAY_OPEN_M + cfg.orMinutes;
   let entry = null, stop = null, exit = null, reason = '', mfe = 0;
   for (let i = 0; i < regBars.length; i++) {
@@ -311,6 +318,13 @@ function dayReplay_(regBars, sig, cfg) {
     if (b.m < orEnd) continue;
     if (entry == null) {
       if (b.m > lateM) break;
+      if (mode === 'close') {
+        if (!(sign === 1 ? b.c > sig.trigger : b.c < sig.trigger)) continue;
+        if ((b.c - sig.trigger) * sign > cfg.chaseR * R) return { taken: false, late: true };
+        entry = b.c + sign * cfg.slipPerShare;
+        stop = sig.trigger - sign * R;
+        continue;   // the stop is only looked at from the next bar
+      }
       const hit = sign === 1 ? b.h >= sig.trigger : b.l <= sig.trigger;
       if (!hit) continue;
       entry = sign === 1 ? Math.max(b.o, sig.trigger) : Math.min(b.o, sig.trigger);
@@ -329,6 +343,44 @@ function dayReplay_(regBars, sig, cfg) {
   if (entry == null) return { taken: false };
   if (exit == null) { const last = regBars[regBars.length - 1]; exit = last.c - sign * cfg.slipPerShare; reason = 'CLOSE'; }
   return { taken: true, entry: entry, exit: exit, reason: reason, r: (exit - entry) * sign / R, pnlPct: (exit - entry) * sign / entry * 100, mfeR: mfe };
+}
+
+// Re-runs every taken signal in DayLog under BOTH rules on the same real bars and shows the difference. Needs Yahoo (a call per ticker).
+function dayReplayCompare_() {
+  const ui = tryGetUi_(), t0 = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet(), log = ss.getSheetByName(DAY_LOG_SHEET);
+  if (!log || log.getLastRow() < 2) { notify_(ui, 'Replay compare', 'DayLog is empty.'); return; }
+  const rows = log.getRange(2, 1, log.getLastRow() - 1, 13).getValues().map(function (r) {
+    const d = r[0] instanceof Date ? dayDateYmd_(r[0]) : String(r[0]).slice(0, 10);
+    const entry = Number(r[7]), exit = Number(r[8]), rr = Number(r[10]);
+    return { date: d, t: r[1], side: r[2], trigger: Number(r[6]), R: r[7] !== '' && rr ? Math.abs(exit - entry) / Math.abs(rr) : 0, oldR: rr, oldReason: r[9], taken: r[9] !== 'NO ENTRY' && r[7] !== '' };
+  }).filter(function (x) { return x.taken && x.R > 0; });
+  const cache = {}, out = [];
+  let skipped = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (Date.now() - t0 > 270000) { skipped = rows.length - i; break; }
+    const x = rows[i];
+    if (!cache[x.t]) { cache[x.t] = dayFetchBars_(x.t, true) || []; Utilities.sleep(DAY_CONFIG.sleepMs); }
+    const reg = cache[x.t].filter(function (b) { return b.ymd === x.date && b.m >= DAY_OPEN_M && b.m < DAY_CLOSE_M; });
+    if (reg.length < 20) { skipped++; continue; }
+    const rp = dayReplay_(reg, { side: x.side, trigger: x.trigger, R: x.R }, DAY_CONFIG, 'close');
+    const ro = dayReplay_(reg, { side: x.side, trigger: x.trigger, R: x.R }, DAY_CONFIG, 'trigger');
+    out.push({ date: x.date, t: x.t, side: x.side, oldR: ro.taken ? ro.r : null, oldReason: ro.taken ? ro.reason : 'NO ENTRY', newR: rp.taken ? rp.r : null, newReason: rp.taken ? rp.reason : (rp.late ? 'LATE' : 'NO ENTRY'), newEntry: rp.taken ? rp.entry : '' });
+  }
+  const agg = function (k) {
+    const d = out.filter(function (o) { return o[k] != null; });
+    const w = d.filter(function (o) { return o[k] > 0; }).length;
+    return { n: d.length, win: d.length ? w / d.length : null, avg: d.length ? dayMean_(d.map(function (o) { return o[k]; })) : null, sum: d.reduce(function (t, o) { return t + o[k]; }, 0) };
+  };
+  const a = agg('oldR'), b = agg('newR');
+  const line = function (n, g) { return n + ': ' + g.n + ' trades, win ' + (g.win == null ? 'n/a' : Math.round(g.win * 100) + '%') + ', avg ' + (g.avg == null ? 'n/a' : dayR2_(g.avg) + 'R') + ', total ' + dayR2_(g.sum) + 'R'; };
+  let cmp = ss.getSheetByName('DayReplayCompare');
+  if (!cmp) cmp = ss.insertSheet('DayReplayCompare');
+  cmp.clearContents();
+  cmp.getRange(1, 1, 1, 8).setValues([['Date', 'Ticker', 'Side', 'Old R (enter in bar)', 'Old result', 'New R (enter at close)', 'New result', 'New entry']]).setFontWeight('bold');
+  if (out.length) cmp.getRange(2, 1, out.length, 8).setValues(out.map(function (o) { return [o.date, o.t, o.side, o.oldR == null ? '' : dayR2_(o.oldR), o.oldReason, o.newR == null ? '' : dayR2_(o.newR), o.newReason, o.newEntry === '' ? '' : dayR2_(o.newEntry)]; }));
+  notify_(ui, 'Replay compare (same real bars, same signals)', line('OLD rule (stop can hit on the entry bar)', a) + '\n' + line('NEW rule (enter at the close, stop from next bar)', b) +
+    (skipped ? '\n(' + skipped + ' rows skipped: no bars or time limit)' : '') + '\nPer-signal detail is on the DayReplayCompare tab.\nTruth is between the two rules: bars are 5 minutes, so what happened inside a bar is unknown.');
 }
 
 function dayStats_(rows) {
@@ -364,10 +416,12 @@ function setupDay() {
 
 function dayAddMenu_() {
   SpreadsheetApp.getUi().createMenu('⚡ Day')
-    .addItem('Run Scan + Send to Auto_Trade', 'dayScanNow_')
+    .addItem('Run Scan + Send FAVORABLE to Auto_Trade', 'dayScanNow_')
+    .addItem('📤 Send Selected Rows to Auto_Trade (manual)', 'dayPushSelected_')
     .addItem('Set Account Size…', 'daySetAccount_')
     .addItem('Add Extra Tickers…', 'dayAddExtraTickers_')
-    .addItem('Add Option Columns (once)', 'dayAddOptionColumns_')
+    .addItem('Add Option + Odds Columns (once)', 'dayAddOptionColumns_')
+    .addItem('🎲 Time Machine Odds (BUY / SHORT / WAIT rows)', 'dayOddsNow_')
     .addSeparator()
     .addItem('▶ Start Schedule', 'startDaySchedule_')
     .addItem('■ Stop Schedule', 'stopDaySchedule_')
@@ -375,7 +429,7 @@ function dayAddMenu_() {
     .addSeparator()
     .addItem('📒 Day Stats (option orders)', 'alogShowStats_')
     .addItem('📒 Update Log Now', 'alogUpdateNow_')
-    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Debug').addItem('One Ticker (full trail)', 'debugDayOneTicker').addItem('Old stock-level stats (DayLog)', 'dayShowStats_').addItem('Old stock-level replay of today', 'dayEodNow_'))
+    .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Debug').addItem('One Ticker (full trail)', 'debugDayOneTicker').addItem('Old stock-level stats (DayLog)', 'dayShowStats_').addItem('Old stock-level replay of today', 'dayEodNow_').addItem('Compare old vs new replay rule (past days)', 'dayReplayCompare_'))
     .addToUi();
 }
 
@@ -423,7 +477,7 @@ function dayAddOptionColumns_() {
   const lastCol = Math.max(sheet.getLastColumn(), 1);
   const have = {}; sheet.getRange(1, 1, 1, lastCol).getValues()[0].forEach(function (v) { have[String(v).trim()] = true; });
   let next = lastCol; while (next > 0 && String(sheet.getRange(1, next).getValue()).trim() === '') next--;
-  const add = DAY_OPTION_HEADERS.filter(function (h) { return !have[h]; });
+  const add = DAY_OPTION_HEADERS.concat(DAY_ODDS_HEADERS).filter(function (h) { return !have[h]; });
   add.forEach(function (h) { next++; sheet.getRange(1, next).setValue(h).setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3'); });
   notify_(tryGetUi_(), 'Day', add.length ? 'Added ' + add.length + ' option column(s) at the end: ' + add.join(', ') + '.\nMove or delete them as you like; the scan follows the header names.' : 'All option columns are already there.');
 }
@@ -656,7 +710,7 @@ function dayAtHeaderMap_(sheet) {
     if (k && !map[k]) map[k] = i + 1;
   });
   return { rank: map.rank, ticker: map.ticker, expiry: map.expiry, strike: map.strike, type: map.ordertype, lots: map['#lot'] || map.lot || map.lots,
-    limit: map.limitprice || map.limit, stop: map.stoploss, profit: map.profitsell, status: map.status };
+    limit: map.limitprice || map.limit, stop: map.stoploss, profit: map.profitsell, status: map.status, result: map.result };
 }
 
 // Keeps the Auto_Trade tab in step with the Day tab, one pass per scan:
@@ -664,7 +718,9 @@ function dayAtHeaderMap_(sheet) {
 //     or the direction flipped call <-> put) or that are left over from an earlier day.
 //  2. ADD a row for every BUY / SHORT with an option plan that has none yet (a signal that came back after its row was removed gets a new row).
 // Rows you moved past Review (Ready, Sent, Filled, ...) are never touched. A ticker this scan did not look at is left alone.
-function dayPushToAutoTrade_(rows, ymd) {
+// opt.filter(row) = which rows may be added (the automatic push passes the favorable-only test); opt.manual = your hand-picked rows: added as YOUR rows (never auto-removed), WAIT allowed
+function dayPushToAutoTrade_(rows, ymd, opt) {
+  opt = opt || {};
   const A = DAY_CONFIG.autoTrade;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(A.sheet);
@@ -677,7 +733,8 @@ function dayPushToAutoTrade_(rows, ymd) {
   if (st.ymd !== ymd) st = { ymd: ymd, keys: [] };
   let owned = {}; try { owned = JSON.parse(props.getProperty('DAY_AT_OWNED') || '{}'); } catch (e) {}   // 'TICKER|C' -> day it was added
   st.keys.forEach(function (k) { if (!owned[k]) owned[k] = ymd; });                                       // rows added before ownership was tracked
-  const orders = rows.map(function (r) { return dayAutoTradeOrder_(r, A.minQty, A.includeWait, A.lots); }).filter(Boolean);
+  const okRow = opt.filter || function () { return true; };
+  const orders = rows.filter(okRow).map(function (r) { return dayAutoTradeOrder_(r, A.minQty, A.includeWait || !!opt.manual, A.lots); }).filter(Boolean);
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) return 'Auto_Trade: busy, will retry next scan';
   const removed = [];
@@ -686,7 +743,9 @@ function dayPushToAutoTrade_(rows, ymd) {
     const byTicker = {}; rows.forEach(function (r) { byTicker[String(r.Ticker).toUpperCase()] = r; });
     const gone = ['WAIT', 'FORMING', 'LATE', 'FAILED', 'NO NEW'].filter(function (x) { return !(A.includeWait && x === 'WAIT'); });
     const last0 = sh.getLastRow();
-    if (last0 > 1) {
+    if (opt.manual) {
+      // manual push: leave every existing row alone
+    } else if (last0 > 1) {
       const n0 = last0 - 1;
       const tk = sh.getRange(2, m.ticker, n0, 1).getValues(), sk = sh.getRange(2, m.strike, n0, 1).getValues(), ss0 = sh.getRange(2, m.status, n0, 1).getValues();
       const live = {};   // keys that still have a Review row
@@ -699,7 +758,7 @@ function dayPushToAutoTrade_(rows, ymd) {
         live[key] = true;
         const r = byTicker[t];
         const stale = owned[key] < ymd;
-        const dead = r && (gone.indexOf(r.Action) >= 0 || (r.Side && (r.Side === 'LONG' ? 'C' : 'P') !== key.split('|')[1]));
+        const dead = r && (gone.indexOf(r.Action) >= 0 || !okRow(r) || (r.Side && (r.Side === 'LONG' ? 'C' : 'P') !== key.split('|')[1]));
         if (stale || dead) kill.push({ row: i + 2, key: key, why: stale ? 'old' : (r.Action || 'flipped') });
       }
       kill.sort(function (a, b) { return b.row - a.row; }).forEach(function (k) {   // bottom up so row numbers stay valid
@@ -733,7 +792,7 @@ function dayPushToAutoTrade_(rows, ymd) {
       if (m.stop && o.stop > 0) { put(m.stop, o.stop); sh.getRange(row, m.stop).setNumberFormat('$#,##0.00'); }
       if (m.profit && o.target > 0) { put(m.profit, o.target); sh.getRange(row, m.profit).setNumberFormat('$#,##0.00'); }
       put(m.status, A.status);
-      st.keys.push(o.ticker + '|' + o.cp); owned[o.ticker + '|' + o.cp] = ymd;
+      st.keys.push(o.ticker + '|' + o.cp); if (!opt.manual) owned[o.ticker + '|' + o.cp] = ymd;
     });
     props.setProperty('DAY_AT_PUSHED', JSON.stringify(st));
     props.setProperty('DAY_AT_OWNED', JSON.stringify(owned));
@@ -751,7 +810,28 @@ function dayDateYmd_(dt) {
   return u.getUTCFullYear() + '-' + p(u.getUTCMonth() + 1) + '-' + p(u.getUTCDate());
 }
 
-// Menu: push whatever BUY / SHORT option plans are on the Day tab right now
+// Favorable = the Day scan says BUY / SHORT AND the Time Machine says the target is the likelier end AND the average result is positive.
+// No odds yet (not computed, no history, error) = not favorable: it is held back until they exist.
+function dayFavorable_(r) {
+  if (!r || (r.Action !== 'BUY' && r.Action !== 'SHORT')) return false;
+  return /toward the target/i.test(String(r['TM Verdict'] || '')) && Number(r['TM Avg R']) > 0;
+}
+
+// Menu: push the Day rows you have selected, whatever the odds say (your own call; the automatic sync never removes these)
+function dayPushSelected_() {
+  const ui = tryGetUi_(), ss = SpreadsheetApp.getActiveSpreadsheet(), sheet = ss.getActiveSheet();
+  if (sheet.getName() !== DAY_SHEET_NAME) { notify_(ui, 'Day', 'Select one or more rows on the Day tab first.'); return; }
+  const map = dayHeaderMap_(sheet), rg = sheet.getActiveRange();
+  const r1 = Math.max(2, rg.getRow()), r2 = rg.getLastRow();
+  if (r2 < 2) { notify_(ui, 'Day', 'Select one or more rows below the header.'); return; }
+  const vals = sheet.getRange(r1, 1, r2 - r1 + 1, sheet.getLastColumn()).getValues();
+  const rows = vals.map(function (v) { const o = {}; Object.keys(map).forEach(function (h) { o[h] = v[map[h] - 1]; });
+    if (o['Opt Expiry'] instanceof Date) o['Opt Expiry'] = dayDateYmd_(o['Opt Expiry']); return o; });
+  const ymd = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+  notify_(ui, 'Day → Auto_Trade (manual)', dayPushToAutoTrade_(rows, ymd, { manual: true }) || 'Nothing added: the selected rows have no option plan, are not BUY / SHORT / WAIT, or were already sent today.');
+}
+
+// Menu: push whatever BUY / SHORT option plans are on the Day tab right now (kept for reference; not on the menu)
 function dayPushNow_() {
   const ui = tryGetUi_();
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_SHEET_NAME);
@@ -765,6 +845,174 @@ function dayPushNow_() {
 }
 
 /* ============================================================================
+ * TIME MACHINE ODDS (port of trader-timemachine from the day-trader-skill pack)
+ * ----------------------------------------------------------------------------
+ * Pool = every full past session's 5-minute bars (last 60 days) as ratios to the previous bar's close. One replay starts at the entry price and walks the rest of
+ * today's bars, each drawn from a past bar of about the same time of day (slot +/- window) and scaled to the current price. Stop is checked before the target in
+ * every bar (a bar touching both counts as the stop). Outcomes: target first / stop first / neither by the close. History: the same rule on every past session.
+ * A simulation from the stock's own recent bars, not a prediction: earnings, news and halts can do what the last 60 days never did.
+ * Same seed + same data = same numbers (mulberry32 here, so figures differ slightly from the Python tool's random generator).
+ * ========================================================================== */
+
+function dayRng_(seed) {
+  let a = seed >>> 0;
+  return function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+function dayFetchBars60_(ticker) {
+  const hosts = ['query2', 'query1'];
+  for (let h = 0; h < hosts.length; h++) {
+    try {
+      const resp = UrlFetchApp.fetch('https://' + hosts[h] + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=60d&interval=5m&includePrePost=false',
+        { method: 'get', muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' } });
+      if (resp.getResponseCode() !== 200) continue;
+      const r = (JSON.parse(resp.getContentText()).chart || {}).result;
+      const bars = dayParseBars_(r && r[0]);
+      if (bars.length) return bars;
+    } catch (e) { Logger.log('day bars60 ' + ticker + ': ' + e); }
+  }
+  return null;
+}
+
+// Full sessions (all 78 regular 5-minute bars) strictly before beforeYmd, oldest first: [[bar slot 0..77], ...]
+function dayTmSessions_(bars, beforeYmd) {
+  const by = {};
+  bars.forEach(function (b) {
+    if (b.ymd >= beforeYmd || b.m < DAY_OPEN_M || b.m >= DAY_CLOSE_M) return;
+    (by[b.ymd] = by[b.ymd] || {})[Math.floor((b.m - DAY_OPEN_M) / 5)] = b;
+  });
+  const out = [];
+  Object.keys(by).sort().forEach(function (d) {
+    const s = by[d], arr = [];
+    for (let i = 0; i < 78; i++) { if (!s[i]) return; arr.push(s[i]); }
+    out.push(arr);
+  });
+  return out;
+}
+
+function dayTmPool_(sessions) {
+  const pool = []; for (let i = 0; i < 78; i++) pool.push([]);
+  sessions.forEach(function (D) { for (let i = 1; i < 78; i++) { const pc = D[i - 1].c; pool[i].push([D[i].o / pc, D[i].h / pc, D[i].l / pc, D[i].c / pc]); } });
+  return pool;
+}
+
+// Replays bars k+1..77 from price `entry`. side 'LONG' | 'SHORT'.
+function dayTmSim_(pool, entry, stop, target, k, side, replays, seed, windowSlots) {
+  const long = side === 'LONG', risk = long ? entry - stop : stop - entry;
+  if (!(risk > 0)) return null;
+  const rT = (long ? target - entry : entry - target) / risk;
+  const rng = dayRng_(seed);
+  let nT = 0, nS = 0, nN = 0, sumR = 0; const closes = [];
+  for (let n = 0; n < replays; n++) {
+    let p = entry, out = 0;
+    for (let i = k + 1; i <= 77; i++) {
+      const j = windowSlots === 0 ? i : Math.min(77, Math.max(1, i + Math.floor(rng() * (2 * windowSlots + 1)) - windowSlots));
+      const arr = pool[j], bar = arr[Math.floor(rng() * arr.length)];
+      const hi = p * bar[1], lo = p * bar[2];
+      if (!out) {
+        if (long) { if (lo <= stop) out = 2; else if (hi >= target) out = 1; }
+        else { if (hi >= stop) out = 2; else if (lo <= target) out = 1; }
+      }
+      p = p * bar[3];
+    }
+    if (out === 1) { nT++; sumR += rT; } else if (out === 2) { nS++; sumR -= 1; } else { nN++; sumR += (long ? p - entry : entry - p) / risk; }
+    closes.push(p);
+  }
+  closes.sort(function (a, b) { return a - b; });
+  return { pT: nT / replays, pS: nS / replays, pN: nN / replays, avgR: sumR / replays, rT: rT, median: closes[Math.floor(closes.length * 0.5)] };
+}
+
+// The same rule on every past full session: first close beyond the opening range (up to the entry cutoff) = entry, stop first, then target, else the close.
+function dayTmHistory_(sessions, side, trigger, stop, target, cfg) {
+  const long = side === 'LONG', sign = long ? 1 : -1, orN = Math.max(1, Math.round(cfg.orMinutes / 5));
+  const cutSlot = Math.floor((dayMinutes_(cfg.entryCutoff) - DAY_OPEN_M) / 5);
+  const rPct = Math.abs(trigger - stop) / trigger, tR = Math.abs(target - trigger) / Math.abs(trigger - stop);
+  let nT = 0, nS = 0, nN = 0, n = 0, sumR = 0;
+  sessions.forEach(function (D) {
+    let oh = -Infinity, ol = Infinity; for (let i = 0; i < orN; i++) { oh = Math.max(oh, D[i].h); ol = Math.min(ol, D[i].l); }
+    let kk = -1; for (let i = orN; i <= cutSlot; i++) { if (long ? D[i].c > oh : D[i].c < ol) { kk = i; break; } }
+    if (kk < 0) return;
+    const trig = long ? oh : ol, R = trig * rPct, e = D[kk].c;
+    if ((e - trig) * sign > cfg.chaseR * R) return;
+    const st = trig - sign * R, tg = trig + sign * tR * R;
+    let o = 0;
+    for (let i = kk + 1; i < 78; i++) { const b = D[i]; if (long ? b.l <= st : b.h >= st) { o = 2; break; } if (long ? b.h >= tg : b.l <= tg) { o = 1; break; } }
+    n++;
+    const risk = Math.abs(e - st);
+    if (o === 1) { nT++; sumR += Math.abs(tg - e) / risk; } else if (o === 2) { nS++; sumR -= 1; } else { nN++; sumR += ((D[77].c - e) * sign) / risk; }
+  });
+  return { n: n, nT: nT, nS: nS, nN: nN, avgR: n ? sumR / n : null };
+}
+
+function dayTmVerdict_(pT, pS, rT) {
+  if (!(pT + pS > 0)) return 'Neither side is hit: the close decides';
+  const share = pT / (pT + pS), be = 1 / (1 + rT), gap = share - be, a = Math.abs(gap);
+  const toward = gap > 0 ? 'target' : 'stop';
+  if (a < 0.05) return Math.abs(rT - 1) < 0.15 ? 'Close to a coin flip' : 'Close to break-even';
+  return (a >= 0.15 ? 'Strongly toward the ' : 'Leans toward the ') + toward;
+}
+
+// One ticker. entry = the live price (or the trigger when the market is not in its regular session). Returns row fields or { why }.
+function dayOdds_(ticker, side, price, trigger, stop, target, np, C) {
+  try {
+    const O = C.odds, bars = dayFetchBars60_(ticker);
+    if (!bars) return { why: 'no 60-day bars' };
+    const sessions = dayTmSessions_(bars, np.ymd);
+    if (sessions.length < O.minSessions) return { why: 'only ' + sessions.length + ' full sessions of history (need ' + O.minSessions + ')' };
+    const orN = Math.max(1, Math.round(C.orMinutes / 5));
+    const live = np.m >= DAY_OPEN_M + C.orMinutes && np.m < DAY_CLOSE_M;
+    const k = live ? Math.max(orN, Math.floor((np.m - DAY_OPEN_M) / 5) - 1) : orN;
+    const entry = live && price > 0 ? Number(price) : Number(trigger);
+    if (k >= 77) return { why: 'session is over' };
+    const long = side === 'LONG';
+    if (long ? (entry <= stop || entry >= target) : (entry >= stop || entry <= target)) return { why: 'price is already past the stop or the target' };
+    const sim = dayTmSim_(dayTmPool_(sessions), entry, stop, target, k, side, O.replays, O.seed, O.window);
+    if (!sim) return { why: 'bad stop' };
+    const hist = dayTmHistory_(sessions, side, trigger, stop, target, C);
+    return { pT: sim.pT, pS: sim.pS, pN: sim.pN, avgR: sim.avgR, rT: sim.rT, verdict: dayTmVerdict_(sim.pT, sim.pS, sim.rT),
+      hist: hist.n ? hist.n + ' sessions: ' + hist.nT + ' target, ' + hist.nS + ' stop, ' + hist.nN + ' neither (avg ' + dayR2_(hist.avgR) + 'R)' : 'rule never fired in the history',
+      sessions: sessions.length, k: k };
+  } catch (e) { return { why: 'odds failed: ' + (e && e.message ? e.message : e) }; }
+}
+
+function dayOddsApply_(r, o) {
+  if (!o) return;
+  if (o.why) { r['TM Verdict'] = o.why; return; }
+  r['TM Target %'] = Math.round(o.pT * 1000) / 10; r['TM Stop %'] = Math.round(o.pS * 1000) / 10; r['TM Open %'] = Math.round(o.pN * 1000) / 10;
+  r['TM Avg R'] = Math.round(o.avgR * 100) / 100; r['TM History'] = o.hist; r['TM Verdict'] = o.verdict;
+}
+
+function dayOddsMemo_(ymd) {
+  let m = {}; try { m = JSON.parse(PropertiesService.getScriptProperties().getProperty('DAY_ODDS') || '{}'); } catch (e) { m = {}; }
+  return m.ymd === ymd && m.d ? m : { ymd: ymd, d: {} };
+}
+
+// Menu: odds for the BUY / SHORT / WAIT rows on the Day tab right now (WAIT rows use the trigger as the entry before the open range ends)
+function dayOddsNow_() {
+  const ui = tryGetUi_(), C = DAY_CONFIG, t0 = Date.now();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) { notify_(ui, 'Day', 'Nothing on the Day tab yet.'); return; }
+  const map = dayHeaderMap_(sheet);
+  const need = ['Ticker', 'Action', 'Side', 'Price', 'Trigger', 'Stop', 'Target', 'TM Verdict'].filter(function (h) { return !map[h]; });
+  if (need.length) { notify_(ui, 'Day', 'Missing column(s): ' + need.join(', ') + '. Run Add Option + Odds Columns (once).'); return; }
+  const np = dayNowParts_(new Date());
+  const vals = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const g = function (v, h) { return v[map[h] - 1]; };
+  const todo = []; vals.forEach(function (v, i) { if (['BUY', 'SHORT', 'WAIT'].indexOf(g(v, 'Action')) >= 0 && g(v, 'Side') && Number(g(v, 'Trigger')) > 0) todo.push({ i: i, v: v }); });
+  const memo = dayOddsMemo_(np.ymd); const lines = []; let n = 0;
+  todo.slice(0, C.odds.maxManual).forEach(function (x) {
+    if (Date.now() - t0 > 240000) return;
+    const o = dayOdds_(g(x.v, 'Ticker'), g(x.v, 'Side'), Number(g(x.v, 'Price')), Number(g(x.v, 'Trigger')), Number(g(x.v, 'Stop')), Number(g(x.v, 'Target')), np, C);
+    memo.d[g(x.v, 'Ticker') + '|' + g(x.v, 'Side')] = o;
+    const row = {}; dayOddsApply_(row, o);
+    DAY_ODDS_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(x.i + 2, map[h]).setValue(row[h] === undefined ? '' : row[h]); });
+    lines.push(g(x.v, 'Ticker') + ' ' + g(x.v, 'Side') + ': ' + (o.why ? o.why : 'target ' + row['TM Target %'] + '%, stop ' + row['TM Stop %'] + '%, open ' + row['TM Open %'] + '% -> ' + o.verdict)); n++;
+  });
+  PropertiesService.getScriptProperties().setProperty('DAY_ODDS', JSON.stringify(memo));
+  notify_(ui, 'Time Machine odds', n ? lines.join('\n') : 'No BUY / SHORT / WAIT rows with a trigger on the Day tab.');
+}
+
+/* ============================================================================
  * AUTO LOG — "what if I had placed every Auto_Trade order and never touched it"
  * ----------------------------------------------------------------------------
  * Every order the Day tab adds to Auto_Trade is logged to the AutoLog tab and followed with live option quotes (every 5 minutes, from the
@@ -774,12 +1022,20 @@ function dayPushNow_() {
  *   TARGET     bid reached the profit price: sold at the profit price
  *   STOPPED    bid fell to the stop: sold at the bid (a market stop fills at the bid, usually a little under the stop)
  *   EXPIRED    the contract expired while open (closed at the last mark)
+ *   SIGNAL CLOSE  the log's own advice (CLOSE / CONSIDER CLOSING, see alogSignal_) turned up: sold at the bid, as if you had followed it
  * P/L $ = (exit - entry) x 100 x lots - fees. Open positions show Open P/L at the bid until they settle; they carry over days.
  * Limits: quotes are sampled every 5 minutes, so a touch between two samples is missed; wide option spreads make real fills worse than this.
+ *
+ * MY TRADES: when you place an order from Auto_Trade (its Status leaves Review: Sent / Live / In Position / Filled / Closed) the log row becomes YOURS:
+ *   Mine = YES, the row moves to the top of the tab, and it follows your REAL order from then on (real fill price, real exit price, status CLOSED when the exit fills).
+ *   While it is OPEN it shows a Signal every 5 minutes: TAKE PROFIT / CLOSE NOW / CLOSE / CONSIDER CLOSING / WATCH / HOLD, with the reason in Signal Why.
+ *   The decay rules (see alogSignal_): expiry within 1 day, no movement for a while, and an end-of-day / held-overnight-under-water warning. A phone alert goes out when the
+ *   signal turns to TAKE PROFIT, CLOSE NOW or CLOSE. The signal only advises; nothing is sold for you.
  * ========================================================================== */
 
-const ALOG_CONFIG = { sheet: 'AutoLog', feePerLot: 1.00 };   // feePerLot: opening commission per contract (closing is free at TastyTrade; check your own fee schedule)
-const ALOG_HEADERS = ['Date', 'Ticker', 'Action', 'Contract', 'Added', 'Limit', 'Stop', 'Target', 'Lots', 'Status', 'Filled At', 'Entry', 'Exit', 'Exit Time',
+const ALOG_CONFIG = { sheet: 'AutoLog', feePerLot: 1.00, stallMin: 90, stallPct: 0.05, expiryCloseDays: 1, eodBeforeMin: 15, paperExitOn: ['CLOSE', 'CONSIDER CLOSING'] };   // paperExitOn: the signals that close a PAPER trade at the bid (what you would have done)   // feePerLot: opening commission per contract (closing is free at TastyTrade; check your own fee schedule)
+const ALOG_NEW_COLS = ['Mine', 'Signal', 'Signal Why', 'Real Status'];
+const ALOG_HEADERS = ['Date', 'Ticker', 'Mine', 'Signal', 'Signal Why', 'Real Status', 'Action', 'Contract', 'Added', 'Limit', 'Stop', 'Target', 'Lots', 'Status', 'Filled At', 'Entry', 'Exit', 'Exit Time',
   'P/L $', 'P/L %', 'Mark', 'Open P/L $', 'Bid High', 'Bid Low', 'Underlying', 'Score', 'Symbol', 'Expiry'];
 const ALOG_TEXT_COLS = ['Date', 'Added', 'Filled At', 'Exit Time', 'Symbol', 'Expiry'];
 
@@ -790,7 +1046,8 @@ function alogOcc_(ticker, expiryYmd, cp, strike) {
 function alogSheet_(create) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(ALOG_CONFIG.sheet);
-  if (sh || !create) return sh;
+  if (sh) { alogEnsureCols_(sh); return sh; }
+  if (!create) return sh;
   sh = ss.insertSheet(ALOG_CONFIG.sheet);
   sh.getRange(1, 1, 1, ALOG_HEADERS.length).setValues([ALOG_HEADERS]).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(1); sh.setFrozenColumns(2);
@@ -807,6 +1064,34 @@ function alogSheet_(create) {
   });
   sh.setConditionalFormatRules(rules);
   return sh;
+}
+
+// Older AutoLog tabs get the Mine / Signal columns added right after Ticker (all four missing) or at the end (some missing)
+function alogEnsureCols_(sh) {
+  const w = sh.getLastColumn(); if (w < 1) return;
+  const hdr = sh.getRange(1, 1, 1, w).getValues()[0].map(function (h) { return String(h || '').trim(); });
+  const missing = ALOG_NEW_COLS.filter(function (h) { return hdr.indexOf(h) < 0; });
+  if (!missing.length) return;
+  let at;
+  if (missing.length === ALOG_NEW_COLS.length && hdr.indexOf('Ticker') >= 0) { at = hdr.indexOf('Ticker') + 2; sh.insertColumnsAfter(at - 1, missing.length); }
+  else at = w + 1;
+  sh.getRange(1, at, 1, missing.length).setValues([missing]).setFontWeight('bold').setHorizontalAlignment('center');
+  const sw = missing.indexOf('Signal Why'); if (sw >= 0) sh.setColumnWidth(at + sw, 280);
+}
+
+// Keeps YOUR trades at the top (open ones first, then newest); everything else stays in the order it was logged. Plain values only, formats are per column.
+function alogReorder_(sh) {
+  const w = sh.getLastColumn(), n = sh.getLastRow() - 1; if (n < 2) return;
+  const hdr = sh.getRange(1, 1, 1, w).getValues()[0].map(function (h) { return String(h || '').trim(); });
+  const cM = hdr.indexOf('Mine'), cS = hdr.indexOf('Status'), cD = hdr.indexOf('Date'), cA = hdr.indexOf('Added'); if (cM < 0 || cS < 0) return;
+  const rng = sh.getRange(2, 1, n, w), vals = rng.getValues();
+  const idx = vals.map(function (v, i) { return i; });
+  const mine = idx.filter(function (i) { return vals[i][cM] === 'YES'; }), rest = idx.filter(function (i) { return vals[i][cM] !== 'YES'; });
+  const act = function (i) { const t = vals[i][cS]; return t === 'OPEN' || t === 'PENDING' ? 0 : 1; };
+  mine.sort(function (a, b) { return act(a) - act(b) || String(vals[b][cD]).localeCompare(String(vals[a][cD])) || String(vals[b][cA]).localeCompare(String(vals[a][cA])) || a - b; });
+  const order = mine.concat(rest);
+  if (order.every(function (x, i) { return x === i; })) return;
+  rng.setValues(order.map(function (i) { return vals[i]; }));
 }
 
 function alogRead_(sh) {
@@ -874,14 +1159,72 @@ function alogStep_(r, q, ctx) {
     r['Bid High'] = Math.max(Number(r['Bid High']) || bid, bid); r['Bid Low'] = Math.min(Number(r['Bid Low']) || bid, bid);
     if (target && bid >= target) close('TARGET', target);
     else if (stop && bid <= stop) close('STOPPED', bid);
-    else r['Open P/L $'] = r2((bid - entry) * 100 * lots - fee);
+    else {
+      r['Open P/L $'] = r2((bid - entry) * 100 * lots - fee);
+      const sg = alogSignal_(r, q, ctx); r.Signal = sg.signal; r['Signal Why'] = sg.why;
+      if (ALOG_CONFIG.paperExitOn.indexOf(sg.signal) >= 0) close('SIGNAL CLOSE', bid);   // you follow the advice: out at the bid, reason stays in Signal Why
+    }
+  }
+  return r;
+}
+
+// Fill prices out of the Auto_Trade Result text: "entry filled @ 2.55 | exit filled @ 3.06" (bracket) or "Filled @ 2.55" (single order). Pure.
+function alogRealFill_(status, text) {
+  const t = String(text || ''), e = t.match(/(?:entry filled|^filled)\s*@\s*([\d.]+)/i), x = t.match(/exit filled\s*@\s*([\d.]+)/i);
+  return { entry: e ? Number(e[1]) : null, exit: x ? Number(x[1]) : null };
+}
+
+const ALOG_PLACED = ['sent', 'live', 'in position', 'filled', 'closed', 'received', 'working'];
+const ALOG_DEAD = ['cancelled', 'canceled', 'rejected', 'error', 'expired', 'removed'];
+
+// Advice for an OPEN position of yours. Pure. ctx: { ymd, nowM, closeM }. Returns { signal, why }.
+function alogSignal_(r, q, ctx) {
+  const bid = q && q.bid > 0 ? q.bid : null, entry = Number(r.Entry), mark = Number(r.Mark) || null;
+  const px = bid != null ? bid : mark;
+  if (!(entry > 0) || px == null) return { signal: r.Signal || '', why: r['Signal Why'] || '' };
+  const C = ALOG_CONFIG, stop = Number(r.Stop) || null, target = Number(r.Target) || null;
+  const pct = (px - entry) / entry, pctTxt = (pct >= 0 ? '+' : '') + Math.round(pct * 100) + '%';
+  const dte = Math.round((Date.UTC(+String(r.Expiry).slice(0, 4), +String(r.Expiry).slice(5, 7) - 1, +String(r.Expiry).slice(8, 10)) - Date.UTC(+ctx.ymd.slice(0, 4), +ctx.ymd.slice(5, 7) - 1, +ctx.ymd.slice(8, 10))) / 86400000);
+  const fm = String(r['Filled At'] || '').match(/^(\d+):(\d+)/), sameDay = r.Date === ctx.ymd;
+  const heldMin = sameDay && fm ? ctx.nowM - (+fm[1] * 60 + +fm[2]) : null;
+  if (target && bid != null && bid >= target) return { signal: 'TAKE PROFIT', why: 'bid ' + bid.toFixed(2) + ' reached your profit price ' + target.toFixed(2) };
+  if (stop && bid != null && bid <= stop) return { signal: 'CLOSE NOW', why: 'bid ' + bid.toFixed(2) + ' is at or under your stop ' + stop.toFixed(2) };
+  if (dte <= C.expiryCloseDays) return { signal: 'CLOSE', why: dte <= 0 ? 'expires today: decay is at its fastest' : 'expires in ' + dte + ' day: decay is steep and the price can swing hard' };
+  if (heldMin != null && heldMin >= C.stallMin && Math.abs(pct) < C.stallPct) return { signal: 'CLOSE', why: 'no movement in ' + heldMin + ' min (' + pctTxt + '): time decay is now working against you' };
+  if (!sameDay && pct <= 0) return { signal: 'CONSIDER CLOSING', why: 'held since ' + r.Date + ' and still under your entry (' + pctTxt + '): decay keeps eating it' };
+  if (ctx.nowM >= ctx.closeM - C.eodBeforeMin && pct < C.stallPct * 2) return { signal: 'CONSIDER CLOSING', why: 'end of day and not clearly ahead (' + pctTxt + '): it decays overnight' };
+  if (stop && entry > stop && (entry - px) >= 0.5 * (entry - stop)) return { signal: 'WATCH', why: 'halfway to your stop (' + pctTxt + ')' };
+  return { signal: 'HOLD', why: pctTxt + (dte >= 0 ? ', ' + dte + ' days to expiry' : '') };
+}
+
+// One step for a row that is YOURS: real fills decide entry and exit; the quote only drives the mark, open P/L and the signal. Pure. ctx: { ymd, hm, nowM, closeM, afterClose, fee }
+function alogStepMine_(r, q, ctx, real) {
+  const lots = Number(r.Lots) || 1, fee = ctx.fee * lots, r2 = function (x) { return Math.round(x * 100) / 100; };
+  const bid = q && q.bid > 0 ? q.bid : null, ask = q && q.ask > 0 ? q.ask : null;
+  if (bid != null && ask != null) r.Mark = r2((bid + ask) / 2);
+  if (real.entry != null && (r.Status === 'PENDING' || r.Status === 'NOT FILLED' || r.Status === 'OPEN')) {
+    if (r.Status !== 'OPEN') { r.Status = 'OPEN'; r['Filled At'] = ctx.hm; r.Date = r.Date || ctx.ymd; }
+    r.Entry = real.entry;
+  }
+  if (r.Status !== 'OPEN') return r;
+  const entry = Number(r.Entry);
+  const close = function (status, exit) {
+    r.Status = status; r.Exit = r2(exit); r['Exit Time'] = ctx.ymd + ' ' + ctx.hm;
+    r['P/L $'] = r2((exit - entry) * 100 * lots - fee); r['P/L %'] = Math.round((exit - entry) / entry * 1000) / 10; r['Open P/L $'] = ''; r.Signal = ''; r['Signal Why'] = '';
+  };
+  if (real.exit != null) { close('CLOSED', real.exit); return r; }
+  if (ctx.ymd > r.Expiry) { close('EXPIRED', Number(r.Mark) > 0 ? Number(r.Mark) : 0); return r; }
+  if (bid != null && !ctx.afterClose) {
+    r['Bid High'] = Math.max(Number(r['Bid High']) || bid, bid); r['Bid Low'] = Math.min(Number(r['Bid Low']) || bid, bid);
+    r['Open P/L $'] = r2((bid - entry) * 100 * lots - fee);
+    const sg = alogSignal_(r, q, ctx); r.Signal = sg.signal; r['Signal Why'] = sg.why;
   }
   return r;
 }
 
 // Totals for the dialog / the end-of-day alert. Pure.
 function alogStats_(recs, ymd) {
-  const settled = recs.filter(function (r) { return r.Status === 'TARGET' || r.Status === 'STOPPED' || r.Status === 'EXPIRED'; });
+  const settled = recs.filter(function (r) { return r.Status === 'TARGET' || r.Status === 'STOPPED' || r.Status === 'EXPIRED' || r.Status === 'CLOSED' || r.Status === 'SIGNAL CLOSE'; });
   const open = recs.filter(function (r) { return r.Status === 'OPEN'; });
   const pl = function (r) { return Number(r['P/L $']) || 0; };
   const sum = function (a, f) { return a.reduce(function (t, r) { return t + f(r); }, 0); };
@@ -898,6 +1241,22 @@ function alogStats_(recs, ymd) {
     expectancy: settled.length ? sum(settled, pl) / settled.length : null, byDay: byDay, byAct: byAct };
 }
 
+// Auto_Trade rows as { 'TICKER|yyyy-mm-dd|65P': { status, text } } (the bottom-most row wins when a contract repeats)
+function alogReadAutoTrade_() {
+  const out = {}, sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_CONFIG.autoTrade.sheet);
+  if (!sh || sh.getLastRow() < 2) return out;
+  const m = dayAtHeaderMap_(sh); if (!m.ticker || !m.expiry || !m.strike || !m.status) return out;
+  const n = sh.getLastRow() - 1, w = sh.getLastColumn(), v = sh.getRange(2, 1, n, w).getValues();
+  v.forEach(function (row) {
+    const t = String(row[m.ticker - 1]).trim().toUpperCase(), sk = String(row[m.strike - 1]).trim().toUpperCase(); let ex = row[m.expiry - 1];
+    if (!t || !sk || !ex) return;
+    if (ex instanceof Date) ex = dayDateYmd_(ex);
+    else { const p = String(ex).match(/^(\d+)\/(\d+)\/(\d{4})$/); ex = p ? p[3] + '-' + ('0' + p[1]).slice(-2) + '-' + ('0' + p[2]).slice(-2) : String(ex).slice(0, 10); }
+    out[t + '|' + ex + '|' + sk] = { status: String(row[m.status - 1]).trim(), text: m.result ? String(row[m.result - 1] || '') : '' };
+  });
+  return out;
+}
+
 function alogUpdateNow_() { alogTick_(true); const ui = tryGetUi_(); if (ui) notify_(ui, 'Auto Log', 'Updated. See the AutoLog tab.'); }
 
 // Every 5 minutes (from the Day schedule's trigger) and after each Day scan. Does nothing unless an order is PENDING / OPEN.
@@ -910,23 +1269,48 @@ function alogTick_(force) {
   if (!lock.tryLock(5000)) return;
   try {
     const { map, recs } = alogRead_(sh);
-    const active = recs.filter(function (r) { return r.Status === 'PENDING' || r.Status === 'OPEN'; });
     const props = PropertiesService.getScriptProperties();
     const afterClose = np.m >= np.closeM;
+    const hm = Utilities.formatDate(now, 'America/New_York', 'HH:mm');
+    const keyOf = function (r) { return String(r.Ticker).toUpperCase() + '|' + r.Expiry + '|' + String(r.Contract).split(' ')[0].toUpperCase(); };
+    // ---- which log rows are YOURS: the Auto_Trade row of the same contract has left Review
+    let at = null;
+    const live = function (r) { return r.Status === 'PENDING' || r.Status === 'OPEN'; };
+    if (recs.some(function (r) { return r.Mine === 'YES' ? (live(r) || r.Status === 'NOT FILLED') : (r.Date === np.ymd && r.Status !== 'NOT FILLED') || live(r); })) at = alogReadAutoTrade_();
+    const changed = {}; let mineChanged = false;
+    if (at) recs.forEach(function (r) {
+      const a = at[keyOf(r)]; if (!a) return;
+      const st = String(a.status).trim().toLowerCase();
+      if (r.Mine !== 'YES') {
+        if (ALOG_PLACED.indexOf(st) >= 0 && (r.Date === np.ymd || live(r))) { r.Mine = 'YES'; r['Real Status'] = a.status; changed[r._row] = r; mineChanged = true; }
+        return;
+      }
+      if (r['Real Status'] !== a.status) { r['Real Status'] = a.status; changed[r._row] = r; }
+      if (ALOG_DEAD.indexOf(st) >= 0 && r.Status === 'PENDING' && !alogRealFill_(a.status, a.text).entry) { r.Status = 'NOT FILLED'; r.Mine = ''; changed[r._row] = r; mineChanged = true; }
+    });
+    const active = recs.filter(live);
     if (active.length) {
-      const hm = Utilities.formatDate(now, 'America/New_York', 'HH:mm');
       let quotes = {};
       const token = getTastyTradeAccessToken_();
       if (token) {
         const raw = fetchTastyMarketDataBatch_(active.map(function (r) { return String(r.Symbol); }).filter(function (v, i, a) { return v && a.indexOf(v) === i; }), token);
         Object.keys(raw).forEach(function (k) { quotes[k.replace(/\s+/g, '')] = raw[k]; });
       }
+      const cfg = getAlertConfig_(), ctx = { ymd: np.ymd, hm: hm, nowM: np.m, closeM: np.closeM, afterClose: afterClose, fee: ALOG_CONFIG.feePerLot };
       active.forEach(function (r) {
-        const before = JSON.stringify(r);
-        alogStep_(r, quotes[String(r.Symbol).replace(/\s+/g, '')], { ymd: np.ymd, hm: hm, afterClose: afterClose, fee: ALOG_CONFIG.feePerLot });
-        if (JSON.stringify(r) !== before) alogWriteRow_(sh, map, r);
+        const before = JSON.stringify(r), prevSig = r.Signal, q = quotes[String(r.Symbol).replace(/\s+/g, '')];
+        if (r.Mine === 'YES') {
+          const a = at && at[keyOf(r)];
+          alogStepMine_(r, q, ctx, a ? alogRealFill_(a.status, a.text) : { entry: null, exit: null });
+          if (r.Signal && r.Signal !== prevSig && ['TAKE PROFIT', 'CLOSE NOW', 'CLOSE'].indexOf(r.Signal) >= 0 && cfg.ready) {
+            try { sendPhoneAlert_(cfg, r.Signal + ': ' + r.Ticker + ' ' + r.Contract, r['Signal Why'] + ' | open ' + (Number(r['Open P/L $']) >= 0 ? '+' : '-') + '$' + Math.abs(Number(r['Open P/L $']) || 0).toFixed(0), false); } catch (e) {}
+          }
+        } else alogStep_(r, q, ctx);
+        if (JSON.stringify(r) !== before) { changed[r._row] = r; if (r.Mine === 'YES') mineChanged = true; }
       });
     }
+    Object.keys(changed).forEach(function (k) { alogWriteRow_(sh, map, changed[k]); });
+    if (mineChanged) alogReorder_(sh);
     // once per day after the close: a short result line to the phone
     if (afterClose && props.getProperty('ALOG_LAST_EOD') !== np.ymd) {
       props.setProperty('ALOG_LAST_EOD', np.ymd);
@@ -949,6 +1333,8 @@ function alogShowStats_() {
     'Win rate: ' + (t.winRate == null ? '-' : Math.round(t.winRate * 100) + '%') + '   avg win ' + d(t.avgWin) + '   avg loss ' + d(t.avgLoss) + '   per trade ' + d(t.expectancy), '',
     'By day (settled that day):'].concat(Object.keys(t.byDay).sort().slice(-10).map(function (k) { const x = t.byDay[k]; return '  ' + k + ': ' + x.filled + '/' + x.n + ' filled, ' + x.settled + ' settled, ' + d(x.net); }),
     ['', 'By action:'], Object.keys(t.byAct).map(function (k) { const x = t.byAct[k]; return '  ' + k + ': ' + x.n + ' settled, ' + Math.round(x.w / x.n * 100) + '% wins, ' + d(x.net); }));
+  const mine = alogRead_(sh).recs.filter(function (r) { return r.Mine === 'YES'; });
+  if (mine.length) { const tm = alogStats_(mine, ''); lines.push('', 'MY TRADES (placed from Auto_Trade): ' + tm.total + '   open: ' + tm.open + '   settled: ' + tm.settled, '  NET settled ' + d(tm.net) + '   open (at bid) ' + d(tm.openPL) + '   win rate ' + (tm.winRate == null ? '-' : Math.round(tm.winRate * 100) + '%')); }
   notify_(ui, 'Auto Log', lines.join('\n'));
 }
 
@@ -1108,10 +1494,26 @@ function dayRun_(mode, opts) {
         });
     }
 
+    // Time Machine odds for the live BUY / SHORT rows (once per ticker and side per day; a few seconds each)
+    if (C.odds && C.odds.enabled && np.m >= DAY_OPEN_M + C.orMinutes) {
+      try {
+        const memo = dayOddsMemo_(np.ymd); let done = 0, dirty = false;
+        rows.filter(function (r) { return (r.Action === 'BUY' || r.Action === 'SHORT') && !held0[r.Ticker] && r.Side; }).forEach(function (r) {
+          const key = r.Ticker + '|' + r.Side;
+          if (!memo.d[key] && done < C.odds.maxPerScan && Date.now() - startMs < 240000) {
+            const x = res[r.Ticker];
+            if (x && x.sig && x.sig.trigger > 0) { memo.d[key] = dayOdds_(r.Ticker, r.Side, r.Price, x.sig.trigger, x.sig.stop, x.sig.target, np, C); done++; dirty = true; }
+          }
+          if (memo.d[key]) dayOddsApply_(r, memo.d[key]);
+        });
+        if (dirty) PropertiesService.getScriptProperties().setProperty('DAY_ODDS', JSON.stringify(memo));
+      } catch (e) { logToSheet_('Day odds failed: ' + (e && e.message ? e.message : e)); }
+    }
+
     // hand the live BUY / SHORT option plans to Auto_Trade (appends only; never touches your existing rows)
     let pushNote = '';
     if (C.optionHints && C.autoTrade && C.autoTrade.enabled && np.m >= DAY_OPEN_M && np.m < DAY_CLOSE_M) {
-      try { pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd); } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
+      try { pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd, { filter: C.autoTrade.requireFavorable ? dayFavorable_ : null }); } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
     }
 
     try { alogTick_(false); } catch (e) { logToSheet_('AutoLog update failed: ' + (e && e.message ? e.message : e)); }
@@ -1157,7 +1559,7 @@ function dayFormat_(sheet, n, map) {
   ['Price', 'Change', 'Entry Date', 'Entry', 'Qty'].forEach(center);
   ['Trigger', 'Stop', 'Target', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   ['Gap %', 'VW %', 'ATR %', 'Spread %', 'P/L %'].forEach(function (h) { fmt(h, '0.00'); });
-  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0');
+  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0'); fmt('TM Target %', '0.0'); fmt('TM Stop %', '0.0'); fmt('TM Open %', '0.0'); fmt('TM Avg R', '0.00');
   fmt('RVOL', '0.0'); fmt('Pre RVOL', '0.0'); fmt('Score', '0'); fmt('R', '0.0'); fmt('P/L $', '$#,##0.00;-$#,##0.00;$0.00'); fmt('LastRun', 'hh:mm');
   if (map.Change) {
     const rules = sheet.getConditionalFormatRules();
