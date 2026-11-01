@@ -31,6 +31,7 @@
 const DAY_SHEET_NAME = 'Day';
 const DAY_LOG_SHEET = 'DayLog';
 const DAY_TICK_FN = 'dayScheduledTick_';
+const DAY_FAST_FN = 'dayFastTick_';
 
 const DAY_CONFIG = {
   orMinutes: 5,                 // opening range length
@@ -55,6 +56,16 @@ const DAY_CONFIG = {
   // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
   // Time Machine odds (port of the day-trader-skill replay): BUY / SHORT rows get target-first / stop-first odds from the stock's own last 60 days of 5-minute bars
   odds: { enabled: true, replays: 5000, window: 2, minSessions: 20, maxPerScan: 4, maxManual: 8, seed: 19 },
+  // Safety gates: a BUY / SHORT reaches Auto_Trade only if it passes ALL of these (the Gate column on the Day tab says PASS or why it was blocked)
+  gates: {
+    earnings: { enabled: true, failClosed: true, daysAhead: 14 },   // blocked when the company reports between today and the option's expiry; failClosed: if the calendar cannot be loaded, block (and alert)
+    delta: { min: 0.40, max: 0.75 },     // |delta| of the picked contract (the picker aims at 0.60); a contract without a delta passes
+    maxSpreadOfGain: 0.30                // bid/ask spread in dollars must be at most this share of the planned gain (target minus limit)
+  },
+  // Account guard: stops NEW rows going to Auto_Trade (existing rows are left alone). Counts the AutoLog trades that were approved or sent by hand.
+  guard: { enabled: true, dailyLossUsd: 150, maxOpen: 3, lossStreak: 3, cooldownMin: 60 },
+  // Fast scan: its own on/off in the menu. Apps Script cannot trigger every 3 minutes, so a 1-minute trigger wakes up and only scans every everySec
+  fast: { fromHm: '09:36', untilHm: '11:30', everySec: 180, maxRunsPerDay: 80 },
   autoTrade: { enabled: true, sheet: 'Auto_Trade', status: 'Review', minQty: 1, includeWait: false, lots: 1, requireFavorable: true },   // includeWait: also add WAIT rows (not triggered yet)
   optMinDte: 2,                 // never the 0-1 day contract: theta and spreads are brutal; use the first expiry at least this many days out
   optTargetDelta: 0.60,         // slightly in the money: moves like the stock, less premium wasted on time value
@@ -78,9 +89,10 @@ const DAY_CONFIG = {
 // the ones you don't have (once; delete any you don't want and they stay deleted).
 const DAY_OPTION_HEADERS = ['Opt Action', 'Opt Expiry', 'Opt Strike', 'Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Qty', 'Opt Delta', 'Opt Spread %', 'Opt OI'];
 const DAY_ODDS_HEADERS = ['TM Target %', 'TM Stop %', 'TM Open %', 'TM Avg R', 'TM History', 'TM Verdict'];
+const DAY_GATE_HEADERS = ['Gate'];
 const DAY_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'Side', 'Setup', 'Score', 'Trigger', 'Stop', 'Target', 'Size',
   'Gap %', 'RVOL', 'Pre RVOL', 'ATR %', 'VW %', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low', 'Spread %', 'Catalyst', 'Tape',
-  'P/L $', 'P/L %', 'R', 'Why', 'Option'].concat(DAY_OPTION_HEADERS).concat(DAY_ODDS_HEADERS).concat(['LastRun', 'SortKey']);
+  'P/L $', 'P/L %', 'R', 'Why', 'Option'].concat(DAY_OPTION_HEADERS).concat(DAY_ODDS_HEADERS).concat(DAY_GATE_HEADERS).concat(['LastRun', 'SortKey']);
 const DAY_ENTRY_COL = 5;
 const DAY_ENTRY_FORMULA = '=sumproduct(E2:E92,F2:F92)';
 
@@ -425,10 +437,13 @@ function dayAddMenu_() {
     .addSeparator()
     .addItem('▶ Start Schedule', 'startDaySchedule_')
     .addItem('■ Stop Schedule', 'stopDaySchedule_')
+    .addItem('⏩ Fast Scan (3 min) ON', 'startDayFast_')
+    .addItem('⏹ Fast Scan OFF', 'stopDayFast_')
     .addItem('Schedule Status', 'dayScheduleStatus_')
     .addSeparator()
     .addItem('📒 Day Stats (option orders)', 'alogShowStats_')
     .addItem('📒 Update Log Now', 'alogUpdateNow_')
+    .addItem('📊 Update Scorecard (AutoScore tab)', 'alogScoreNow_')
     .addSubMenu(SpreadsheetApp.getUi().createMenu('🔍 Debug').addItem('One Ticker (full trail)', 'debugDayOneTicker').addItem('Old stock-level stats (DayLog)', 'dayShowStats_').addItem('Old stock-level replay of today', 'dayEodNow_').addItem('Compare old vs new replay rule (past days)', 'dayReplayCompare_'))
     .addToUi();
 }
@@ -477,7 +492,7 @@ function dayAddOptionColumns_() {
   const lastCol = Math.max(sheet.getLastColumn(), 1);
   const have = {}; sheet.getRange(1, 1, 1, lastCol).getValues()[0].forEach(function (v) { have[String(v).trim()] = true; });
   let next = lastCol; while (next > 0 && String(sheet.getRange(1, next).getValue()).trim() === '') next--;
-  const add = DAY_OPTION_HEADERS.concat(DAY_ODDS_HEADERS).filter(function (h) { return !have[h]; });
+  const add = DAY_OPTION_HEADERS.concat(DAY_ODDS_HEADERS).concat(DAY_GATE_HEADERS).filter(function (h) { return !have[h]; });
   add.forEach(function (h) { next++; sheet.getRange(1, next).setValue(h).setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3'); });
   notify_(tryGetUi_(), 'Day', add.length ? 'Added ' + add.length + ' option column(s) at the end: ' + add.join(', ') + '.\nMove or delete them as you like; the scan follows the header names.' : 'All option columns are already there.');
 }
@@ -505,7 +520,7 @@ function dayAddExtraTickers_() {
   notify_(ui, 'Day', 'Extra tickers saved: ' + (list.join(', ') || '(none)'));
 }
 
-function dayRemoveTriggers_() { let n = 0; ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === DAY_TICK_FN) { ScriptApp.deleteTrigger(t); n++; } }); return n; }
+function dayRemoveTriggers_(includeFast) { let n = 0; ScriptApp.getProjectTriggers().forEach(function (t) { const f = t.getHandlerFunction(); if (f === DAY_TICK_FN || (includeFast && f === DAY_FAST_FN)) { ScriptApp.deleteTrigger(t); n++; } }); return n; }
 function startDaySchedule_() {
   dayRemoveTriggers_();
   ScriptApp.newTrigger(DAY_TICK_FN).timeBased().everyMinutes(DAY_CONFIG.tickMinutes).create();
@@ -514,12 +529,14 @@ function startDaySchedule_() {
     (S.closeCheck ? '\nPlus one CLOSE check at ' + dayHm_(DAY_CLOSE_M - DAY_CONFIG.closeBeforeMin - 5) + ' if you hold something.' : '') + (S.eodReplay ? '\nPlus the 16:05 paper replay.' : '') +
     '\n(A ' + DAY_CONFIG.tickMinutes + '-minute trigger wakes up and exits at once unless a slot is due.)');
 }
-function stopDaySchedule_() { notify_(tryGetUi_(), 'Day schedule', 'Stopped (' + dayRemoveTriggers_() + ' trigger(s) removed).'); }
+function stopDaySchedule_() { notify_(tryGetUi_(), 'Day schedule', 'Stopped (' + dayRemoveTriggers_(true) + ' trigger(s) removed, the fast scan included).'); }
 function dayScheduleStatus_() {
   const p = PropertiesService.getScriptProperties();
   const on = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === DAY_TICK_FN; }).length;
+  const fastOn = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === DAY_FAST_FN; }).length;
+  let fr = {}; try { fr = JSON.parse(p.getProperty('DAY_FAST_RUNS') || '{}'); } catch (e) {}
   const a = dayAccount_();
-  notify_(tryGetUi_(), 'Day schedule status', 'Schedule: ' + (on ? 'ON' : 'OFF') + '\nLast pre-market scan: ' + (p.getProperty('DAY_LAST_PRE') || 'never') + '\nLast full scan: ' + (p.getProperty('DAY_LAST_FULL') || 'never') +
+  notify_(tryGetUi_(), 'Day schedule status', 'Schedule: ' + (on ? 'ON' : 'OFF') + '\nFast scan (' + DAY_CONFIG.fast.everySec / 60 + ' min): ' + (fastOn ? 'ON' : 'OFF') + (fr.ymd ? ' (runs on ' + fr.ymd + ': ' + fr.n + ')' : '') + '\nLast pre-market scan: ' + (p.getProperty('DAY_LAST_PRE') || 'never') + '\nLast full scan: ' + (p.getProperty('DAY_LAST_FULL') || 'never') +
     '\nLast paper replay: ' + (p.getProperty('DAY_LAST_EOD') || 'never') + '\nAccount: ' + a.account + ' x' + a.leverage + '\nPhone alerts: ' + (getAlertConfig_().ready ? 'ready' : 'NOT set up (menu: Quick and Leap > Phone Alerts)'));
 }
 
@@ -684,6 +701,120 @@ function dayOptionProposal_(ticker, side, price, R, token, acct) {
 }
 
 /* ============================================================================
+ * SAFETY GATES, ACCOUNT GUARD, ALERTS
+ * ----------------------------------------------------------------------------
+ * dayGate_      one BUY / SHORT row: has an option plan, odds favorable (Time Machine), delta in range, spread cost small against the planned gain, no earnings
+ *               before the option expires. Result { ok, why[], hard }. hard = a real reason (not just "odds not ready" / "calendar unavailable"): only hard failures
+ *               remove a Review row that is already in Auto_Trade.
+ * alogGuard_    pure: from the AutoLog rows, is it too late to open anything new today (daily loss, open positions, losing streak)?
+ * dayAlertOnce_ one phone alert per problem per day.
+ * Nothing here sells or cancels anything.
+ * ========================================================================== */
+
+function dayAddDays_(ymd, n) { const d = new Date(ymd + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+
+// Earnings dates (first report on or after today) for the names being scanned. One Finnhub call per day, cached; { ok, off, map, fallback }
+function dayEarningsMap_(np, names) {
+  const G = DAY_CONFIG.gates.earnings, props = PropertiesService.getScriptProperties(), fallback = dayAddDays_(np.ymd, 7);
+  if (!G.enabled) return { ok: true, off: true, map: {}, fallback: fallback };
+  let c = {}; try { c = JSON.parse(props.getProperty('DAY_EARN') || '{}'); } catch (e) { c = {}; }
+  if (c.ymd === np.ymd && c.cov && names.every(function (t) { return c.cov.indexOf(t) >= 0; })) return { ok: true, map: c.map || {}, fallback: fallback };
+  let cal = null;
+  try { if (typeof earnFetchCalendar_ === 'function') cal = earnFetchCalendar_(np.ymd, dayAddDays_(np.ymd, G.daysAhead)); } catch (e) { logToSheet_('Day earnings calendar failed: ' + (e && e.message ? e.message : e)); }
+  if (!cal) return { ok: false, map: {}, fallback: fallback };
+  const want = {}; names.concat(c.ymd === np.ymd && c.cov ? c.cov : []).forEach(function (t) { want[t] = true; });
+  const map = {};
+  cal.forEach(function (e) { if (want[e.symbol] && e.ymd >= np.ymd && (!map[e.symbol] || e.ymd < map[e.symbol])) map[e.symbol] = e.ymd; });
+  props.setProperty('DAY_EARN', JSON.stringify({ ymd: np.ymd, cov: Object.keys(want), map: map }));
+  return { ok: true, map: map, fallback: fallback };
+}
+
+function dayEarningsBlock_(r, em) {
+  if (!em || em.off) return '';
+  if (!em.ok) return DAY_CONFIG.gates.earnings.failClosed ? 'earnings calendar unavailable' : '';
+  const d = em.map[String(r.Ticker).toUpperCase()]; if (!d) return '';
+  const exp = /^\d{4}-\d{2}-\d{2}$/.test(String(r['Opt Expiry'])) ? String(r['Opt Expiry']) : em.fallback;
+  return d <= exp ? 'earnings ' + d + ' before the option expires (' + exp + ')' : '';
+}
+
+function dayGate_(r, em) {
+  const G = DAY_CONFIG.gates, A = DAY_CONFIG.autoTrade, why = [];
+  if (!r || (r.Action !== 'BUY' && r.Action !== 'SHORT')) return { ok: false, why: ['not a live BUY / SHORT'], hard: true };
+  if (!dayAutoTradeOrder_(r, A.minQty, false, A.lots)) why.push('no option plan');
+  if (A.requireFavorable && !dayFavorable_(r)) why.push(r['TM Verdict'] ? 'odds: ' + r['TM Verdict'] : 'odds not ready');
+  const dRaw = r['Opt Delta'], d = Math.abs(Number(dRaw));
+  if (dRaw !== '' && dRaw != null && !isNaN(d) && (d < G.delta.min || d > G.delta.max)) why.push('delta ' + d.toFixed(2) + ' outside ' + G.delta.min + ' to ' + G.delta.max);
+  const mid = Number(r['Opt Mid']), sp = Number(r['Opt Spread %']), gain = Number(r['Opt Target']) - Number(r['Opt Limit']);
+  if (mid > 0 && sp > 0 && gain > 0 && (sp / 100 * mid) > G.maxSpreadOfGain * gain) why.push('spread costs ' + Math.round(sp / 100 * mid / gain * 100) + '% of the planned gain');
+  const eb = dayEarningsBlock_(r, em); if (eb) why.push(eb);
+  return { ok: !why.length, why: why, hard: why.some(function (w) { return !/^(odds not ready|earnings calendar unavailable)/.test(w); }) };
+}
+
+// Pure. recs = AutoLog rows. Counts approved + hand-sent rows (not the shadow rows).
+function alogGuard_(recs, ymd, nowM, G) {
+  const ok = recs.filter(function (r) { return r.Approved !== 'NO'; });
+  const openN = ok.filter(function (r) { return r.Status === 'PENDING' || r.Status === 'OPEN'; }).length;
+  const today = ok.filter(function (r) { return ALOG_SETTLED.indexOf(r.Status) >= 0 && String(r['Exit Time'] || '').slice(0, 10) === ymd; })
+    .sort(function (a, b) { return String(a['Exit Time']).localeCompare(String(b['Exit Time'])); });
+  const net = today.reduce(function (t, r) { return t + (Number(r['P/L $']) || 0); }, 0);
+  let streak = 0; for (let i = today.length - 1; i >= 0; i--) { if ((Number(today[i]['P/L $']) || 0) < 0) streak++; else break; }
+  const why = [];
+  if (net <= -G.dailyLossUsd) why.push('daily loss limit reached (' + (net < 0 ? '-' : '') + '$' + Math.abs(net).toFixed(0) + ' today)');
+  if (openN >= G.maxOpen) why.push(openN + ' positions already open (max ' + G.maxOpen + ')');
+  if (streak >= G.lossStreak) {
+    const m = String(today[today.length - 1]['Exit Time']).match(/(\d+):(\d+)$/), lastM = m ? +m[1] * 60 + +m[2] : null;
+    if (lastM != null && nowM - lastM < G.cooldownMin) { const u = lastM + G.cooldownMin; why.push('paused after ' + streak + ' losses in a row, until ' + ('0' + Math.floor(u / 60)).slice(-2) + ':' + ('0' + (u % 60)).slice(-2)); }
+  }
+  return { blocked: why.join('; '), openN: openN, net: net, streak: streak };
+}
+
+function dayGuardNow_(np) {
+  if (!DAY_CONFIG.guard.enabled) return { blocked: '' };
+  const sh = alogSheet_(false); if (!sh || sh.getLastRow() < 2) return { blocked: '' };
+  return alogGuard_(alogRead_(sh).recs, np.ymd, np.m, DAY_CONFIG.guard);
+}
+
+function dayAlertOnce_(key, title, body) {
+  try {
+    const p = PropertiesService.getScriptProperties(), ymd = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
+    let s = {}; try { s = JSON.parse(p.getProperty('DAY_ALERTED') || '{}'); } catch (e) { s = {}; }
+    if (s.ymd !== ymd) s = { ymd: ymd, keys: {} };
+    if (s.keys[key]) return false;
+    s.keys[key] = 1; p.setProperty('DAY_ALERTED', JSON.stringify(s));
+    logToSheet_('Day alert: ' + title + ' - ' + body);
+    const cfg = getAlertConfig_(); if (cfg.ready) sendPhoneAlert_(cfg, title, body, true);
+    return true;
+  } catch (e) { return false; }
+}
+
+// Counters for the end-of-day health line
+function dayStatsBump_(np, fn) {
+  try {
+    const p = PropertiesService.getScriptProperties(); let s = {};
+    try { s = JSON.parse(p.getProperty('DAY_STATS') || '{}'); } catch (e) { s = {}; }
+    if (s.ymd !== np.ymd) s = { ymd: np.ymd, scans: 0, seen: {}, passed: {}, blocked: {} };
+    fn(s); p.setProperty('DAY_STATS', JSON.stringify(s));
+  } catch (e) {}
+}
+
+function dayHealthText_(s, a) {
+  if (!s || !s.ymd) return 'No scans were recorded today.';
+  const seen = Object.keys(s.seen || {}).length, passed = Object.keys(s.passed || {}).length, bl = Object.keys(s.blocked || {});
+  const why = bl.slice(0, 4).map(function (k) { return k.split('|')[0] + ': ' + String(s.blocked[k]).slice(0, 60); }).join('; ');
+  return s.ymd + ': ' + s.scans + ' scans, ' + seen + ' BUY/SHORT signals, ' + passed + ' passed the gates, ' + bl.length + ' blocked' + (why ? ' (' + why + ')' : '') +
+    (a ? '. Paper today: ' + (a.net >= 0 ? '+' : '-') + '$' + Math.abs(a.net).toFixed(0) + ', ' + a.settled + ' settled, ' + a.open + ' open.' : '.');
+}
+
+function dayHealthSend_(np) {
+  let s = {}; try { s = JSON.parse(PropertiesService.getScriptProperties().getProperty('DAY_STATS') || '{}'); } catch (e) { s = {}; }
+  let a = null;
+  try { const sh = alogSheet_(false); if (sh && sh.getLastRow() > 1) { const rec = alogRead_(sh).recs.filter(function (r) { return r.Approved !== 'NO' && (r.Date === np.ymd || String(r['Exit Time'] || '').slice(0, 10) === np.ymd); }); a = alogStats_(rec, np.ymd); } } catch (e) {}
+  const text = dayHealthText_(s.ymd === np.ymd ? s : null, a);
+  logToSheet_('Day health ' + text);
+  const cfg = getAlertConfig_(); if (cfg.ready) sendPhoneAlert_(cfg, 'Day health', text, false);
+}
+
+/* ============================================================================
  * AUTO_TRADE HAND-OFF
  * ========================================================================== */
 
@@ -700,6 +831,8 @@ function dayAutoTradeOrder_(r, minQty, includeWait, fixedLots) {
   const cp = oa === 'BUY CALL' ? 'C' : 'P';
   return { ticker: String(r.Ticker).toUpperCase(), cp: cp, expiry: String(r['Opt Expiry']), strike: strike,
     strikeText: (Math.round(strike * 100) / 100) + cp, orderType: 'BTO', lots: qty, oneLot: oneLot, action: r.Action, under: Number(r.Price) || '', score: r.Score === undefined ? '' : r.Score,
+    delta: r['Opt Delta'] === '' || r['Opt Delta'] == null ? '' : Number(r['Opt Delta']), spread: r['Opt Spread %'] === '' || r['Opt Spread %'] == null ? '' : Number(r['Opt Spread %']),
+    verdict: r['TM Verdict'] || '', avgR: r['TM Avg R'] === undefined ? '' : r['TM Avg R'],
     limit: Math.round(limit * 100) / 100, stop: Math.round(Number(r['Opt Stop']) * 100) / 100, target: Math.round(Number(r['Opt Target']) * 100) / 100 };
 }
 
@@ -733,7 +866,7 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
   if (st.ymd !== ymd) st = { ymd: ymd, keys: [] };
   let owned = {}; try { owned = JSON.parse(props.getProperty('DAY_AT_OWNED') || '{}'); } catch (e) {}   // 'TICKER|C' -> day it was added
   st.keys.forEach(function (k) { if (!owned[k]) owned[k] = ymd; });                                       // rows added before ownership was tracked
-  const okRow = opt.filter || function () { return true; };
+  const okRow = opt.filter || function () { return true; }, keepRow = opt.keep || okRow;
   const orders = rows.filter(okRow).map(function (r) { return dayAutoTradeOrder_(r, A.minQty, A.includeWait || !!opt.manual, A.lots); }).filter(Boolean);
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) return 'Auto_Trade: busy, will retry next scan';
@@ -758,7 +891,7 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
         live[key] = true;
         const r = byTicker[t];
         const stale = owned[key] < ymd;
-        const dead = r && (gone.indexOf(r.Action) >= 0 || !okRow(r) || (r.Side && (r.Side === 'LONG' ? 'C' : 'P') !== key.split('|')[1]));
+        const dead = r && (gone.indexOf(r.Action) >= 0 || !keepRow(r) || (r.Side && (r.Side === 'LONG' ? 'C' : 'P') !== key.split('|')[1]));
         if (stale || dead) kill.push({ row: i + 2, key: key, why: stale ? 'old' : (r.Action || 'flipped') });
       }
       kill.sort(function (a, b) { return b.row - a.row; }).forEach(function (k) {   // bottom up so row numbers stay valid
@@ -770,7 +903,9 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
     } else { owned = {}; }
 
     // ---- 2. add new signals
-    const fresh = orders.filter(function (o) { return st.keys.indexOf(o.ticker + '|' + o.cp) < 0; });
+    let fresh = orders.filter(function (o) { return st.keys.indexOf(o.ticker + '|' + o.cp) < 0; });
+    const heldBack = opt.noAdd && fresh.length ? fresh.length : 0;
+    if (opt.noAdd) fresh = [];
     const needAdd = ['expiry', 'type', 'lots', 'limit'].filter(function (k) { return !m[k]; });
     if (fresh.length && needAdd.length) return 'Auto_Trade: header(s) not found: ' + needAdd.join(', ');
     // first empty row judged by the Ticker column (the tab has formulas / validation far below the data)
@@ -796,10 +931,11 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
     });
     props.setProperty('DAY_AT_PUSHED', JSON.stringify(st));
     props.setProperty('DAY_AT_OWNED', JSON.stringify(owned));
-    if (fresh.length) { try { alogAdd_(fresh, ymd); } catch (e) { logToSheet_('AutoLog add failed: ' + (e && e.message ? e.message : e)); } }
+    if (fresh.length) { try { alogAdd_(fresh, ymd, opt.manual ? 'MANUAL' : 'YES'); } catch (e) { logToSheet_('AutoLog add failed: ' + (e && e.message ? e.message : e)); } }
     const parts = [];
     if (removed.length) parts.push('removed ' + removed.join(', '));
     if (fresh.length) parts.push('added ' + fresh.map(function (o) { return o.ticker + ' ' + o.strikeText + ' x' + o.lots; }).join(', '));
+    if (heldBack) parts.push('held back ' + heldBack + ' new (' + opt.noAdd + ')');
     return parts.length ? 'Auto_Trade: ' + parts.join('; ') + ' (Status "' + A.status + '")' : '';
   } finally { lock.releaseLock(); }
 }
@@ -842,6 +978,53 @@ function dayPushNow_() {
     if (o['Opt Expiry'] instanceof Date) o['Opt Expiry'] = dayDateYmd_(o['Opt Expiry']); return o; });
   const ymd = Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd');
   notify_(ui, 'Day → Auto_Trade', dayPushToAutoTrade_(rows, ymd) || 'No new BUY / SHORT option plans to add (already sent today, or none with an option plan).');
+}
+
+/* ============================================================================
+ * FAST SCAN (own switch in the menu: ⏩ Fast Scan ON / ⏹ OFF)
+ * Apps Script triggers can only run every 1, 5, 10, 15 or 30 minutes, so "every 3 minutes" is a 1-minute trigger that does the real work only when
+ * everySec has passed since the last run. It scans the shortlist (and anything you hold) exactly like the normal live scan, only on market days between
+ * fromHm and untilHm, never while another scan is running, at most maxRunsPerDay times, and it removes its own trigger when the window ends.
+ * The trigger exists only while the switch is ON. Stop Schedule also removes it.
+ * ========================================================================== */
+
+function dayFastRemove_() { let n = 0; ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === DAY_FAST_FN) { ScriptApp.deleteTrigger(t); n++; } }); return n; }
+
+function dayHasHeld_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DAY_SHEET_NAME);
+  return sheet ? Object.keys(dayReadHeld_(sheet, dayHeaderMap_(sheet))).length > 0 : false;
+}
+
+function startDayFast_() {
+  const F = DAY_CONFIG.fast, ui = tryGetUi_(), np = dayNowParts_(new Date());
+  const open = !(np.dow === '6' || np.dow === '7' || US_MARKET_HOLIDAYS[np.ymd]);
+  if (!open || np.m >= dayMinutes_(F.untilHm)) { notify_(ui, 'Fast scan', 'Not started: switch it on on a market day before ' + F.untilHm + ' ET. It runs ' + F.fromHm + ' to ' + F.untilHm + ' and then turns itself off.'); return; }
+  dayFastRemove_();
+  ScriptApp.newTrigger(DAY_FAST_FN).timeBased().everyMinutes(1).create();
+  PropertiesService.getScriptProperties().deleteProperty('DAY_FAST_LAST');
+  notify_(ui, 'Fast scan ON', 'Scans every ' + (F.everySec / 60) + ' minutes from ' + F.fromHm + ' to ' + F.untilHm + ' ET (max ' + F.maxRunsPerDay + ' runs today), then switches itself off.\n' +
+    'Turn it off any time: Day > Fast Scan OFF (or Stop Schedule).\n(Apps Script only offers 1-minute triggers, so it wakes every minute and works every ' + (F.everySec / 60) + ' minutes.)');
+}
+
+function stopDayFast_() { const n = dayFastRemove_(); notify_(tryGetUi_(), 'Fast scan', n ? 'OFF (' + n + ' trigger removed).' : 'It was not running.'); }
+
+function dayFastTick_() {
+  const C = DAY_CONFIG, F = C.fast, np = dayNowParts_(new Date()), props = PropertiesService.getScriptProperties();
+  if (np.dow === '6' || np.dow === '7' || US_MARKET_HOLIDAYS[np.ymd] || np.m >= dayMinutes_(F.untilHm)) { dayFastRemove_(); return; }   // window over: switch itself off
+  if (np.m < dayMinutes_(F.fromHm)) return;
+  let runs = {}; try { runs = JSON.parse(props.getProperty('DAY_FAST_RUNS') || '{}'); } catch (e) { runs = {}; }
+  if (runs.ymd !== np.ymd) runs = { ymd: np.ymd, n: 0 };
+  if (runs.n >= F.maxRunsPerDay) { dayFastRemove_(); dayAlertOnce_('fastcap', 'Fast scan stopped itself', 'It reached its limit of ' + F.maxRunsPerDay + ' runs today.'); return; }
+  if (Date.now() - parseInt(props.getProperty('DAY_FAST_LAST') || '0', 10) < (F.everySec - 25) * 1000) return;
+  const running = parseInt(props.getProperty('DAY_RUNNING') || '0', 10);
+  if (running && Date.now() - running < 8 * 60000) return;                    // a scan is still going: skip, do not stack
+  props.setProperty('DAY_FAST_LAST', String(Date.now()));
+  runs.n++; props.setProperty('DAY_FAST_RUNS', JSON.stringify(runs));
+  if ((props.getProperty('DAY_LAST_FULL') || '').indexOf(np.ymd) !== 0) { dayRun_('FULL', { quiet: true }); return; }
+  let short = {}; try { short = JSON.parse(props.getProperty('DAY_SHORT') || '{}'); } catch (e) { short = {}; }
+  const held = dayHasHeld_();
+  if (!held && (!short.list || !short.list.length)) return;
+  dayRun_('LIVE', { quiet: true });
 }
 
 /* ============================================================================
@@ -1034,9 +1217,12 @@ function dayOddsNow_() {
  * ========================================================================== */
 
 const ALOG_CONFIG = { sheet: 'AutoLog', feePerLot: 1.00, stallMin: 90, stallPct: 0.05, expiryCloseDays: 1, eodBeforeMin: 15, paperExitOn: ['CLOSE', 'CONSIDER CLOSING'] };   // paperExitOn: the signals that close a PAPER trade at the bid (what you would have done)   // feePerLot: opening commission per contract (closing is free at TastyTrade; check your own fee schedule)
-const ALOG_NEW_COLS = ['Mine', 'Signal', 'Signal Why', 'Real Status'];
-const ALOG_HEADERS = ['Date', 'Ticker', 'Mine', 'Signal', 'Signal Why', 'Real Status', 'Action', 'Contract', 'Added', 'Limit', 'Stop', 'Target', 'Lots', 'Status', 'Filled At', 'Entry', 'Exit', 'Exit Time',
-  'P/L $', 'P/L %', 'Mark', 'Open P/L $', 'Bid High', 'Bid Low', 'Underlying', 'Score', 'Symbol', 'Expiry'];
+const ALOG_FRONT = ['Mine', 'Approved', 'Signal', 'Signal Why', 'Real Status'];   // inserted right after Ticker on an older tab
+const ALOG_BACK = ['DTE', 'Delta', 'Spread %', 'TM Verdict', 'TM Avg R', 'Blocked By', 'Under Exit', 'Stock Move %'];   // appended at the end on an older tab
+const ALOG_SETTLED = ['TARGET', 'STOPPED', 'EXPIRED', 'CLOSED', 'SIGNAL CLOSE'];
+const ALOG_FMT = { 'Delta': '0.00', 'Spread %': '0.0', 'TM Avg R': '0.00', 'Under Exit': '$#,##0.00', 'Stock Move %': '0.0' };
+const ALOG_HEADERS = ['Date', 'Ticker', 'Mine', 'Approved', 'Signal', 'Signal Why', 'Real Status', 'Action', 'Contract', 'Added', 'Limit', 'Stop', 'Target', 'Lots', 'Status', 'Filled At', 'Entry', 'Exit', 'Exit Time',
+  'P/L $', 'P/L %', 'Mark', 'Open P/L $', 'Bid High', 'Bid Low', 'Underlying', 'Score', 'Symbol', 'Expiry'].concat(ALOG_BACK);
 const ALOG_TEXT_COLS = ['Date', 'Added', 'Filled At', 'Exit Time', 'Symbol', 'Expiry'];
 
 function alogOcc_(ticker, expiryYmd, cp, strike) {
@@ -1054,6 +1240,8 @@ function alogSheet_(create) {
   const col = function (h) { return ALOG_HEADERS.indexOf(h) + 1; };
   ALOG_TEXT_COLS.forEach(function (h) { sh.getRange(2, col(h), 2000, 1).setNumberFormat('@'); });
   ['Limit', 'Stop', 'Target', 'Entry', 'Exit', 'Mark', 'Bid High', 'Bid Low', 'Underlying'].forEach(function (h) { sh.getRange(2, col(h), 2000, 1).setNumberFormat('$#,##0.00'); });
+  Object.keys(ALOG_FMT).forEach(function (h) { sh.getRange(2, col(h), 2000, 1).setNumberFormat(ALOG_FMT[h]); });
+  sh.setColumnWidth(col('Signal Why'), 280);
   ['P/L $', 'Open P/L $'].forEach(function (h) { sh.getRange(2, col(h), 2000, 1).setNumberFormat('$#,##0.00;-$#,##0.00;$0.00'); });
   sh.getRange(2, col('P/L %'), 2000, 1).setNumberFormat('0.0');
   const rules = [];
@@ -1066,17 +1254,23 @@ function alogSheet_(create) {
   return sh;
 }
 
-// Older AutoLog tabs get the Mine / Signal columns added right after Ticker (all four missing) or at the end (some missing)
+// Older AutoLog tabs: the Mine / Approved / Signal columns go right after Ticker, the entry-detail columns go at the end
 function alogEnsureCols_(sh) {
   const w = sh.getLastColumn(); if (w < 1) return;
-  const hdr = sh.getRange(1, 1, 1, w).getValues()[0].map(function (h) { return String(h || '').trim(); });
-  const missing = ALOG_NEW_COLS.filter(function (h) { return hdr.indexOf(h) < 0; });
+  const read = function () { return sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function (h) { return String(h || '').trim(); }); };
+  let hdr = read();
+  const head = function (rg) { rg.setFontWeight('bold').setHorizontalAlignment('center'); };
+  if (hdr.indexOf('Mine') < 0 && hdr.indexOf('Ticker') >= 0) {
+    const at = hdr.indexOf('Ticker') + 2; sh.insertColumnsAfter(at - 1, ALOG_FRONT.length);
+    head(sh.getRange(1, at, 1, ALOG_FRONT.length).setValues([ALOG_FRONT])); sh.setColumnWidth(at + ALOG_FRONT.indexOf('Signal Why'), 280); hdr = read();
+  } else if (hdr.indexOf('Approved') < 0 && hdr.indexOf('Mine') >= 0) {
+    const at = hdr.indexOf('Mine') + 2; sh.insertColumnsAfter(at - 1, 1); head(sh.getRange(1, at).setValue('Approved')); hdr = read();
+  }
+  const missing = ALOG_FRONT.concat(ALOG_BACK).filter(function (h) { return hdr.indexOf(h) < 0; });
   if (!missing.length) return;
-  let at;
-  if (missing.length === ALOG_NEW_COLS.length && hdr.indexOf('Ticker') >= 0) { at = hdr.indexOf('Ticker') + 2; sh.insertColumnsAfter(at - 1, missing.length); }
-  else at = w + 1;
-  sh.getRange(1, at, 1, missing.length).setValues([missing]).setFontWeight('bold').setHorizontalAlignment('center');
-  const sw = missing.indexOf('Signal Why'); if (sw >= 0) sh.setColumnWidth(at + sw, 280);
+  const at = hdr.length + 1;
+  head(sh.getRange(1, at, 1, missing.length).setValues([missing]));
+  missing.forEach(function (h, i) { if (ALOG_FMT[h]) sh.getRange(2, at + i, 2000, 1).setNumberFormat(ALOG_FMT[h]); });
 }
 
 // Keeps YOUR trades at the top (open ones first, then newest); everything else stays in the order it was logged. Plain values only, formats are per column.
@@ -1115,22 +1309,48 @@ function alogWriteRow_(sh, map, r) {
   ALOG_HEADERS.forEach(function (h) { if (map[h]) sh.getRange(r._row, map[h]).setValue(r[h] === undefined || r[h] === null ? '' : r[h]); });
 }
 
-// Called while the push holds the script lock: one log row per order added to Auto_Trade.
-function alogAdd_(orders, ymd) {
+// One log row per order. approved: 'YES' (sent to Auto_Trade by the scan), 'MANUAL' (you sent it by hand), 'NO' (shadow row: a signal a gate or the guard held back, tracked on paper only
+// so the scorecard can show whether the gates help). Called while the push holds the script lock (YES / MANUAL), or under its own lock (NO).
+function alogAdd_(orders, ymd, approved) {
+  approved = approved || 'YES';
   const sh = alogSheet_(true);
   const { map, recs } = alogRead_(sh);
   const hm = Utilities.formatDate(new Date(), 'America/New_York', 'HH:mm');
   let next = sh.getLastRow() + 1;
   orders.forEach(function (o) {
     const cpOf = function (r) { const m = String(r.Contract).match(/^[\d.]+([CP])/); return m ? m[1] : ''; };
-    const live = recs.some(function (r) { return r.Date === ymd && r.Ticker === o.ticker && cpOf(r) === o.cp && (r.Status === 'PENDING' || r.Status === 'OPEN'); });
-    if (live) return;   // the same ticker / side is still working today: not a new order
-    const rec = { _row: next++, Date: ymd, Ticker: o.ticker, Action: o.action, Contract: o.strikeText + ' ' + Utilities.formatDate(new Date(o.expiry + 'T12:00:00Z'), 'UTC', 'MMMd'), Added: hm,
+    const same = recs.filter(function (r) { return r.Date === ymd && r.Ticker === o.ticker && cpOf(r) === o.cp; });
+    const live = same.filter(function (r) { return r.Status === 'PENDING' || r.Status === 'OPEN'; });
+    if (approved === 'NO') { if (same.length) return; }                                   // one shadow row per ticker and side per day
+    else if (live.length) {                                                               // the same ticker / side is still working today: not a new order
+      const sh0 = live.filter(function (r) { return r.Approved === 'NO'; })[0];
+      if (sh0) { sh0.Approved = approved; sh0['Blocked By'] = ''; alogWriteRow_(sh, map, sh0); }   // it was a shadow row and has now passed: it counts from here
+      return;
+    }
+    const dte = Math.round((Date.UTC(+o.expiry.slice(0, 4), +o.expiry.slice(5, 7) - 1, +o.expiry.slice(8, 10)) - Date.UTC(+ymd.slice(0, 4), +ymd.slice(5, 7) - 1, +ymd.slice(8, 10))) / 86400000);
+    const rec = { _row: next++, Date: ymd, Ticker: o.ticker, Approved: approved, Action: o.action, Contract: o.strikeText + ' ' + Utilities.formatDate(new Date(o.expiry + 'T12:00:00Z'), 'UTC', 'MMMd'), Added: hm,
       Limit: o.limit, Stop: o.stop || '', Target: o.target || '', Lots: o.lots, Status: 'PENDING', Underlying: o.under, Score: o.score,
-      Symbol: alogOcc_(o.ticker, o.expiry, o.cp, o.strike), Expiry: o.expiry };
+      Symbol: alogOcc_(o.ticker, o.expiry, o.cp, o.strike), Expiry: o.expiry, DTE: dte, Delta: o.delta === undefined ? '' : o.delta, 'Spread %': o.spread === undefined ? '' : o.spread,
+      'TM Verdict': o.verdict || '', 'TM Avg R': o.avgR === undefined ? '' : o.avgR, 'Blocked By': o.blockedBy || '' };
     alogWriteRow_(sh, map, rec);
     recs.push(rec);
   });
+}
+
+// Shadow rows for signals the gates / guard held back (own lock; skipped if busy, the next scan retries)
+function dayShadowLog_(orders, ymd) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try { alogAdd_(orders, ymd, 'NO'); } finally { lock.releaseLock(); }
+}
+
+// Stock price at exit and the stock's move in the direction of your trade, next to the option's P/L %
+function alogUnderFill_(r, ctx) {
+  const u = ctx.under && ctx.under[String(r.Ticker).toUpperCase()];
+  if (!(u > 0)) return;
+  r['Under Exit'] = Math.round(u * 100) / 100;
+  const e = Number(r.Underlying);
+  if (e > 0) r['Stock Move %'] = Math.round((r.Action === 'SHORT' ? -1 : 1) * (u / e - 1) * 1000) / 10;
 }
 
 // One quote sample applied to one log row. Pure (no sheet calls), so it can be tested. ctx: { ymd, hm, afterClose, fee }
@@ -1152,7 +1372,7 @@ function alogStep_(r, q, ctx) {
     const entry = Number(r.Entry), target = Number(r.Target) || null, stop = Number(r.Stop) || null;
     const close = function (status, exit) {
       r.Status = status; r.Exit = r2(exit); r['Exit Time'] = ctx.ymd + ' ' + ctx.hm;
-      r['P/L $'] = r2((exit - entry) * 100 * lots - fee); r['P/L %'] = Math.round((exit - entry) / entry * 1000) / 10; r['Open P/L $'] = '';
+      r['P/L $'] = r2((exit - entry) * 100 * lots - fee); r['P/L %'] = Math.round((exit - entry) / entry * 1000) / 10; r['Open P/L $'] = ''; alogUnderFill_(r, ctx);
     };
     if (ctx.ymd > r.Expiry) { close('EXPIRED', Number(r.Mark) > 0 ? Number(r.Mark) : 0); return r; }
     if (bid == null || ctx.afterClose) { return r; }
@@ -1210,7 +1430,7 @@ function alogStepMine_(r, q, ctx, real) {
   const entry = Number(r.Entry);
   const close = function (status, exit) {
     r.Status = status; r.Exit = r2(exit); r['Exit Time'] = ctx.ymd + ' ' + ctx.hm;
-    r['P/L $'] = r2((exit - entry) * 100 * lots - fee); r['P/L %'] = Math.round((exit - entry) / entry * 1000) / 10; r['Open P/L $'] = ''; r.Signal = ''; r['Signal Why'] = '';
+    r['P/L $'] = r2((exit - entry) * 100 * lots - fee); r['P/L %'] = Math.round((exit - entry) / entry * 1000) / 10; r['Open P/L $'] = ''; r.Signal = ''; r['Signal Why'] = ''; alogUnderFill_(r, ctx);
   };
   if (real.exit != null) { close('CLOSED', real.exit); return r; }
   if (ctx.ymd > r.Expiry) { close('EXPIRED', Number(r.Mark) > 0 ? Number(r.Mark) : 0); return r; }
@@ -1224,7 +1444,7 @@ function alogStepMine_(r, q, ctx, real) {
 
 // Totals for the dialog / the end-of-day alert. Pure.
 function alogStats_(recs, ymd) {
-  const settled = recs.filter(function (r) { return r.Status === 'TARGET' || r.Status === 'STOPPED' || r.Status === 'EXPIRED' || r.Status === 'CLOSED' || r.Status === 'SIGNAL CLOSE'; });
+  const settled = recs.filter(function (r) { return ALOG_SETTLED.indexOf(r.Status) >= 0; });
   const open = recs.filter(function (r) { return r.Status === 'OPEN'; });
   const pl = function (r) { return Number(r['P/L $']) || 0; };
   const sum = function (a, f) { return a.reduce(function (t, r) { return t + f(r); }, 0); };
@@ -1255,6 +1475,114 @@ function alogReadAutoTrade_() {
     out[t + '|' + ex + '|' + sk] = { status: String(row[m.status - 1]).trim(), text: m.result ? String(row[m.result - 1] || '') : '' };
   });
   return out;
+}
+
+/* ============================================================================
+ * SCORECARD (tab "AutoScore", rebuilt when a trade settles, and from the menu)
+ * Approved = the scan sent it to Auto_Trade; Hand-sent = you sent it; Not approved = a gate / the guard held it back, tracked on paper so you can see whether the gates help.
+ * ========================================================================== */
+
+function alogScoreRows_(recs) {
+  const pl = function (r) { return Number(r['P/L $']) || 0; };
+  const settledAll = recs.filter(function (r) { return ALOG_SETTLED.indexOf(r.Status) >= 0; });
+  const exitOrder = function (a, b) { return String(a['Exit Time']).localeCompare(String(b['Exit Time'])); };
+  const rd = function (x, n) { if (x == null || isNaN(x)) return ''; const p = Math.pow(10, n == null ? 2 : n); return Math.round(x * p) / p; };
+  const stat = function (a) {
+    const w = a.filter(function (r) { return pl(r) > 0; }), l = a.filter(function (r) { return pl(r) <= 0; });
+    const sw = w.reduce(function (t, r) { return t + pl(r); }, 0), sl = l.reduce(function (t, r) { return t + pl(r); }, 0), net = sw + sl;
+    const ord = a.slice().sort(exitOrder); let run = 0, peak = 0, dd = 0, streak = 0, worst = 0;
+    ord.forEach(function (r) { run += pl(r); peak = Math.max(peak, run); dd = Math.min(dd, run - peak); if (pl(r) < 0) { streak++; worst = Math.max(worst, streak); } else streak = 0; });
+    return { n: a.length, wins: w.length, rate: a.length ? w.length / a.length : null, avgW: w.length ? sw / w.length : null, avgL: l.length ? sl / l.length : null,
+      exp: a.length ? net / a.length : null, net: net, pf: sl < 0 ? sw / -sl : null, dd: dd, worst: worst };
+  };
+  const out = [], bold = [], title = [];
+  const T = function (t) { out.push([]); out.push([t]); title.push(out.length - 1); bold.push(out.length - 1); };
+  const HD = function (cells) { out.push(cells); bold.push(out.length - 1); };
+  const line = function (label, a) { const s = stat(a); out.push([label, s.n, s.rate == null ? '' : Math.round(s.rate * 100) + '%', rd(s.avgW), rd(s.avgL), rd(s.exp), rd(s.net), s.pf == null ? '' : rd(s.pf)]); return s; };
+  const groups = function (arr, keyFn, order) {
+    const g = {}; arr.forEach(function (r) { const k = keyFn(r); (g[k] = g[k] || []).push(r); });
+    (order || Object.keys(g).sort()).forEach(function (k) { if (g[k]) line(k, g[k]); });
+  };
+  const HEAD = ['', 'Settled', 'Win rate', 'Avg win $', 'Avg loss $', 'Per trade $', 'Net $', 'Profit factor'];
+  const taken = settledAll.filter(function (r) { return r.Approved !== 'NO'; });
+
+  out.push(['AutoScore: paper and real results of the Day scan, one lot per trade, after fees. Updated ' + Utilities.formatDate(new Date(), 'America/New_York', 'yyyy-MM-dd HH:mm') + ' ET']); title.push(0); bold.push(0);
+  T('1. All trades you would have taken (approved by the scan + hand-sent)');
+  HD(HEAD);
+  const all = line('All settled', taken), st = stat(taken);
+  out.push(['Open now (approved / hand-sent)', recs.filter(function (r) { return r.Approved !== 'NO' && (r.Status === 'OPEN' || r.Status === 'PENDING'); }).length]);
+  out.push(['Worst losing streak', st.worst, '', '', '', '', 'Max drawdown $', rd(st.dd)]);
+
+  T('2. Did the gates help? Approved vs hand-sent vs not approved (paper)');
+  HD(HEAD);
+  const lab = { YES: 'Approved by the scan', MANUAL: 'Hand-sent by you', NO: 'Not approved (paper only)' };
+  groups(settledAll, function (r) { return lab[r.Approved === 'NO' || r.Approved === 'MANUAL' ? r.Approved : 'YES']; }, [lab.YES, lab.MANUAL, lab.NO]);
+  const a1 = stat(settledAll.filter(function (r) { return r.Approved !== 'NO' && r.Approved !== 'MANUAL'; })), a0 = stat(settledAll.filter(function (r) { return r.Approved === 'NO'; }));
+  out.push([a1.n >= 10 && a0.n >= 10 ? (a1.exp > a0.exp ? 'Approved trades did better per trade than the ones held back.' : 'Approved trades did NOT beat the ones held back: the gates are not helping yet.') : 'Too few settled trades in one of the groups (need 10 each) to compare.']);
+
+  T('3. By Time Machine verdict at entry (all paper trades)');
+  HD(HEAD);
+  groups(settledAll, function (r) { const v = String(r['TM Verdict'] || ''); return /toward the target/i.test(v) ? 'Toward the target' : /toward the stop/i.test(v) ? 'Toward the stop' : /coin flip|break-even/i.test(v) ? 'Coin flip / break-even' : v ? 'Other' : 'No odds logged'; },
+    ['Toward the target', 'Coin flip / break-even', 'Toward the stop', 'Other', 'No odds logged']);
+
+  T('4. How trades ended (approved + hand-sent)');
+  HD(HEAD);
+  groups(taken, function (r) { return r.Status; });
+
+  T('5. By days to expiry at entry (approved + hand-sent)');
+  HD(HEAD);
+  groups(taken, function (r) { const d = Number(r.DTE); return r.DTE === '' || r.DTE == null || isNaN(d) ? 'Unknown' : d <= 3 ? '3 days or less' : d <= 7 ? '4 to 7 days' : '8 days or more'; }, ['3 days or less', '4 to 7 days', '8 days or more', 'Unknown']);
+
+  T('6. By direction (approved + hand-sent)');
+  HD(HEAD);
+  groups(taken, function (r) { return r.Action === 'SHORT' ? 'SHORT (puts)' : 'BUY (calls)'; });
+
+  T('7. Stock move vs option move: does the option follow the stock the way the plan assumes?');
+  const sm = taken.filter(function (r) { return r['Stock Move %'] !== '' && r['Stock Move %'] != null && !isNaN(Number(r['Stock Move %'])); });
+  const avg = function (a, f) { return a.length ? a.reduce(function (t, r) { return t + f(r); }, 0) / a.length : null; };
+  const sMove = avg(sm, function (r) { return Number(r['Stock Move %']); }), oMove = avg(sm, function (r) { return Number(r['P/L %']) || 0; });
+  HD(['', 'Trades with a stock exit price', 'Avg stock move % (your direction)', 'Avg option P/L %', 'Option % per 1% stock move']);
+  out.push(['', sm.length, rd(sMove), rd(oMove), sMove != null && Math.abs(sMove) >= 0.05 ? rd(oMove / sMove) : '']);
+
+  T('8. By day (last 10, approved + hand-sent)');
+  HD(HEAD);
+  const days = {}; taken.forEach(function (r) { const d = String(r['Exit Time'] || r.Date).slice(0, 10); (days[d] = days[d] || []).push(r); });
+  Object.keys(days).sort().slice(-10).forEach(function (d) { line(d, days[d]); });
+
+  T('9. Can you trust it yet?');
+  const n = taken.length;
+  out.push([n < 40 ? 'Not enough trades: ' + n + ' settled of the 40 needed. Keep it on paper.' :
+    (all.exp > 0 && all.net > 0 ? n + ' settled trades, positive after fees (' + rd(all.exp) + ' $ per trade). Check section 2 before you rely on it, and size small.' : n + ' settled trades and not profitable after fees. Do not trade it with real money.')]);
+  return { rows: out, bold: bold, title: title };
+}
+
+function alogScoreWrite_(recs) {
+  const o = alogScoreRows_(recs), ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName('AutoScore') || ss.insertSheet('AutoScore');
+  const w = Math.max.apply(null, o.rows.map(function (r) { return r.length; }).concat([1]));
+  const vals = o.rows.map(function (r) { const x = r.slice(); while (x.length < w) x.push(''); return x; });
+  sh.clear();
+  sh.getRange(1, 1, vals.length, w).setValues(vals);
+  o.bold.forEach(function (i) { sh.getRange(i + 1, 1, 1, w).setFontWeight('bold'); });
+  o.title.forEach(function (i) { sh.getRange(i + 1, 1, 1, w).setBackground('#d9ead3'); });
+  sh.setColumnWidth(1, 330); for (let c = 2; c <= w; c++) sh.setColumnWidth(c, 105);
+  if (w > 1) sh.getRange(1, 2, vals.length, w - 1).setHorizontalAlignment('center');
+}
+
+function alogScoreMaybe_(recs, force) {
+  const p = PropertiesService.getScriptProperties();
+  const settled = recs.filter(function (r) { return ALOG_SETTLED.indexOf(r.Status) >= 0; });
+  const sig = recs.length + '|' + settled.length + '|' + settled.reduce(function (t, r) { return t + (Number(r['P/L $']) || 0); }, 0).toFixed(2) + '|' + recs.filter(function (r) { return r.Approved === 'NO'; }).length;
+  if (!force && p.getProperty('ALOG_SCORE_SIG') === sig) return;
+  alogScoreWrite_(recs);
+  p.setProperty('ALOG_SCORE_SIG', sig);
+}
+
+function alogScoreNow_() {
+  const ui = tryGetUi_(), sh = alogSheet_(false);
+  if (!sh || sh.getLastRow() < 2) { notify_(ui, 'AutoScore', 'Nothing logged yet.'); return; }
+  alogScoreMaybe_(alogRead_(sh).recs, true);
+  notify_(ui, 'AutoScore', 'Updated. See the AutoScore tab.');
 }
 
 function alogUpdateNow_() { alogTick_(true); const ui = tryGetUi_(); if (ui) notify_(ui, 'Auto Log', 'Updated. See the AutoLog tab.'); }
@@ -1296,7 +1624,9 @@ function alogTick_(force) {
         const raw = fetchTastyMarketDataBatch_(active.map(function (r) { return String(r.Symbol); }).filter(function (v, i, a) { return v && a.indexOf(v) === i; }), token);
         Object.keys(raw).forEach(function (k) { quotes[k.replace(/\s+/g, '')] = raw[k]; });
       }
-      const cfg = getAlertConfig_(), ctx = { ymd: np.ymd, hm: hm, nowM: np.m, closeM: np.closeM, afterClose: afterClose, fee: ALOG_CONFIG.feePerLot };
+      let under = {};
+      if (token) { try { const dq = dayQuotes_(active.map(function (r) { return String(r.Ticker).toUpperCase(); }).filter(function (v, i, a) { return a.indexOf(v) === i; }), token); Object.keys(dq).forEach(function (k) { under[k] = dq[k].price; }); } catch (e) {} }
+      const cfg = getAlertConfig_(), ctx = { ymd: np.ymd, hm: hm, nowM: np.m, closeM: np.closeM, afterClose: afterClose, fee: ALOG_CONFIG.feePerLot, under: under };
       active.forEach(function (r) {
         const before = JSON.stringify(r), prevSig = r.Signal, q = quotes[String(r.Symbol).replace(/\s+/g, '')];
         if (r.Mine === 'YES') {
@@ -1311,10 +1641,11 @@ function alogTick_(force) {
     }
     Object.keys(changed).forEach(function (k) { alogWriteRow_(sh, map, changed[k]); });
     if (mineChanged) alogReorder_(sh);
+    try { alogScoreMaybe_(recs, false); } catch (e) { logToSheet_('AutoScore failed: ' + (e && e.message ? e.message : e)); }
     // once per day after the close: a short result line to the phone
     if (afterClose && props.getProperty('ALOG_LAST_EOD') !== np.ymd) {
       props.setProperty('ALOG_LAST_EOD', np.ymd);
-      const all = alogRead_(sh).recs, t = alogStats_(all.filter(function (r) { return r.Date === np.ymd || (r['Exit Time'] || '').slice(0, 10) === np.ymd; }), np.ymd);
+      const all = alogRead_(sh).recs, t = alogStats_(all.filter(function (r) { return r.Approved !== 'NO' && (r.Date === np.ymd || (r['Exit Time'] || '').slice(0, 10) === np.ymd); }), np.ymd);
       const cfg = getAlertConfig_();
       if (t.total && cfg.ready) sendPhoneAlert_(cfg, 'Auto log ' + np.ymd + ': ' + (t.net >= 0 ? '+' : '-') + '$' + Math.abs(t.net).toFixed(0) + ' settled',
         t.filled + ' of ' + t.total + ' orders filled, ' + t.settled + ' settled (' + (t.winRate == null ? '-' : Math.round(t.winRate * 100) + '% wins') + '), ' + t.open + ' still open (' + (t.openPL >= 0 ? '+' : '-') + '$' + Math.abs(t.openPL).toFixed(0) + ' open).', false);
@@ -1326,7 +1657,7 @@ function alogShowStats_() {
   const ui = tryGetUi_();
   const sh = alogSheet_(false);
   if (!sh || sh.getLastRow() < 2) { notify_(ui, 'Auto Log', 'Nothing logged yet. Orders are logged when the Day scan adds them to Auto_Trade.'); return; }
-  const t = alogStats_(alogRead_(sh).recs, '');
+  const allRecs = alogRead_(sh).recs, t = alogStats_(allRecs.filter(function (r) { return r.Approved !== 'NO'; }), '');
   const d = function (x) { return x == null ? '-' : (x < 0 ? '-$' : '$') + Math.abs(x).toFixed(2); };
   const lines = ['Orders logged: ' + t.total + '   filled: ' + t.filled + (t.total ? ' (' + Math.round(t.filled / t.total * 100) + '%)' : '') + '   not filled: ' + t.notFilled,
     'Settled: ' + t.settled + '   open: ' + t.open, 'NET settled P/L: ' + d(t.net) + '   open (at bid): ' + d(t.openPL),
@@ -1335,6 +1666,8 @@ function alogShowStats_() {
     ['', 'By action:'], Object.keys(t.byAct).map(function (k) { const x = t.byAct[k]; return '  ' + k + ': ' + x.n + ' settled, ' + Math.round(x.w / x.n * 100) + '% wins, ' + d(x.net); }));
   const mine = alogRead_(sh).recs.filter(function (r) { return r.Mine === 'YES'; });
   if (mine.length) { const tm = alogStats_(mine, ''); lines.push('', 'MY TRADES (placed from Auto_Trade): ' + tm.total + '   open: ' + tm.open + '   settled: ' + tm.settled, '  NET settled ' + d(tm.net) + '   open (at bid) ' + d(tm.openPL) + '   win rate ' + (tm.winRate == null ? '-' : Math.round(tm.winRate * 100) + '%')); }
+  const shd = allRecs.filter(function (r) { return r.Approved === 'NO'; });
+  if (shd.length) { const ts = alogStats_(shd, ''); lines.push('', 'NOT APPROVED (held back by a gate or the guard, paper only): ' + ts.total + ' logged, ' + ts.settled + ' settled, net ' + d(ts.net) + '   see the AutoScore tab for the comparison'); }
   notify_(ui, 'Auto Log', lines.join('\n'));
 }
 
@@ -1378,7 +1711,7 @@ function dayRun_(mode, opts) {
     dayWriteHeaders_(sheet);
     const now = new Date(), np = dayNowParts_(now), acct = dayAccount_();
     const token = getTastyTradeAccessToken_();
-    if (!token) { notify_(ui, 'Day', 'No TastyTrade token (see ScriptLog).'); return null; }
+    if (!token) { dayAlertOnce_('token', 'Day scan: no TastyTrade token', 'The scan cannot run: the TastyTrade token request failed (see ScriptLog). Run Auto Trade > Check Token Permissions.'); notify_(ui, 'Day', 'No TastyTrade token (see ScriptLog).'); return null; }
     const map0 = dayHeaderMap_(sheet);
     const held0 = dayReadHeld_(sheet, map0);
     let short = {};
@@ -1415,6 +1748,12 @@ function dayRun_(mode, opts) {
       res[t] = { t: t, base: base, td: td, price: price, q: q };
       Utilities.sleep(C.sleepMs);
     }
+
+    // Yahoo returned nothing for most names: say so instead of failing quietly
+    try {
+      const nSkip = names.filter(function (t) { return res[t] && res[t].state === 'SKIP'; }).length;
+      if (names.length >= 5 && nSkip / names.length >= 0.5) dayAlertOnce_('yahoo', 'Day scan: Yahoo data missing', 'No intraday data for ' + nSkip + ' of ' + names.length + ' names. Signals and odds are unreliable until it recovers.');
+    } catch (e) {}
 
     // tape from SPY + QQQ: both above (below) VWAP and their opening candles agree
     const tapeOf = function (t) { const r = res[t]; if (!r || !r.td || r.td.vwap == null || !r.price) return 0; return r.price > r.td.vwap ? 1 : -1; };
@@ -1476,6 +1815,7 @@ function dayRun_(mode, opts) {
     if (mode === 'PRE') props.setProperty('DAY_LAST_PRE', np.ymd + ' ' + Utilities.formatDate(now, 'America/New_York', 'HH:mm'));
 
     // option proposal: BUY CALL for LONG, BUY PUT for SHORT, on the best live signals (BUY / SHORT first, then the best WAIT rows)
+    let optFails = 0;
     if (C.optionHints && np.m >= DAY_OPEN_M) {
       const rank = { BUY: 2, SHORT: 2, WAIT: 1 };
       rows.filter(function (r) { return rank[r.Action] && !held0[r.Ticker] && r.Side; })
@@ -1484,7 +1824,7 @@ function dayRun_(mode, opts) {
           const x = res[r.Ticker];
           if (!(x && x.sig && x.sig.R > 0)) return;
           const o = dayOptionProposal_(r.Ticker, r.Side, r.Price, x.sig.R, token, { account: acct.account });
-          if (o.why) { r.Option = o.why; return; }
+          if (o.why) { r.Option = o.why; if (/lookup failed|no option chain/.test(o.why)) optFails++; return; }
           r['Opt Action'] = o.action; r['Opt Expiry'] = o.expiry; r['Opt Strike'] = o.strike; r['Opt Mid'] = o.plan.mid; r['Opt Limit'] = o.plan.limit;
           r['Opt Stop'] = o.plan.stop; r['Opt Target'] = o.plan.target; r['Opt Qty'] = o.plan.qty;
           if (o.plan.delta != null) r['Opt Delta'] = dayR2_(o.plan.delta);
@@ -1494,12 +1834,15 @@ function dayRun_(mode, opts) {
         });
     }
 
+    if (optFails >= 2) dayAlertOnce_('chain', 'Day scan: option chains failing', optFails + ' option lookups failed this scan (TastyTrade). No option plans, so nothing can reach Auto_Trade.');
+
     // Time Machine odds for the live BUY / SHORT rows (once per ticker and side per day; a few seconds each)
     if (C.odds && C.odds.enabled && np.m >= DAY_OPEN_M + C.orMinutes) {
       try {
         const memo = dayOddsMemo_(np.ymd); let done = 0, dirty = false;
         rows.filter(function (r) { return (r.Action === 'BUY' || r.Action === 'SHORT') && !held0[r.Ticker] && r.Side; }).forEach(function (r) {
           const key = r.Ticker + '|' + r.Side;
+          if (memo.d[key] && memo.d[key].why && /no 60-day bars/.test(memo.d[key].why)) { delete memo.d[key]; dayAlertOnce_('bars60', 'Time Machine: no price history', 'Yahoo returned no 60-day bars for ' + r.Ticker + '. Its odds are missing, so it cannot be approved.'); }
           if (!memo.d[key] && done < C.odds.maxPerScan && Date.now() - startMs < 240000) {
             const x = res[r.Ticker];
             if (x && x.sig && x.sig.trigger > 0) { memo.d[key] = dayOdds_(r.Ticker, r.Side, r.Price, x.sig.trigger, x.sig.stop, x.sig.target, np, C); done++; dirty = true; }
@@ -1510,13 +1853,41 @@ function dayRun_(mode, opts) {
       } catch (e) { logToSheet_('Day odds failed: ' + (e && e.message ? e.message : e)); }
     }
 
-    // hand the live BUY / SHORT option plans to Auto_Trade (appends only; never touches your existing rows)
+    // ---- SAFETY GATES: a live BUY / SHORT reaches Auto_Trade only if it passes odds, delta, spread cost and earnings (Gate column), and the account guard allows new rows
     let pushNote = '';
+    const liveRows = rows.filter(function (r) { return !held0[r.Ticker] && (r.Action === 'BUY' || r.Action === 'SHORT'); });
+    let em = { off: true, ok: true, map: {} };
+    if (liveRows.length) {
+      try { em = dayEarningsMap_(np, names.filter(function (t) { return t !== 'SPY' && t !== 'QQQ'; })); } catch (e) { em = { ok: false, map: {} }; logToSheet_('Day earnings map failed: ' + (e && e.message ? e.message : e)); }
+      if (!em.ok && !em.off && C.gates.earnings.failClosed) dayAlertOnce_('earn', 'Earnings filter cannot load the calendar', 'New signals are blocked until the Finnhub earnings calendar loads (Finnhub key set? see ScriptLog). To trade without the earnings check, set gates.earnings.enabled to false.');
+    }
+    liveRows.forEach(function (r) { const g = dayGate_(r, em); r._gate = g; r.Gate = g.ok ? 'PASS' : 'BLOCKED: ' + g.why.join('; '); });
+    let guard = { blocked: '' };
+    try { guard = dayGuardNow_(np) || guard; } catch (e) { logToSheet_('Day guard failed: ' + (e && e.message ? e.message : e)); }
+    if (guard.blocked) dayAlertOnce_('guard|' + guard.blocked.slice(0, 30), 'Day guard: no new Auto_Trade rows', guard.blocked);
+    dayStatsBump_(np, function (st) {
+      st.scans++;
+      liveRows.forEach(function (r) { const k = r.Ticker + '|' + r.Side; st.seen[k] = 1; if (r._gate.ok) { st.passed[k] = 1; delete st.blocked[k]; } else if (!st.passed[k]) st.blocked[k] = r._gate.why.join('; '); });
+    });
+
+    // hand the passing option plans to Auto_Trade (appends only; never touches your own rows). A row already there that now fails a hard gate is removed if still Review.
     if (C.optionHints && C.autoTrade && C.autoTrade.enabled && np.m >= DAY_OPEN_M && np.m < DAY_CLOSE_M) {
-      try { pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd, { filter: C.autoTrade.requireFavorable ? dayFavorable_ : null }); } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
+      try {
+        pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd, {
+          filter: function (r) { return !!(r._gate && r._gate.ok); },
+          keep: function (r) { return !(r._gate && r._gate.hard); },
+          noAdd: guard.blocked });
+      } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
     }
 
-    try { alogTick_(false); } catch (e) { logToSheet_('AutoLog update failed: ' + (e && e.message ? e.message : e)); }
+    // shadow rows: signals a gate or the guard held back are still tracked on paper (Approved = NO), so the scorecard can show whether the gates help
+    try {
+      const shadow = liveRows.filter(function (r) { return r['TM Target %'] !== undefined && r['TM Target %'] !== '' && (!(r._gate && r._gate.ok) || guard.blocked); })
+        .map(function (r) { const o = dayAutoTradeOrder_(r, C.autoTrade.minQty, false, C.autoTrade.lots); if (o) o.blockedBy = !r._gate.ok ? r._gate.why.join('; ') : 'guard: ' + guard.blocked; return o; }).filter(Boolean);
+      if (shadow.length) dayShadowLog_(shadow, np.ymd);
+    } catch (e) { logToSheet_('Shadow log failed: ' + (e && e.message ? e.message : e)); }
+
+    try { alogTick_(false); } catch (e) { dayAlertOnce_('alog', 'AutoLog update failed', String(e && e.message ? e.message : e).slice(0, 200)); logToSheet_('AutoLog update failed: ' + (e && e.message ? e.message : e)); }
 
     // rows order: held first (9000+), then ranked; SPY/QQQ gauges last
     rows.sort(function (a, b) { return (b.SortKey || 0) - (a.SortKey || 0); });
@@ -1543,7 +1914,7 @@ function dayRun_(mode, opts) {
     const alertNote = opts.alert === false ? '' : daySendAlerts_(mode, np, shown, held0, tape, short, opts);
     const c = {}; shown.forEach(function (r) { c[r.Action] = (c[r.Action] || 0) + 1; });
     const msg = (timedOut ? '⏱️ Stopped at the time limit.\n' : '') + mode + ' scan of ' + names.length + ' names, tape ' + tape + '\n' + Object.keys(c).map(function (k) { return k + ': ' + c[k]; }).join('   ') +
-      (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '') + (pushNote ? '\n' + pushNote : '');
+      (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '') + (pushNote ? '\n' + pushNote : '') + (guard.blocked ? '\nGuard: ' + guard.blocked : '');
     logToSheet_('Day scan ' + msg.replace(/\n/g, ' | '));
     notify_(ui, 'Day scan', msg);
     return { mode: mode, rows: shown.length, timedOut: timedOut };
@@ -1674,6 +2045,7 @@ function dayScheduledTick_() {
     if (hasHeld()) dayRun_('LIVE', { quiet: true });
     return;
   }
+  if (m >= np.closeM + 5 && last('DAY_LAST_HEALTH') !== np.ymd) { props.setProperty('DAY_LAST_HEALTH', np.ymd); try { dayHealthSend_(np); } catch (e) { logToSheet_('Day health failed: ' + (e && e.message ? e.message : e)); } }
   if (S.eodReplay && m >= np.closeM + 5 && last('DAY_LAST_EOD') !== np.ymd) dayEod_({ quiet: true });
 }
 
