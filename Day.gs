@@ -55,6 +55,8 @@ const DAY_CONFIG = {
   // Auto_Trade hand-off: BUY / SHORT rows that got an option plan are appended to the Auto_Trade tab for you to review.
   // Status is written as autoTrade.status so nothing fires until YOU change it to whatever your executor treats as "go".
   // Time Machine odds (port of the day-trader-skill replay): BUY / SHORT rows get target-first / stop-first odds from the stock's own last 60 days of 5-minute bars
+  // RSI / Aroon next to the Action: only for live BUY / SHORT / WAIT rows and the positions you hold (one Yahoo 1-minute call each)
+  indicators: { enabled: true, maxPerScan: 12, rsiLen: 14, aroonLen: 25 },
   odds: { enabled: true, replays: 5000, window: 2, minSessions: 20, maxPerScan: 4, maxManual: 8, seed: 19 },
   // Safety gates: a BUY / SHORT reaches Auto_Trade only if it passes ALL of these (the Gate column on the Day tab says PASS or why it was blocked)
   gates: {
@@ -90,7 +92,8 @@ const DAY_CONFIG = {
 const DAY_OPTION_HEADERS = ['Opt Action', 'Opt Expiry', 'Opt Strike', 'Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Qty', 'Opt Delta', 'Opt Spread %', 'Opt OI'];
 const DAY_ODDS_HEADERS = ['TM Target %', 'TM Stop %', 'TM Open %', 'TM Avg R', 'TM History', 'TM Verdict'];
 const DAY_GATE_HEADERS = ['Gate'];
-const DAY_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'Side', 'Setup', 'Score', 'Trigger', 'Stop', 'Target', 'Size',
+const DAY_IND_HEADERS = ['RSI 1m', 'AUP 5m', 'ADN 5m'];   // sit right after Action: 1-minute RSI(14), 5-minute Aroon Up / Down (length 25), the same settings as the Flip tab
+const DAY_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'RSI 1m', 'AUP 5m', 'ADN 5m', 'Side', 'Setup', 'Score', 'Trigger', 'Stop', 'Target', 'Size',
   'Gap %', 'RVOL', 'Pre RVOL', 'ATR %', 'VW %', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low', 'Spread %', 'Catalyst', 'Tape',
   'P/L $', 'P/L %', 'R', 'Why', 'Option'].concat(DAY_OPTION_HEADERS).concat(DAY_ODDS_HEADERS).concat(DAY_GATE_HEADERS).concat(['LastRun', 'SortKey']);
 const DAY_ENTRY_COL = 5;
@@ -432,7 +435,7 @@ function dayAddMenu_() {
     .addItem('📤 Send Selected Rows to Auto_Trade (manual)', 'dayPushSelected_')
     .addItem('Set Account Size…', 'daySetAccount_')
     .addItem('Add Extra Tickers…', 'dayAddExtraTickers_')
-    .addItem('Add Option + Odds Columns (once)', 'dayAddOptionColumns_')
+    .addItem('Add New Columns (option, odds, gate, RSI / Aroon)', 'dayAddOptionColumns_')
     .addItem('🎲 Time Machine Odds (BUY / SHORT / WAIT rows)', 'dayOddsNow_')
     .addSeparator()
     .addItem('▶ Start Schedule', 'startDaySchedule_')
@@ -494,7 +497,16 @@ function dayAddOptionColumns_() {
   let next = lastCol; while (next > 0 && String(sheet.getRange(1, next).getValue()).trim() === '') next--;
   const add = DAY_OPTION_HEADERS.concat(DAY_ODDS_HEADERS).concat(DAY_GATE_HEADERS).filter(function (h) { return !have[h]; });
   add.forEach(function (h) { next++; sheet.getRange(1, next).setValue(h).setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3'); });
-  notify_(tryGetUi_(), 'Day', add.length ? 'Added ' + add.length + ' option column(s) at the end: ' + add.join(', ') + '.\nMove or delete them as you like; the scan follows the header names.' : 'All option columns are already there.');
+  // RSI / Aroon go right after the Action column (everything to the right shifts over; the scan follows the header names)
+  const hdr = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0].map(function (v) { return String(v).trim(); });
+  const missInd = DAY_IND_HEADERS.filter(function (h) { return hdr.indexOf(h) < 0; });
+  let indNote = '';
+  if (missInd.length) {
+    const ai = hdr.indexOf('Action') + 1;
+    if (ai > 0) { sheet.insertColumnsAfter(ai, missInd.length); sheet.getRange(1, ai + 1, 1, missInd.length).setValues([missInd]).setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3').setHorizontalAlignment('center'); for (let i = 1; i <= missInd.length; i++) sheet.setColumnWidth(ai + i, 46); indNote = 'Added ' + missInd.join(', ') + ' right after Action.'; }
+    else { missInd.forEach(function (h) { next++; sheet.getRange(1, next).setValue(h).setFontWeight('bold').setFontSize(6).setWrap(true).setBackground('#d9ead3'); }); indNote = 'No Action column found, so ' + missInd.join(', ') + ' went to the end.'; }
+  }
+  notify_(tryGetUi_(), 'Day', (add.length ? 'Added ' + add.length + ' column(s) at the end: ' + add.join(', ') + '.\n' : '') + (indNote ? indNote + '\n' : '') + (add.length || indNote ? 'Move or delete them as you like; the scan follows the header names.' : 'All columns are already there.'));
 }
 
 function daySetAccount_() {
@@ -698,6 +710,72 @@ function dayOptionProposal_(ticker, side, price, R, token, acct) {
       text: (isCall ? 'CALL ' : 'PUT ') + best.strike + ' ' + Utilities.formatDate(exp.date, 'America/New_York', 'MMMd') + ' (' + dte + 'd): limit ' + plan.limit.toFixed(2) + ', mid ' + plan.mid.toFixed(2) +
         ', stop ' + plan.stop.toFixed(2) + ', target ' + plan.target.toFixed(2) + ', qty ' + plan.qty };
   } catch (e) { return { why: 'option lookup failed: ' + (e && e.message ? e.message : e) }; }
+}
+
+/* ============================================================================
+ * RSI / AROON NEXT TO THE ACTION (same definitions as the Flip tab and the Cloud Function)
+ *   RSI 1m  = Wilder RSI(14) on 1-minute closes, the forming candle included
+ *   AUP 5m / ADN 5m = Aroon Up / Down, length 25, on 5-minute bars built from the 1-minute bars: 100 x (25 - bars since the highest high / lowest low in the last 26 bars) / 25
+ * Regular-session bars of the last 5 days from Yahoo. Display only: they do not change any signal, gate or order.
+ * ========================================================================== */
+
+function dayFetchBars1m_(ticker) {
+  const hosts = ['query1', 'query2'];
+  for (let h = 0; h < hosts.length; h++) {
+    try {
+      const resp = UrlFetchApp.fetch('https://' + hosts[h] + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?range=5d&interval=1m&includePrePost=false',
+        { method: 'get', muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' } });
+      if (resp.getResponseCode() !== 200) continue;
+      const r = (JSON.parse(resp.getContentText()).chart || {}).result;
+      const bars = dayParseBars_(r && r[0]);
+      if (bars.length) return bars;
+    } catch (e) { Logger.log('day bars1m ' + ticker + ': ' + e); }
+  }
+  return null;
+}
+
+// Wilder's RSI series (seed = simple average of the first `len` changes, then Wilder smoothing): one value per bar from index len onward, or null.
+function dayRsiSeries_(closes, len) {
+  if (closes.length < len + 1) return null;
+  const toRsi = function (g, l) { return l === 0 ? (g === 0 ? 50 : 100) : 100 - 100 / (1 + g / l); };
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= len; i++) { const d = closes[i] - closes[i - 1]; if (d > 0) gain += d; else loss -= d; }
+  let ag = gain / len, al = loss / len;
+  const out = [toRsi(ag, al)];
+  for (let i = len + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    ag = (ag * (len - 1) + (d > 0 ? d : 0)) / len; al = (al * (len - 1) + (d < 0 ? -d : 0)) / len;
+    out.push(toRsi(ag, al));
+  }
+  return out;
+}
+
+// 5-minute bars from 1-minute bars (bars carry ms): bucket = floor(seconds / 300)
+function day5mFrom1m_(bars) {
+  const out = []; let cur = null;
+  bars.forEach(function (b) {
+    const k = Math.floor(b.ms / 300000);
+    if (!cur || cur.k !== k) { cur = { k: k, h: b.h, l: b.l, c: b.c }; out.push(cur); }
+    else { if (b.h > cur.h) cur.h = b.h; if (b.l < cur.l) cur.l = b.l; cur.c = b.c; }
+  });
+  return out;
+}
+
+// Aroon over the last len+1 bars; ties go to the most recent bar
+function dayAroon_(bars, len) {
+  if (bars.length < len + 1) return null;
+  const win = bars.slice(bars.length - (len + 1));
+  let hiAgo = 0, loAgo = 0, hi = -Infinity, lo = Infinity;
+  for (let ago = 0; ago <= len; ago++) { const b = win[win.length - 1 - ago]; if (b.h > hi) { hi = b.h; hiAgo = ago; } if (b.l < lo) { lo = b.l; loAgo = ago; } }
+  return { up: 100 * (len - hiAgo) / len, down: 100 * (len - loAgo) / len };
+}
+
+// Pure: 1-minute bars -> { rsi, aup, adn } (each null when there are too few bars)
+function dayIndicatorsFromBars_(bars1m, cfg) {
+  const r1 = function (x) { return x == null ? null : Math.round(x * 10) / 10; };
+  const series = dayRsiSeries_(bars1m.map(function (b) { return b.c; }), cfg.rsiLen);
+  const ar = dayAroon_(day5mFrom1m_(bars1m), cfg.aroonLen);
+  return { rsi: series ? r1(series[series.length - 1]) : null, aup: ar ? r1(ar.up) : null, adn: ar ? r1(ar.down) : null };
 }
 
 /* ============================================================================
@@ -1814,6 +1892,20 @@ function dayRun_(mode, opts) {
     }
     if (mode === 'PRE') props.setProperty('DAY_LAST_PRE', np.ymd + ' ' + Utilities.formatDate(now, 'America/New_York', 'HH:mm'));
 
+    // RSI 1m / Aroon 5m next to the Action, for the live BUY / SHORT / WAIT rows and the positions you hold (display only)
+    if (C.indicators && C.indicators.enabled && np.m >= DAY_OPEN_M) {
+      let nInd = 0;
+      rows.filter(function (r) { return r.Ticker !== 'SPY' && r.Ticker !== 'QQQ' && (held0[r.Ticker] || r.Action === 'BUY' || r.Action === 'SHORT' || r.Action === 'WAIT'); })
+        .sort(function (a, b) { return (held0[b.Ticker] ? 1 : 0) - (held0[a.Ticker] ? 1 : 0) || (b.Score || 0) - (a.Score || 0); }).slice(0, C.indicators.maxPerScan)
+        .forEach(function (r) {
+          if (Date.now() - startMs > C.timeBudgetMs - 40000) return;
+          const b1 = dayFetchBars1m_(r.Ticker); if (!b1) return;
+          const iv = dayIndicatorsFromBars_(b1, C.indicators);
+          if (iv.rsi != null) r['RSI 1m'] = iv.rsi; if (iv.aup != null) { r['AUP 5m'] = iv.aup; r['ADN 5m'] = iv.adn; }
+          nInd++; Utilities.sleep(C.sleepMs);
+        });
+    }
+
     // option proposal: BUY CALL for LONG, BUY PUT for SHORT, on the best live signals (BUY / SHORT first, then the best WAIT rows)
     let optFails = 0;
     if (C.optionHints && np.m >= DAY_OPEN_M) {
@@ -1930,7 +2022,7 @@ function dayFormat_(sheet, n, map) {
   ['Price', 'Change', 'Entry Date', 'Entry', 'Qty'].forEach(center);
   ['Trigger', 'Stop', 'Target', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   ['Gap %', 'VW %', 'ATR %', 'Spread %', 'P/L %'].forEach(function (h) { fmt(h, '0.00'); });
-  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0'); fmt('TM Target %', '0.0'); fmt('TM Stop %', '0.0'); fmt('TM Open %', '0.0'); fmt('TM Avg R', '0.00');
+  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0'); fmt('RSI 1m', '0.0'); fmt('AUP 5m', '0'); fmt('ADN 5m', '0'); center('RSI 1m'); center('AUP 5m'); center('ADN 5m'); fmt('TM Target %', '0.0'); fmt('TM Stop %', '0.0'); fmt('TM Open %', '0.0'); fmt('TM Avg R', '0.00');
   fmt('RVOL', '0.0'); fmt('Pre RVOL', '0.0'); fmt('Score', '0'); fmt('R', '0.0'); fmt('P/L $', '$#,##0.00;-$#,##0.00;$0.00'); fmt('LastRun', 'hh:mm');
   if (map.Change) {
     const rules = sheet.getConditionalFormatRules();

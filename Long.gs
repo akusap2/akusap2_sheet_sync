@@ -47,7 +47,7 @@ function longFlushCache_(pending) {
   const cutoff = Date.now() - 3 * 86400000;
   const rows = [];
   Object.keys(existing).forEach(function (k) {
-    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH|LONGTECH2)_/.test(k)) {
+    if (/^SLOW_(LONGCON|LONGCON2|LONGTECH|LONGTECH2|LONGINS)_/.test(k)) {
       try { const d = JSON.parse(existing[k]).date; if (new Date(d + 'T00:00:00').getTime() < cutoff) return; } catch (e) { return; }
     }
     rows.push([k, existing[k]]);
@@ -98,6 +98,16 @@ const LONG_CONFIG = {
   },
   // cspQualityStock_/Etf_ read these two; 100 switches their trend gates off (Long judges trend itself, per row)
   maxBelow200Pct: 100, maxDrawdownPct: 100,
+  // --- insider buying (Finnhub /stock/insider-transactions, SEC Form 4). Information only: it does NOT change Score or Action. ---
+  insider: {
+    enabled: true,
+    lookbackDays: 90,
+    refreshDays: 2,          // cached per ticker; insider filings arrive a few times a month, so 2 days is fresh enough
+    buyMinUsd: 50000,        // open-market purchases below this total are shown as "small buy"
+    clusterMinBuyers: 2,     // this many different insiders buying = CLUSTER BUY
+    clusterMinUsd: 100000,
+    fetchPauseMs: 1100       // after each LIVE call only (Finnhub free tier is about 60 calls/minute); cached rows cost nothing
+  },
   // --- alerts ----------------------------------------------------------------
   alerts: { exitRepeatHours: 12, rollRepeatHours: 24, tpRepeatHours: 24, reviewRepeatHours: 24, buyRepeatHours: 24 },
   // --- schedule (US/Eastern) -------------------------------------------------
@@ -143,10 +153,10 @@ const LONG_INPUT_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry'];            
 const LONG_HELD_WHEN_OPEN = ['Strike', 'Expiry'];                                // your entries while Qty is filled: never overwritten
 const LONG_EXTRA_HEADERS = ['Quality', 'Source', 'Type'];                        // written by Promote, not by the scan
 const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality',
-  'Earn Days', 'IV Rank', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
+  'Earn Days', 'IV Rank', 'Insider', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
   'Days', 'P/L $', 'Why', 'LastRun'];
 const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20', 'RS vs SPY %', 'Ret 1M %',
-  'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'SortKey'];
+  'Bid', 'Ask', 'Extrinsic $', 'Risk 10%', 'Risk 30%', 'Ins Buy $K', 'Ins Buyers', 'Ins Sell $K', 'SortKey'];
 // Still computed (used by Action, alerts and Why) but no longer a column: setup never re-adds them, and if they are still on the sheet they are hidden.
 const LONG_NO_COLUMN = ['Carry %/yr', 'Breakeven %', 'P/L %', 'Stock Equiv $', 'Capital Saved $'];
 // Headers you replaced with your own total formula in row 1 (Entry: SUMPRODUCT, P/L $: SUM). Setup never adds these headers back;
@@ -628,6 +638,65 @@ function longFetchEarnings_(ticker, ctx) {
   return (res.value && res.value.date) ? new Date(res.value.date + 'T12:00:00') : null;
 }
 
+// ---- Insider buying -----------------------------------------------------------------------------------------------
+// Pure: Finnhub rows -> summary. Only transactionCode 'P' (open-market purchase) counts as buying and 'S' (open-market sale) as selling;
+// awards, option exercises, tax withholding and gifts are ignored. Sales are shown but never a signal (executives sell for many routine reasons).
+function longInsiderSummary_(rows, nowMs, cfg) {
+  const I = cfg.insider, cutoff = nowMs - I.lookbackDays * 86400000;
+  let buyUsd = 0, sellUsd = 0, buys = 0, lastBuy = null;
+  const buyers = {};
+  (rows || []).forEach(function (r) {
+    if (!r) return;
+    const d = new Date(String(r.transactionDate || r.filingDate || '') + 'T12:00:00').getTime();
+    if (isNaN(d) || d < cutoff) return;
+    const qty = Math.abs(Number(r.change)), px = Number(r.transactionPrice);
+    if (!(qty > 0) || !(px > 0)) return;
+    const usd = qty * px;
+    if (r.transactionCode === 'P') {
+      buyUsd += usd; buys++; buyers[String(r.name || '?').toUpperCase()] = true;
+      const ds = String(r.transactionDate || r.filingDate).slice(0, 10);
+      if (!lastBuy || ds > lastBuy) lastBuy = ds;
+    } else if (r.transactionCode === 'S') {
+      sellUsd += usd;
+    }
+  });
+  return { buyUsd: Math.round(buyUsd), buyers: Object.keys(buyers).length, buys: buys, sellUsd: Math.round(sellUsd), lastBuy: lastBuy };
+}
+
+function longInsiderLabel_(sum, cfg) {
+  const I = cfg.insider;
+  if (!sum) return '';
+  if (sum.buyers >= I.clusterMinBuyers && sum.buyUsd >= I.clusterMinUsd) return 'CLUSTER BUY';
+  if (sum.buyUsd >= I.buyMinUsd) return 'BUY';
+  if (sum.buyUsd > 0) return 'small buy';
+  if (sum.sellUsd > 0) return 'sells only';
+  return 'none';
+}
+
+function longMoneyShort_(usd) { return usd >= 1e6 ? '$' + longRound_(usd / 1e6, 1) + 'M' : '$' + Math.round(usd / 1000) + 'K'; }
+
+// One Finnhub call per ticker per refreshDays (cached in LongCache). Returns the summary, or null when there is no key / the plan does not
+// allow it / the call failed (then the cell stays blank and the next run tries again). A real "no insider trades" answer IS cached.
+function longFetchInsider_(ticker, ctx) {
+  const I = LONG_CONFIG.insider;
+  if (!I.enabled || !ctx.finnhubKey || ctx.insiderOff) return null;
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'LONGINS', ticker, I.refreshDays, function () {
+    const to = new Date(ctx.now.getTime()), from = new Date(ctx.now.getTime() - I.lookbackDays * 86400000);
+    const url = FINNHUB_BASE_URL + '/stock/insider-transactions?symbol=' + encodeURIComponent(ticker) + '&from=' + longYmd_(from) + '&to=' + longYmd_(to) +
+      '&token=' + encodeURIComponent(ctx.finnhubKey);
+    const resp = fetchWithRetry_(url, { method: 'get', muteHttpExceptions: true, headers: { Accept: 'application/json', 'User-Agent': 'options-portfolio-validator/1.0' } },
+      FINNHUB_MAX_RETRIES, FINNHUB_RETRY_BASE_DELAY_MS);
+    const code = resp.getResponseCode();
+    if (code === 401 || code === 403) { ctx.insiderOff = true; logToSheet_('Long insider: Finnhub returned HTTP ' + code + ' (key or plan does not include insider transactions). Insider column skipped for this run.'); return null; }
+    if (code !== 200) return null;
+    const json = JSON.parse(resp.getContentText());
+    if (!json || !Array.isArray(json.data)) return null;
+    return longInsiderSummary_(json.data, ctx.now.getTime(), LONG_CONFIG);
+  });
+  if (res.fetchAttempted) Utilities.sleep(I.fetchPauseMs);
+  return res.value || null;
+}
+
 function longFetchAnalyst_(ticker, ctx) {
   const res = getSlowCached_(ctx.slowCache, ctx.pending, 'ANALYST', ticker, SLOW_REFRESH_DAYS.ANALYST, function () {
     const a = fetchYahooAnalystTarget_(ticker);
@@ -809,6 +878,12 @@ function longProcessRow_(inp, ctx) {
   out['Next Earnings'] = isEtf ? 'ETF' : (earnDate || ''); out['Earn Days'] = earnDays == null ? '' : earnDays;
   const ivr = ctx.ivRanks[t] != null ? ctx.ivRanks[t] : null;
   out['IV Rank'] = ivr != null ? ivr : '';
+  const ins = isEtf ? null : longFetchInsider_(t, ctx);
+  if (ins) {
+    out.Insider = longInsiderLabel_(ins, cfg);
+    out['Ins Buy $K'] = Math.round(ins.buyUsd / 1000); out['Ins Buyers'] = ins.buyers; out['Ins Sell $K'] = Math.round(ins.sellUsd / 1000);
+  } else if (isEtf) { out.Insider = 'ETF'; }
+  const insNote = (ins && ins.buyUsd >= cfg.insider.buyMinUsd) ? ' | insiders bought ' + longMoneyShort_(ins.buyUsd) + ' (' + ins.buyers + ' people, last ' + ins.lastBuy + ')' : '';
   const target = isEtf ? null : longFetchAnalyst_(t, ctx);
   const upside = target ? (target / spot - 1) * 100 : null;
   if (target) { out.Analyst = target; out['Upside %'] = upside; }
@@ -858,7 +933,7 @@ function longProcessRow_(inp, ctx) {
     if (mark == null) { try { noQuoteWhy = longExplainMissingQuote_(t, inp.openExpiry, inp.openStrike, ctx, now); } catch (e) { noQuoteWhy = 'no quote for this contract'; } }
     const pl = (mark != null && inp.openEntry > 0) ? (mark / inp.openEntry - 1) * 100 : null;
     const ha = longHeldAction_({ dte: c.dte, pl: pl, spot: spot, tech: tech, upside: upside, quality: inp.quality, isEtf: isEtf, carry: m.carry }, cfg);
-    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '') + (snapNote ? ' | ' + snapNote : '');
+    out.Action = ha.action; out.Why = 'HELD: ' + ha.why + (noQuoteWhy ? ' | NO MID: ' + noQuoteWhy : '') + insNote + (snapNote ? ' | ' + snapNote : '');
     out.Strike = inp.openStrike; out.Expiry = inp.openExpiry; out.DTE = c.dte;
     if (mark != null) out.Mid = mark;
     if (c.delta != null) out.Delta = c.delta;
@@ -915,7 +990,7 @@ function longProcessRow_(inp, ctx) {
   const ev = longEvaluateEntry_(x, cfg);
   out.Action = ev.action;
   const noteQ = inp.quality == null ? ' | Quality not scored yet (run Promote)' : '';
-  out.Why = ev.why.filter(function (s) { return s; }).join(' | ') + noteQ + (earnDays != null && earnDays >= 0 && earnDays <= 7 ? ' | earnings in ' + earnDays + 'd (info)' : '');
+  out.Why = ev.why.filter(function (s) { return s; }).join(' | ') + noteQ + insNote + (earnDays != null && earnDays >= 0 && earnDays <= 7 ? ' | earnings in ' + earnDays + 'd (info)' : '');
   out.SortKey = longSortKey_(ev.action, score, null);
   return out;
 }
