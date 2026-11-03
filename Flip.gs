@@ -973,17 +973,48 @@ function flipPickContract_(ticker, spot, sigmaDay, ctx) {
 
 // Expiry text -> Date (cache stores yyyy-MM-dd).
 // Date typed in a sheet cell: keep the calendar day the sheet shows (see the note inside), pinned to noon.
-function flipCellDate_(v) {
-  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
-    // A date cell is midnight in the SPREADSHEET's time zone (GMT here), which differs from the script's (New York): midnight GMT is the
-    // previous evening in New York, so Jun 17 became Jun 16 and no contract matched. Take the calendar day as the sheet shows it, pin to noon.
-    try {
-      const sheetTz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-      const p = Utilities.formatDate(v, sheetTz, 'yyyy-MM-dd').split('-');
-      return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12, 0, 0);
-    } catch (e) { return v; }
+// Calendar day {y, m, d} of whatever sits in an Expiry / Entry Date cell, or null. Works for a real date cell (midnight, or with a time such as
+// "2027-03-19 16:00:00"), text in "2027-03-19", "2027-03-19 16:00:00", "3/19/2027" or "Mar 19, 2027", and a plain serial number.
+// It never depends on the script's or the sheet's time zone being readable: a date cell is midnight in the SPREADSHEET's zone (GMT here), so
+// midnight GMT is the previous evening in New York and used to turn Mar 19 into Mar 18 (no contract matched); a cell that carried a 16:00:00
+// time happened to land on the right day, which is why only those worked.
+function flipDayOfCell_(v) {
+  if (v == null || v === '') return null;
+  const ok = function (y, m, d) { return y >= 2000 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 ? { y: y, m: m, d: d } : null; };
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    if (isNaN(v.getTime())) return null;
+    try {   // the sheet's own zone, when it can be read
+      const tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+      if (typeof tz === 'string' && tz) {
+        const q = Utilities.formatDate(v, tz, 'yyyy-MM-dd').split('-');
+        const r = ok(Number(q[0]), Number(q[1]), Number(q[2]));
+        if (r) return r;
+      }
+    } catch (e) { /* use the fallback below */ }
+    // Fallback: +6h then read the UTC date. Midnight in GMT or any US zone (0-8h after 00:00 UTC) and any time of day up to 17:59 GMT land on the right day.
+    const u = new Date(v.getTime() + 6 * 3600000);
+    return ok(u.getUTCFullYear(), u.getUTCMonth() + 1, u.getUTCDate());
   }
-  return flipDate_(v);
+  if (typeof v === 'number') {
+    if (v < 20000 || v > 80000) return null;
+    const u = new Date(Date.UTC(1899, 11, 30) + Math.floor(v) * 86400000);
+    return ok(u.getUTCFullYear(), u.getUTCMonth() + 1, u.getUTCDate());
+  }
+  const str = String(v).trim();
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$/.exec(str);
+  if (m) return ok(Number(m[1]), Number(m[2]), Number(m[3]));
+  m = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[T\s].*)?$/.exec(str);
+  if (m) return ok(Number(m[3]) < 100 ? 2000 + Number(m[3]) : Number(m[3]), Number(m[1]), Number(m[2]));
+  const d = new Date(str);   // "Mar 19, 2027", "19-Mar-2027": parsed in the script's zone, so the local parts are what was typed
+  return isNaN(d.getTime()) ? null : ok(d.getFullYear(), d.getMonth() + 1, d.getDate());
+}
+
+function flipYmdText_(dy) { const p = function (n) { return (n < 10 ? '0' : '') + n; }; return dy ? dy.y + '-' + p(dy.m) + '-' + p(dy.d) : ''; }
+
+// The day pinned to noon in the script's zone, so every later formatDate in New York shows the same calendar day.
+function flipCellDate_(v) {
+  const dy = flipDayOfCell_(v);
+  return dy ? new Date(dy.y, dy.m - 1, dy.d, 12, 0, 0) : null;
 }
 
 function flipDate_(v) {
@@ -1028,6 +1059,25 @@ function flipEarnDays_(date, now) {
 }
 
 // Columns shared by every kind of row (stock-level facts).
+// Price source, best first: the fresh intraday last (Cloud Function), TastyTrade's own equity quote (read straight from Apps Script, so it does not
+// depend on the Cloud Function), then the last completed daily close. `change` is the day's move when the source knows it.
+function flipPriceOf_(t, env) {
+  const iv = env.ivFresh[t], eq = env.eq && env.eq[t], f = env.feat[t];
+  if (iv && iv.lastPrice > 0) return { price: iv.lastPrice, src: 'iv', change: null };
+  if (eq && eq.price > 0) return { price: eq.price, src: 'eq', change: typeof eq.change === 'number' && isFinite(eq.change) ? eq.change : null };
+  if (f && f.price > 0) return { price: f.price, src: 'daily', change: null };
+  return { price: null, src: '', change: null };
+}
+
+// One TastyTrade call per 20 tickers; {} when there is no token or the call fails (the scan then uses the daily close, as before).
+function flipPrefetchEquity_(tickers, ctx) {
+  try {
+    if (typeof longPrefetchQuotes_ !== 'function') return {};
+    const token = ctx.token || getTastyTradeAccessToken_();
+    return token ? (longPrefetchQuotes_(tickers, token) || {}) : {};
+  } catch (e) { return {}; }
+}
+
 function flipStockCols_(res, t, env, price) {
   const f = env.feat[t], d = env.daily[t] || {}, iv = env.ivFresh[t];
   const C = FLIP_CONFIG;
@@ -1066,7 +1116,8 @@ function flipLiveContract_(base, q) {
 function flipProcessHeld_(rw, env) {
   const C = FLIP_CONFIG, t = rw.ticker, res = {};
   const f = env.feat[t], iv = env.ivFresh[t];
-  const price = iv && iv.lastPrice > 0 ? iv.lastPrice : (f ? f.price : null);
+  const pp = flipPriceOf_(t, env), price = pp.price;
+  env.src[t] = pp;
   flipStockCols_(res, t, env, price);
   const earnDate = env.full ? flipEarnings_(t, env.ctx) : flipEarningsCached_(t, env.ctx);
   const earnDays = flipEarnDays_(earnDate, env.now);
@@ -1125,7 +1176,8 @@ function flipProcessHeld_(rw, env) {
 function flipProcessCandidate_(rw, env) {
   const C = FLIP_CONFIG, S = env.S, t = rw.ticker, res = {};
   const f = env.feat[t], d = env.daily[t] || {}, iv = env.ivFresh[t];
-  const price = iv && iv.lastPrice > 0 ? iv.lastPrice : (f ? f.price : null);
+  const pp = flipPriceOf_(t, env), price = pp.price;
+  env.src[t] = pp;
   flipStockCols_(res, t, env, price);
   let warnTail = '';   // spread warning, appended to every outcome once the live quote is known
   const done = function (action, why) { res['Action'] = action; res['Why'] = why + warnTail; return res; };
@@ -1302,11 +1354,12 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
       return o.length && o[o.length - 1].d === todayYmd ? o.slice(0, -1) : o;
     };
     const spyObj = barsOf('SPY');
-    const feat = {}, prevClose = {};
+    const feat = {}, prevClose = {}, prevClose2 = {};
     tickers.forEach(function (t) {
       const b = barsOf(t);
       feat[t] = flipFeatures_(b, spyObj);
       prevClose[t] = b.length ? b[b.length - 1].c : null;
+      prevClose2[t] = b.length > 1 ? b[b.length - 2].c : null;
     });
     const daily = flipGetDaily_(tickers, ctx);
 
@@ -1315,8 +1368,9 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const spy = ivMap['SPY'] || null;
     const spyHead = !!(spy && spy.vwapPct != null && spy.aroonUp != null && spy.aroonDown != null && spy.vwapPct < 0 && spy.aroonDown > spy.aroonUp);
     const env = { now: now, sess: sess, closeMin: closeMin, S: flipSignal_(), spyHead: spyHead, feat: feat, prevClose: prevClose, daily: daily, ivFresh: {},
-      picks: {}, quotes: {}, ctx: ctx, full: full, open: [], todayYmd: todayYmd };
+      picks: {}, quotes: {}, ctx: ctx, full: full, open: [], todayYmd: todayYmd, eq: {}, src: {}, prevClose2: prevClose2 };
     tickers.forEach(function (t) { env.ivFresh[t] = flipFreshIv_(ivMap[t], env); });
+    env.eq = flipPrefetchEquity_(tickers, ctx);   // Price / Change when the Cloud Function has no fresh intraday data
 
     // Contracts for candidates (cached for the day; only a full scan may hit the chain endpoint).
     let timedOut = false;
@@ -1360,7 +1414,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     const errors = [];
     const stamp = new Date();
     let processed = 0;
-    const alertItems = [], logItems = [], pnlByIdx = {}, sortKeyByIdx = {}, jayByIdx = {};
+    const alertItems = [], logItems = [], pnlByIdx = {}, sortKeyByIdx = {}, jayByIdx = {}, contractByIdx = {};
     const jay = flipJayMap_(now);   // one cached request for the whole tab; null if unreachable (the scan carries on)
     for (let i = 0; i < work.length; i++) {
       if (Date.now() - startMs > budgetMs) { timedOut = true; break; }
@@ -1372,13 +1426,18 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
       jayByIdx[rw.idx] = jay ? (jay[String(rw.ticker).toUpperCase()] || '') : 'n/a';
       // Change = today's move in dollars: price now minus the previous session's close (same base as Day %).
       if (typeof res['Price'] === 'number' && res['Price'] > 0) {
-        const pc = env.prevClose[rw.ticker];
-        if (pc > 0) res['Change'] = flipR2_(res['Price'] - pc);
+        const ps = env.src[rw.ticker] || {};
+        if (ps.src === 'eq' && ps.change != null) res['Change'] = flipR2_(ps.change);                                  // TastyTrade's own move vs the previous close
+        else if (ps.src === 'daily') { const p2 = env.prevClose2[rw.ticker]; if (p2 > 0) res['Change'] = flipR2_(res['Price'] - p2); }   // last session's move (not 0.00)
+        else { const pc = env.prevClose[rw.ticker]; if (pc > 0) res['Change'] = flipR2_(res['Price'] - pc); }
       }
       sortKeyByIdx[rw.idx] = flipSortKey_(res['Action'], res['Score'], res._plPct);
       try { flipBuildAlertItems_(rw, res, alertItems); flipBuildLogItems_(rw, res, env, logItems); } catch (e) { /* alerts and logging never break a scan */ }
       const row = data[rw.idx];
-      const keep = rw.held ? FLIP_HELD_WHEN_OPEN : [];
+      // Strike / Expiry are never part of the block write below (see flipWriteContracts_): a held row's are yours, and a candidate's pick is only
+      // written where the cell is empty or still holds the script's own previous pick, so nothing you type there is ever replaced.
+      const keep = FLIP_HELD_WHEN_OPEN;
+      if (!rw.held) contractByIdx[rw.idx] = { Strike: res['Strike'], Expiry: res['Expiry'] };
       outCols.forEach(function (h) { if (keep.indexOf(h) === -1) row[map[h] - 1] = ''; });
       outCols.forEach(function (h) { if (keep.indexOf(h) === -1 && res[h] !== undefined && res[h] !== null) row[map[h] - 1] = res[h]; });
       pnlByIdx[rw.idx] = (res['P/L $'] === undefined || res['P/L $'] === null) ? '' : res['P/L $'];
@@ -1401,7 +1460,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
         if (!rw.held) return;
         FLIP_HELD_WHEN_OPEN.forEach(function (h) { if (map[h]) data[rw.idx][map[h] - 1] = freshT[rw.idx][map[h] - 1]; });
       });
-      const cols = outCols.map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });
+      const cols = outCols.filter(function (h) { return FLIP_HELD_WHEN_OPEN.indexOf(h) === -1; }).map(function (h) { return map[h]; }).sort(function (a, b) { return a - b; });
       let g0 = 0;
       while (g0 < cols.length) {
         let g1 = g0;
@@ -1410,6 +1469,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
         sheet.getRange(2, c0, data.length, c1 - c0 + 1).setValues(data.map(function (r) { return r.slice(c0 - 1, c1); }));
         g0 = g1 + 1;
       }
+      try { flipWriteContracts_(sheet, map, freshT, contractByIdx); } catch (e) { logToSheet_('Flip: could not write the contract picks: ' + (e && e.message ? e.message : e)); }
       // Jay column: rows processed this run get the paper-entry tier (or blank / n/a); other rows keep what is there (formula or value).
       try {
         const jc = map[FLIP_JAY_HEADER];
@@ -1458,6 +1518,65 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
     return { processed: processed, counts: counts, timedOut: timedOut };
   } finally {
     props.deleteProperty('FLIP_RUNNING');
+  }
+}
+
+// ---- Strike / Expiry of rows without a position -------------------------------------------------------------------------
+// PURE. items: one per ticker row { idx, ticker, held, curStrike, curExpiry (cell values), processed, wantStrike, wantExpiry }.
+// picks: { TICKER: 'strike|yyyy-mm-dd' } = what the script itself last wrote, or null the first time (everything already there is adopted as the
+// script's, once). A row is written only if it holds no position (Qty empty) AND its Strike / Expiry cells are empty or still equal the script's last
+// pick. Anything else was typed by you (for example Strike and Expiry entered before Qty) and is left alone. Returns { write: [item numbers], skipped:
+// [tickers], picks }.
+function flipPlanContractWrites_(items, picks) {
+  const old = picks || {}, out = { write: [], skipped: [], picks: {} };
+  const keyOf = function (s, e) { const n = flipNum_(s), d = flipYmdText_(flipDayOfCell_(e)); return (n == null && !d) ? '' : (n == null ? '' : n) + '|' + d; };
+  items.forEach(function (it, n) {
+    const cur = keyOf(it.curStrike, it.curExpiry);
+    if (it.held) return;                                                  // yours: no longer tracked as a script pick
+    const mine = cur === '' || picks === null || old[it.ticker] === cur;
+    if (!mine) { out.skipped.push(it.ticker); return; }                   // typed by you: keep it, and stop tracking it
+    if (!it.processed) { if (cur !== '') out.picks[it.ticker] = cur; return; }   // not looked at this run: same pick as before
+    const want = keyOf(it.wantStrike, it.wantExpiry);
+    if (want !== cur) out.write.push(n);
+    if (want !== '') out.picks[it.ticker] = want;
+  });
+  return out;
+}
+
+function flipWriteContracts_(sheet, map, freshT, contractByIdx) {
+  if (!map['Strike'] || !map['Expiry'] || !map['Qty'] || !map['Ticker']) return;
+  const props = PropertiesService.getScriptProperties();
+  let picks = null;
+  try { const raw = props.getProperty('FLIP_PICKS'); if (raw) picks = JSON.parse(raw); } catch (e) { picks = null; }
+  const tc = map['Ticker'] - 1, qc = map['Qty'] - 1, sc = map['Strike'] - 1, ec = map['Expiry'] - 1;
+  const items = [];
+  for (let i = 0; i < freshT.length; i++) {
+    const t = String(freshT[i][tc] || '').trim().toUpperCase();
+    if (!t) continue;
+    const w = contractByIdx[i];
+    items.push({ idx: i, ticker: t, held: (flipNum_(freshT[i][qc]) || 0) > 0, curStrike: freshT[i][sc], curExpiry: freshT[i][ec],
+      processed: !!w, wantStrike: w ? w.Strike : null, wantExpiry: w ? w.Expiry : null });
+  }
+  const plan = flipPlanContractWrites_(items, picks);
+  // consecutive rows are written together, so a normal scan is a handful of calls
+  let k = 0;
+  while (k < plan.write.length) {
+    let j = k;
+    while (j + 1 < plan.write.length && items[plan.write[j + 1]].idx === items[plan.write[j]].idx + 1) j++;
+    const first = items[plan.write[k]].idx, cnt = items[plan.write[j]].idx - first + 1;
+    const pick = function (key) { const a = []; for (let q = k; q <= j; q++) { const v = items[plan.write[q]][key]; a.push([v === undefined || v === null ? '' : v]); } return a; };
+    sheet.getRange(first + 2, map['Strike'], cnt, 1).setValues(pick('wantStrike'));
+    sheet.getRange(first + 2, map['Expiry'], cnt, 1).setValues(pick('wantExpiry'));
+    k = j + 1;
+  }
+  try {   // a script property holds 9 KB: far more than ~100 tickers need, but never let it overflow
+    let js = JSON.stringify(plan.picks);
+    if (js.length > 8000) { const o = {}; Object.keys(plan.picks).slice(0, 150).forEach(function (k) { o[k] = plan.picks[k]; }); js = JSON.stringify(o); }
+    props.setProperty('FLIP_PICKS', js);
+  } catch (e) { /* tracking only */ }
+  if (plan.skipped.length) {
+    const msg = 'Flip: left your own Strike / Expiry alone on ' + plan.skipped.join(', ') + ' (no Qty yet, so the scan did not overwrite them).';
+    try { if (props.getProperty('FLIP_SKIP_LOGGED') !== msg) { props.setProperty('FLIP_SKIP_LOGGED', msg); logToSheet_(msg); } } catch (e) { /* log only */ }
   }
 }
 

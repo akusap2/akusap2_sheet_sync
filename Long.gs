@@ -1132,6 +1132,8 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
 
 function longParseDate_(v) {
   if (v == null || v === '') return null;
+  // Same date reading as Flip (any text format, any time suffix, no time-zone lookup). Flip.gs is in the same project; if it is missing, the code below is used.
+  if (typeof flipCellDate_ === 'function') { const fd = flipCellDate_(v); if (fd) return fd; }
   if (longIsDate_(v)) {
     // A date cell is midnight in the SPREADSHEET's time zone, which can differ from the script's: midnight GMT is the previous evening
     // in New York, so Dec 15 became Dec 14 and no contract matched. Take the calendar day as the sheet shows it and pin it to noon.

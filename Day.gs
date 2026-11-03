@@ -62,7 +62,8 @@ const DAY_CONFIG = {
   gates: {
     earnings: { enabled: true, failClosed: true, daysAhead: 14 },   // blocked when the company reports between today and the option's expiry; failClosed: if the calendar cannot be loaded, block (and alert)
     delta: { min: 0.40, max: 0.75 },     // |delta| of the picked contract (the picker aims at 0.60); a contract without a delta passes
-    maxSpreadOfGain: 0.30                // bid/ask spread in dollars must be at most this share of the planned gain (target minus limit)
+    maxSpreadOfGain: 0.30,               // bid/ask spread in dollars must be at most this share of the planned gain (target minus limit)
+    minStopSpreads: 3                    // the premium stop (limit minus stop) must be at least this many bid/ask spreads wide, or quote noise alone stops the trade out. 0 = off
   },
   // Account guard: stops NEW rows going to Auto_Trade (existing rows are left alone). Counts the AutoLog trades that were approved or sent by hand.
   guard: { enabled: true, dailyLossUsd: 150, maxOpen: 3, lossStreak: 3, cooldownMin: 60 },
@@ -75,6 +76,7 @@ const DAY_CONFIG = {
   optMinOi: 100,
   optLimitSpreadFrac: 0.25,     // limit = mid + this fraction of the spread (never above the ask)
   alertTopN: 5,
+  alertBlocked: true,           // also message signals the gates held back (labelled NOT promoted + why). false = phone only hears about what reached Auto_Trade
   tickMinutes: 5,               // how often the cheap gate wakes up (it exits at once unless a slot is due)
   schedule: {
     firstScanHm: '09:36',       // first scan: the 9:30 opening range is complete at 9:35, so a 9:30 run could not see it
@@ -824,6 +826,9 @@ function dayGate_(r, em) {
   if (dRaw !== '' && dRaw != null && !isNaN(d) && (d < G.delta.min || d > G.delta.max)) why.push('delta ' + d.toFixed(2) + ' outside ' + G.delta.min + ' to ' + G.delta.max);
   const mid = Number(r['Opt Mid']), sp = Number(r['Opt Spread %']), gain = Number(r['Opt Target']) - Number(r['Opt Limit']);
   if (mid > 0 && sp > 0 && gain > 0 && (sp / 100 * mid) > G.maxSpreadOfGain * gain) why.push('spread costs ' + Math.round(sp / 100 * mid / gain * 100) + '% of the planned gain');
+  const lim = Number(r['Opt Limit']), stp = Number(r['Opt Stop']), spD = (mid > 0 && sp > 0) ? sp / 100 * mid : 0;
+  if (G.minStopSpreads > 0 && spD > 0 && lim > 0 && stp > 0 && lim > stp && (lim - stp) < G.minStopSpreads * spD)
+    why.push('stop only ' + ((lim - stp) / spD).toFixed(1) + 'x the bid/ask spread (needs ' + G.minStopSpreads + 'x): quote noise alone would trigger it');
   const eb = dayEarningsBlock_(r, em); if (eb) why.push(eb);
   return { ok: !why.length, why: why, hard: why.some(function (w) { return !/^(odds not ready|earnings calendar unavailable)/.test(w); }) };
 }
@@ -1010,6 +1015,7 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
     props.setProperty('DAY_AT_PUSHED', JSON.stringify(st));
     props.setProperty('DAY_AT_OWNED', JSON.stringify(owned));
     if (fresh.length) { try { alogAdd_(fresh, ymd, opt.manual ? 'MANUAL' : 'YES'); } catch (e) { logToSheet_('AutoLog add failed: ' + (e && e.message ? e.message : e)); } }
+    if (opt.out) opt.out.added = fresh.slice();   // the scan reads this to word its phone alert
     const parts = [];
     if (removed.length) parts.push('removed ' + removed.join(', '));
     if (fresh.length) parts.push('added ' + fresh.map(function (o) { return o.ticker + ' ' + o.strikeText + ' x' + o.lots; }).join(', '));
@@ -1947,6 +1953,7 @@ function dayRun_(mode, opts) {
 
     // ---- SAFETY GATES: a live BUY / SHORT reaches Auto_Trade only if it passes odds, delta, spread cost and earnings (Gate column), and the account guard allows new rows
     let pushNote = '';
+    const pushOut = { added: [] };
     const liveRows = rows.filter(function (r) { return !held0[r.Ticker] && (r.Action === 'BUY' || r.Action === 'SHORT'); });
     let em = { off: true, ok: true, map: {} };
     if (liveRows.length) {
@@ -1968,7 +1975,7 @@ function dayRun_(mode, opts) {
         pushNote = dayPushToAutoTrade_(rows.filter(function (r) { return !held0[r.Ticker]; }), np.ymd, {
           filter: function (r) { return !!(r._gate && r._gate.ok); },
           keep: function (r) { return !(r._gate && r._gate.hard); },
-          noAdd: guard.blocked });
+          noAdd: guard.blocked, out: pushOut });
       } catch (e) { pushNote = 'Auto_Trade push failed: ' + (e && e.message ? e.message : e); }
     }
 
@@ -2003,7 +2010,7 @@ function dayRun_(mode, opts) {
     });
     if (shown.length) dayFormat_(sheet, shown.length, wmap);
 
-    const alertNote = opts.alert === false ? '' : daySendAlerts_(mode, np, shown, held0, tape, short, opts);
+    const alertNote = opts.alert === false ? '' : daySendAlerts_(mode, np, shown, held0, tape, short, opts, pushOut.added);
     const c = {}; shown.forEach(function (r) { c[r.Action] = (c[r.Action] || 0) + 1; });
     const msg = (timedOut ? '⏱️ Stopped at the time limit.\n' : '') + mode + ' scan of ' + names.length + ' names, tape ' + tape + '\n' + Object.keys(c).map(function (k) { return k + ': ' + c[k]; }).join('   ') +
       (skipped ? '\n(' + skipped + ' skipped rows not shown)' : '') + (alertNote ? '\n' + alertNote : '') + (pushNote ? '\n' + pushNote : '') + (guard.blocked ? '\nGuard: ' + guard.blocked : '');
@@ -2045,7 +2052,7 @@ function dayFormat_(sheet, n, map) {
  * ALERTS (same phone setup as Quick / Flip / Earnings)
  * ========================================================================== */
 
-function daySendAlerts_(mode, np, shown, held, tape, short, opts) {
+function daySendAlerts_(mode, np, shown, held, tape, short, opts, promoted) {
   const cfg = getAlertConfig_();
   if (!cfg.ready) return 'phone alerts not set up';
   const props = PropertiesService.getScriptProperties();
@@ -2063,15 +2070,29 @@ function daySendAlerts_(mode, np, shown, held, tape, short, opts) {
     if (!w.length) lines.push('none');
   }
   if (np.m >= DAY_OPEN_M + DAY_CONFIG.orMinutes) {
+    // Promoted = a row this scan actually added to Auto_Trade (passed every gate). It gets its own alert, sent once per ticker per day even if the
+    // plain signal was announced earlier; a signal the gates held back is labelled NOT promoted with the reason (DAY_CONFIG.alertBlocked: false hides those).
+    const prom = {}; (promoted || []).forEach(function (o) { prom[o.ticker + '|' + (o.cp === 'C' ? 'LONG' : 'SHORT')] = o; });
     shown.filter(function (r) { return (r.Action === 'BUY' || r.Action === 'SHORT') && !held[r.Ticker]; }).sort(function (a, b) { return b.Score - a.Score; }).slice(0, DAY_CONFIG.alertTopN).forEach(function (r) {
-      if (once('sig|' + r.Ticker + '|' + r.Side)) { titleBits.push(r.Action + ' ' + r.Ticker); lines.push(fmtSig(r)); }
+      const o = prom[r.Ticker + '|' + r.Side];
+      if (o) {
+        if (once('prom|' + r.Ticker + '|' + r.Side)) {
+          st.keys['sig|' + r.Ticker + '|' + r.Side] = 1;
+          titleBits.push('PROMOTED ' + r.Ticker);
+          lines.push('✅ PROMOTED to Auto_Trade (Status Review, nothing is sent to the broker until you approve): ' + o.ticker + ' ' + o.strikeText + ' ' + o.expiry + ' x' + o.lots + ' | limit ' + o.limit + ' stop ' + o.stop + ' target ' + o.target +
+            ' | odds: ' + (o.verdict || 'n/a') + (o.avgR !== '' ? ' (avg ' + o.avgR + 'R)' : '') + '\n   ' + fmtSig(r));
+        }
+      } else if (DAY_CONFIG.alertBlocked && once('sig|' + r.Ticker + '|' + r.Side)) {
+        titleBits.push(r.Action + ' ' + r.Ticker);
+        lines.push('⚪ NOT promoted' + (r.Gate && r.Gate !== 'PASS' ? ' (' + String(r.Gate).replace(/^BLOCKED: /, '') + ')' : '') + ': ' + fmtSig(r));
+      }
     });
     shown.filter(function (r) { return held[r.Ticker]; }).forEach(function (r) {
       if (['STOP', 'TARGET', 'CLOSE'].indexOf(r.Action) >= 0 && once('pos|' + r.Ticker + '|' + r.Action)) { titleBits.push(r.Action + ' ' + r.Ticker); lines.push(r.Ticker + ' ' + r.Action + ': ' + r.Why + ' | P/L $' + (r['P/L $'] === undefined ? '' : r['P/L $'])); }
     });
   }
   if (!lines.length) { props.setProperty('DAY_ALERT_STATE', JSON.stringify(st)); return ''; }
-  const r = sendPhoneAlert_(cfg, 'Day: ' + titleBits.slice(0, 4).join(', '), lines.join('\n') + '\nNot advice. Flat by 15:50.', titleBits.some(function (b) { return /STOP|CLOSE|BUY|SHORT/.test(b); }));
+  const r = sendPhoneAlert_(cfg, 'Day: ' + titleBits.slice(0, 4).join(', '), lines.join('\n') + '\nNot advice. Flat by 15:50.', titleBits.some(function (b) { return /STOP|CLOSE|PROMOTED/.test(b); }));
   if (!r.ok) { logToSheet_('Day alert failed: ' + r.detail); return 'alert failed (' + r.detail + ')'; }
   props.setProperty('DAY_ALERT_STATE', JSON.stringify(st));
   return 'alert sent (' + lines.length + ' line(s))';
