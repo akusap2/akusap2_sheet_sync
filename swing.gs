@@ -55,12 +55,14 @@ const SWING_CONFIG = {
     earnings: { enabled: true },                 // blocked when the company reports before the planned exit
     maxSpreadOfGain: 0.30,                       // spread in dollars at most this share of the planned option gain
     minStopSpreads: 3,                           // the option's move to the stock stop must be at least this many spreads wide (0 = off)
+    odds: { enabled: true, minMcAvgR: -0.1, minHistN: 8, minHistAvgR: 0, minUniN: 30, minUniAvgR: 0, paths: 3000, seed: 7 },   // Time Machine gate (see TIME MACHINE below)
     maxIvRank: 70,                               // IV Rank above this: a single long option is expensive (IV falls back toward normal and eats gains)
     maxOpen: 5, maxNewPerDay: 3                  // 5 open x 1% risk = 5% total open risk (the usual 5-6% conservative cap)
   },
   risk: { riskUsd: 300 },                        // used only for the Qty Sug column (contracts so that a stop-out costs about this much)
   alertBlocked: false,                           // also message signals the gates held back
   lookupsPerScan: 8,
+  logBlocked: false,                             // false: SwingLog holds only BUY / SHORT signals that passed every gate. true: also log blocked signals as shadow rows (Approved NO) to test the gates
   shadowPerDay: 5,
   timeBudgetMs: 4.5 * 60 * 1000,
   schedule: { slots: ['09:50', '12:30', '15:30'], summaryHm: '16:10', graceMin: 25 }
@@ -76,13 +78,13 @@ const SWING_STARTER = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 
 const SWING_INPUT_HEADERS = ['Ticker', 'Entry Date', 'Entry', 'Qty'];                       // yours
 const SWING_USER_COLS = ['Side', 'Expiry', 'Strike', 'Stock Stop', 'Stock Target'];          // yours on a row where you filled Qty, Entry or Entry Date; the script's plan otherwise
 const SWING_HEADERS = ['Ticker', 'Price', 'Change', 'Entry Date', 'Entry', 'Qty', 'Action', 'Side', 'Setup', 'Score', 'Expiry', 'Strike', 'DTE', 'Delta', 'Mid', 'Limit',
-  'Spread %', 'OI', 'VOL', 'Stock Stop', 'Stock Target', 'R:R', 'Risk $/lot', 'Qty Sug', 'Trend', 'RSI', 'ATR %', 'RS vs SPY %', 'RVOL', 'Off High %', 'IV Rank', 'Earn Days',
+  'Spread %', 'OI', 'VOL', 'Stock Stop', 'Stock Target', 'R:R', 'Risk $/lot', 'Qty Sug', 'Trend', 'RSI', 'ATR %', 'RS vs SPY %', 'RVOL', 'Off High %', 'IV Rank', 'TM Verdict', 'TM Target %', 'TM Stop %', 'TM Avg R', 'TM History', 'Earn Days',
   'Days', 'P/L %', 'P/L $', 'Gate', 'Why', 'LastRun'];
 const SWING_OUTPUT_HEADERS = SWING_HEADERS.filter(function (h) { return SWING_INPUT_HEADERS.indexOf(h) === -1; });
 
-const SWING_LOG_HEADERS = ['Date', 'Ticker', 'Side', 'Setup', 'Score', 'Approved', 'Status', 'Contract', 'Expiry', 'DTE', 'Delta', 'Entry Time', 'Stock Entry', 'Stock Stop',
+const SWING_LOG_HEADERS = ['Date', 'Ticker', 'Action', 'Side', 'Setup', 'Score', 'Approved', 'Status', 'Contract', 'Expiry', 'DTE', 'Delta', 'Entry Time', 'Stock Entry', 'Stock Stop',
   'Stock Target', 'Entry', 'Mark', 'Open P/L $', 'Exit', 'Exit Time', 'P/L $', 'P/L %', 'Days Held', 'Max Fav %', 'Max Adv %', 'Spread %', 'Symbol', 'Blocked By',
-  'Why', 'Exit Why', 'Stock Exit', 'Stock Move %'];
+  'Why', 'Exit Why', 'Stock Exit', 'Stock Move %', 'TM Verdict', 'TM Avg R'];
 const SWING_SETTLED = ['STOPPED', 'TARGET', 'PREMIUM STOP', 'DTE EXIT', 'TREND EXIT', 'TIME EXIT', 'NO PROGRESS'];
 
 /* ---------------------------------------------------------------------------
@@ -324,6 +326,27 @@ function swingChooseContract_(cands, side, price, cfg) {
   return ok.slice().sort(function (a, b) { return rank(a) - rank(b); })[0];
 }
 
+// Why a set of candidates was all rejected, as counts. Pure.
+function swingRejects_(cands, cfg) {
+  const O = cfg.option, n = { total: cands.length, noQuote: 0, spread: 0, oi: 0, delta: 0 };
+  cands.forEach(function (c) {
+    if (!(c.bid > 0) || !(c.ask > 0) || c.ask < c.bid) { n.noQuote++; return; }
+    const mid = (c.bid + c.ask) / 2, sp = c.ask - c.bid;
+    if (sp > 0.10 && sp / mid * 100 > O.maxSpreadPct) { n.spread++; return; }
+    if (c.oi != null && c.oi < O.minOi) { n.oi++; return; }
+    if (c.delta != null && (Math.abs(c.delta) < O.minDelta || Math.abs(c.delta) > O.maxDelta)) n.delta++;
+  });
+  return n;
+}
+function swingRejectText_(n, cfg, marketOpen) {
+  const O = cfg.option, parts = [];
+  if (n.noQuote) parts.push(n.noQuote + ' with no live bid/ask');
+  if (n.spread) parts.push(n.spread + ' with spread over ' + O.maxSpreadPct + '%');
+  if (n.oi) parts.push(n.oi + ' with open interest under ' + O.minOi);
+  if (n.delta) parts.push(n.delta + ' with delta outside ' + O.minDelta + '-' + O.maxDelta);
+  return n.total + ' strikes checked: ' + (parts.join(', ') || 'none usable') + (n.noQuote === n.total && !marketOpen ? '. The market is closed, so option quotes are not live: run it after 9:45 ET' : '');
+}
+
 // First-order option plan from the stock plan. optStop / optTarget are estimates of the option price when the stock reaches the stop / target.
 function swingPlan_(c, price, stopPx, targetPx, cfg, riskUsd) {
   const O = cfg.option, mid = (c.bid + c.ask) / 2, sp = c.ask - c.bid;
@@ -349,6 +372,7 @@ function swingGate_(r, guard, cfg) {
   if (gain > 0 && p.spreadUsd > G.maxSpreadOfGain * gain) why.push('spread costs ' + Math.round(p.spreadUsd / gain * 100) + '% of the planned gain');
   const move = p.limit - p.optStop;
   if (G.minStopSpreads > 0 && p.spreadUsd > 0 && move < G.minStopSpreads * p.spreadUsd) why.push('stop only ' + swingR1_(move / p.spreadUsd) + 'x the bid/ask spread (needs ' + G.minStopSpreads + 'x)');
+  if (G.odds && G.odds.enabled && r.odds && !r.odds.missing) swingOddsGate_(r.odds, G.odds).forEach(function (w) { why.push(w); });
   if (G.maxIvRank > 0 && r.ivRank != null && r.ivRank > G.maxIvRank) why.push('IV Rank ' + swingR1_(r.ivRank) + ' over ' + G.maxIvRank + ': options are expensive');
   if (G.earnings.enabled && r.earnYmd && r.todayYmd) {
     const exitBy = swingYmdAdd_(r.todayYmd, Math.ceil(cfg.trade.maxHoldDays * 1.5));
@@ -380,21 +404,21 @@ function swingExit_(p, L, cfg) {
   let stop = p.stockStop, best = p.stockEntry, locked = false, hit = null;
   for (let k = 0; k < barsSince.length && !hit; k++) {
     const b = barsSince[k], lowX = up ? b[2] : b[1], highX = up ? b[1] : b[2];
-    if (stop > 0 && (up ? lowX <= stop : lowX >= stop)) { hit = { status: 'STOPPED', why: 'stock traded through the ' + (locked ? 'trailing ' : '') + 'stop ' + swingR2_(stop) + ' on ' + b[0] + ' (closed at the next run)', late: true }; break; }
-    if (hitTarget(highX)) { hit = { status: 'TARGET', why: 'stock reached the target ' + swingR2_(p.stockTarget) + ' on ' + b[0] + ' (closed at the next run)', late: true }; break; }
+    if (stop > 0 && (up ? lowX <= stop : lowX >= stop)) { hit = { status: 'STOPPED', why: 'stock traded through the ' + (locked ? 'trailing ' : '') + 'stop ' + swingR2_(stop) + ' on ' + b[0] + ' (closed at the next run)', late: true, px: up ? Math.min(stop, b[1]) : Math.max(stop, b[2]) }; break; }
+    if (hitTarget(highX)) { hit = { status: 'TARGET', why: 'stock reached the target ' + swingR2_(p.stockTarget) + ' on ' + b[0] + ' (closed at the next run)', late: true, px: p.stockTarget }; break; }
     if (sgn * (b[3] - best) > 0) best = b[3];
     if (dist > 0 && !locked && sgn * (highX - p.stockEntry) >= T.breakevenR * dist) { locked = true; stop = up ? Math.max(stop, p.stockEntry) : Math.min(stop, p.stockEntry); }
     if (locked && atr > 0) { const tr = best - sgn * T.trailAtr * atr; stop = up ? Math.max(stop, tr) : Math.min(stop, tr); }
   }
   if (hit) return hit;
-  if (stop > 0 && (up ? L.price <= stop : L.price >= stop)) return { status: 'STOPPED', why: 'stock ' + swingR2_(L.price) + ' through the ' + (locked ? 'trailing ' : '') + 'stop ' + swingR2_(stop) };
-  if (hitTarget(L.price)) return { status: 'TARGET', why: 'stock ' + swingR2_(L.price) + ' reached the target ' + swingR2_(p.stockTarget) };
+  if (stop > 0 && (up ? L.price <= stop : L.price >= stop)) return { status: 'STOPPED', why: 'stock ' + swingR2_(L.price) + ' through the ' + (locked ? 'trailing ' : '') + 'stop ' + swingR2_(stop), px: L.price };
+  if (hitTarget(L.price)) return { status: 'TARGET', why: 'stock ' + swingR2_(L.price) + ' reached the target ' + swingR2_(p.stockTarget), px: p.stockTarget };
   if (L.bid != null && p.entry > 0 && L.bid <= p.entry * (1 - T.premiumStopPct / 100)) return { status: 'PREMIUM STOP', why: 'option down ' + Math.round((1 - L.bid / p.entry) * 100) + '% from the entry' };
   if (L.dte != null && L.dte <= O.exitDte) return { status: 'DTE EXIT', why: L.dte + ' days left (rule: out at ' + O.exitDte + '): close or roll' };
-  if (L.feat && L.feat.sma50 && (up ? L.feat.close < L.feat.sma50 : L.feat.close > L.feat.sma50)) return { status: 'TREND EXIT', why: 'closed ' + (up ? 'under' : 'over') + ' the 50-day average (' + swingR2_(L.feat.sma50) + ')' };
-  if (L.daysHeld >= T.maxHoldDays) return { status: 'TIME EXIT', why: L.daysHeld + ' trading days held (max ' + T.maxHoldDays + ')' };
+  if (L.feat && L.feat.sma50 && (up ? L.feat.close < L.feat.sma50 : L.feat.close > L.feat.sma50)) return { status: 'TREND EXIT', why: 'closed ' + (up ? 'under' : 'over') + ' the 50-day average (' + swingR2_(L.feat.sma50) + ')', px: L.price };
+  if (L.daysHeld >= T.maxHoldDays) return { status: 'TIME EXIT', why: L.daysHeld + ' trading days held (max ' + T.maxHoldDays + ')', px: L.price };
   const prog = dist > 0 ? sgn * (L.price - p.stockEntry) / dist : null;
-  if (L.daysHeld >= T.noProgressDays && prog != null && prog < T.noProgressR) return { status: 'NO PROGRESS', why: swingR1_(prog) + 'R after ' + L.daysHeld + ' trading days: time decay is working against it' };
+  if (L.daysHeld >= T.noProgressDays && prog != null && prog < T.noProgressR) return { status: 'NO PROGRESS', why: swingR1_(prog) + 'R after ' + L.daysHeld + ' trading days: time decay is working against it', px: L.price };
   return { status: 'HOLD', why: L.daysHeld + ' trading days' + (prog != null ? ', stock ' + (prog >= 0 ? '+' : '') + swingR1_(prog) + 'R' : '') + (L.bid != null && p.entry > 0 ? ', option ' + (L.bid >= p.entry ? '+' : '') + swingR1_((L.bid / p.entry - 1) * 100) + '%' : '') };
 }
 
@@ -462,6 +486,7 @@ function swingScoreRows_(recs, nowYmd, cfg) {
   rows.push([]);
   rows.push(['2. Did the gates help? Approved vs shadow (signals the gates held back, tracked anyway)']); rows.push(head);
   rows.push(fmtRow('Approved', sAll)); rows.push(fmtRow('Shadow (not approved)', swingStats_(shadow)));
+  if (!cfg.logBlocked) rows.push(['Shadow rows are off (SWING_CONFIG.logBlocked = false): the log holds only BUY / SHORT signals, so there is nothing to compare. Set it to true to test the gates.']);
   rows.push([]);
   const grouped = function (title, keyFn) {
     rows.push([title]); rows.push(head);
@@ -473,8 +498,9 @@ function swingScoreRows_(recs, nowYmd, cfg) {
   grouped('4. By direction (approved)', function (r) { return r.Side; });
   grouped('5. How trades ended (approved)', function (r) { return SWING_SETTLED.indexOf(r.Status) >= 0 ? r.Status : ''; });
   grouped('6. By score at entry (approved)', function (r) { const s = Number(r.Score); return s >= 80 ? '80+' : (s >= 70 ? '70-79' : (s >= 60 ? '60-69' : 'under 60')); });
-  grouped('7. By month (approved)', function (r) { return SWING_SETTLED.indexOf(r.Status) >= 0 ? String(r['Exit Time']).slice(0, 7) : ''; });
-  rows.push(['8. Can you trust it yet?']);
+  grouped('7. By Time Machine verdict at entry (approved)', function (r) { return r['TM Verdict'] ? String(r['TM Verdict']).split(' ')[0] : ''; });
+  grouped('8. By month (approved)', function (r) { return SWING_SETTLED.indexOf(r.Status) >= 0 ? String(r['Exit Time']).slice(0, 7) : ''; });
+  rows.push(['9. Can you trust it yet?']);
   rows.push([sAll.n < 30 ? 'Not enough trades: ' + sAll.n + ' settled of the 30 needed. Keep it on paper.' :
     (sAll.net > 0 && sAll.per > 0 && (sAll.pf || 0) > 1.3 ? 'Positive after ' + sAll.n + ' trades (profit factor ' + (sAll.pf === Infinity ? 'inf' : Math.round(sAll.pf * 100) / 100) + '). Still only a sample: check it holds for 2 months and in a down market.' :
       'Not yet: after ' + sAll.n + ' trades the net is $' + Math.round(sAll.net) + ' (profit factor ' + (sAll.pf == null ? 'n/a' : Math.round(sAll.pf * 100) / 100) + '). Do not trade it with real money.')]);
@@ -485,22 +511,24 @@ function swingScoreRows_(recs, nowYmd, cfg) {
  * DATA: daily bars (Yahoo, cached 6 hours per day in CacheService), quotes, earnings
  * ------------------------------------------------------------------------- */
 const SWING_YAHOO_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', Accept: 'application/json' };
-function swingBarsUrl_(host, t) { return 'https://' + host + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(t) + '?range=1y&interval=1d'; }
+function swingBarsUrl_(host, t, range) { return 'https://' + host + '.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(t) + '?range=' + (range || '1y') + '&interval=1d'; }
 function swingParseBars_(resp) {
   try {
     if (resp.getResponseCode() !== 200) return null;
     const r = JSON.parse(resp.getContentText()).chart.result[0], ts = r.timestamp || [], q = r.indicators.quote[0], out = [];
     for (let i = 0; i < ts.length; i++) {
       if (!(q.close[i] > 0) || !(q.high[i] > 0) || !(q.low[i] > 0)) continue;
-      out.push([Utilities.formatDate(new Date(ts[i] * 1000), 'America/New_York', 'yyyy-MM-dd'), Math.round(q.high[i] * 100) / 100, Math.round(q.low[i] * 100) / 100, Math.round(q.close[i] * 100) / 100, Math.round(q.volume[i] || 0)]);
+      out.push([new Date((ts[i] - 18000) * 1000).toISOString().slice(0, 10),   // daily bars are stamped 9:30 ET: minus 5 h is still the same calendar day in winter and summer
+       Math.round(q.high[i] * 100) / 100, Math.round(q.low[i] * 100) / 100, Math.round(q.close[i] * 100) / 100, Math.round(q.volume[i] || 0)]);
     }
     return out.length ? out : null;
   } catch (e) { return null; }
 }
 // Returns { TICKER: bars } for every ticker it could get. Today's bar is kept as the last element when present (the caller trims it).
-function swingGetBars_(tickers, et) {
-  const cache = CacheService.getScriptCache(), out = {}, key = function (t) { return 'SWB_' + et.ymd + '_' + t; };
-  const hit = cache.getAll(tickers.map(key));
+// range '1y' (default) or '5y'; noCache skips the 6-hour cache (used by the one-off backtest).
+function swingGetBars_(tickers, et, range, noCache) {
+  const cache = CacheService.getScriptCache(), out = {}, key = function (t) { return (range === '5y' ? 'SW5_' : 'SWB_') + et.ymd + '_' + t; };
+  const hit = noCache ? {} : cache.getAll(tickers.map(key));
   const need = [];
   tickers.forEach(function (t) {
     let b = null; try { b = hit[key(t)] ? JSON.parse(hit[key(t)]) : null; } catch (e) { b = null; }
@@ -510,14 +538,14 @@ function swingGetBars_(tickers, et) {
   for (let i = 0; i < need.length; i += 20) {
     const chunk = need.slice(i, i + 20);
     let resps = [];
-    try { resps = UrlFetchApp.fetchAll(chunk.map(function (t) { return { url: swingBarsUrl_('query1', t), method: 'get', muteHttpExceptions: true, headers: SWING_YAHOO_HEADERS }; })); } catch (e) { resps = []; }
+    try { resps = UrlFetchApp.fetchAll(chunk.map(function (t) { return { url: swingBarsUrl_('query1', t, range), method: 'get', muteHttpExceptions: true, headers: SWING_YAHOO_HEADERS }; })); } catch (e) { resps = []; }
     chunk.forEach(function (t, k) {
       let b = resps[k] ? swingParseBars_(resps[k]) : null;
-      if (!b) { try { b = swingParseBars_(UrlFetchApp.fetch(swingBarsUrl_('query2', t), { method: 'get', muteHttpExceptions: true, headers: SWING_YAHOO_HEADERS })); } catch (e) { b = null; } }
+      if (!b) { try { b = swingParseBars_(UrlFetchApp.fetch(swingBarsUrl_('query2', t, range), { method: 'get', muteHttpExceptions: true, headers: SWING_YAHOO_HEADERS })); } catch (e) { b = null; } }
       if (b) { out[t] = b; put[key(t)] = JSON.stringify(b); }
     });
   }
-  try { if (Object.keys(put).length) cache.putAll(put, 21600); } catch (e) { /* cache is an optimisation */ }
+  try { if (!noCache && Object.keys(put).length) cache.putAll(put, 21600); } catch (e) { /* cache is an optimisation */ }
   return out;
 }
 // Completed sessions only: today's bar is dropped until 16:05 ET.
@@ -560,7 +588,7 @@ function swingOptionProposal_(ticker, side, price, stopPx, targetPx, token, et, 
     const q = fetchTastyMarketDataBatch_(syms, token);
     const cands = near.map(function (s, i) { const m = q[syms[i]] || {}; return { strike: s.strike, delta: m.delta, bid: m.bid, ask: m.ask, oi: m.oi, volume: m.volume, sym: syms[i] }; });
     const best = swingChooseContract_(cands, side, price, cfg);
-    if (!best) return { why: 'no liquid contract for ' + expYmd + ' (spread over ' + cfg.option.maxSpreadPct + '%, open interest under ' + cfg.option.minOi + ', delta outside ' + cfg.option.minDelta + '-' + cfg.option.maxDelta + ', or quotes not live)' };
+    if (!best) return { why: 'no liquid contract for ' + expYmd + ': ' + swingRejectText_(swingRejects_(cands, cfg), cfg, et.m >= 9 * 60 + 35 && et.m < 16 * 60 && et.dow < 6), expiryYmd: expYmd, dte: swingDaysBetween_(et.ymd, expYmd) };
     return { plan: swingPlan_(best, price, stopPx, targetPx, cfg, swingRiskUsd_()), expiryYmd: expYmd, strike: best.strike, sym: best.sym, dte: swingDaysBetween_(et.ymd, expYmd) };
   } catch (e) { return { why: 'option lookup failed: ' + (e && e.message ? e.message : e) }; }
 }
@@ -577,6 +605,202 @@ function swingSetRisk_() {
   if (!(v > 0)) { notify_(ui, 'Swing', 'Not a number.'); return; }
   PropertiesService.getScriptProperties().setProperty('SWING_RISK_USD', String(v));
   notify_(ui, 'Swing', 'Risk per trade set to $' + v + '.');
+}
+
+/* ---------------------------------------------------------------------------
+ * TIME MACHINE: the swing rules replayed on past daily bars (stock level, in R multiples of the planned stop distance)
+ *   - swingReplay_    every past signal of the SAME rules on one stock, followed with the SAME exit rules (breakeven + trail, 50-day, 15 days, no progress)
+ *   - swingMonteCarlo_ 3,000 simulated 15-day paths made of that stock's own past daily moves (same stop / target / trail), like the Day tab's odds
+ *   - swingBacktestNow_ the replay over your whole Swing list: does a setup make money at all? The result is stored and also feeds the gate.
+ * Assumptions: entry at the signal day's close; a stop touched inside a session fills at the stop (or the session's best price if it gapped through);
+ * a target fills at the target; no option pricing, no commissions, no earnings filter (earnings gaps are inside the history); today's list of big names
+ * (survivorship). A pattern that worked in the past can stop working.
+ * ------------------------------------------------------------------------- */
+function swingBarWindow_(bars, i) { return bars.slice(Math.max(0, i - 259), i + 1); }
+
+// SPY features by date (memoised). spyBars = completed sessions.
+function swingSpyAt_(spyBars) {
+  const idx = {}, memo = {};
+  (spyBars || []).forEach(function (b, i) { idx[b[0]] = i; });
+  return function (ymd) {
+    const i = idx[ymd];
+    if (i == null || i < 209) return null;
+    if (memo[i] === undefined) memo[i] = swingFeatures_(swingBarWindow_(spyBars, i));
+    return memo[i];
+  };
+}
+
+// All past signals on one stock. Returns [{ date, exit, side, setup, score, status, R, days }]; a trade still open at the end of the data is dropped.
+function swingReplay_(bars, spyAt, cfg) {
+  const out = [], n = bars ? bars.length : 0;
+  let i = 209;
+  while (i < n - 1) {
+    const f = swingFeatures_(swingBarWindow_(bars, i));
+    const sg = f ? swingSignal_(f, spyAt(bars[i][0]), cfg) : null;
+    if (!sg || (sg.action !== 'BUY' && sg.action !== 'SHORT') || !(sg.dist > 0)) { i++; continue; }
+    const entry = f.close, sgn = sg.side === 'LONG' ? 1 : -1;
+    const p = { side: sg.side, stockStop: sg.stop, stockTarget: sg.target, stockEntry: entry, entryYmd: bars[i][0], entry: 0 };
+    let j = i, res = null;
+    while (j < n - 1 && !res) {
+      j++;
+      const ex = swingExit_(p, { price: bars[j][3], bid: null, dte: null, daysHeld: j - i, bars: bars.slice(i, j + 1), feat: swingFeatures_(swingBarWindow_(bars, j)) }, cfg);
+      if (ex.status !== 'HOLD') res = ex;
+    }
+    if (!res) break;
+    const px = res.px != null ? res.px : bars[j][3];
+    out.push({ date: bars[i][0], exit: bars[j][0], side: sg.side, setup: sg.setup, score: sg.score, status: res.status, R: sgn * (px - entry) / sg.dist, days: j - i });
+    i = j;
+  }
+  return out;
+}
+
+function swingTmStats_(trades) {
+  const n = trades.length;
+  if (!n) return { n: 0 };
+  const wins = trades.filter(function (t) { return t.R > 0; }), loss = trades.filter(function (t) { return t.R <= 0; });
+  const sum = function (a) { return a.reduce(function (s, t) { return s + t.R; }, 0); };
+  const gw = sum(wins), gl = -sum(loss);
+  let streak = 0, worst = 0;
+  trades.slice().sort(function (a, b) { return a.exit < b.exit ? -1 : (a.exit > b.exit ? 1 : 0); }).forEach(function (t) { if (t.R <= 0) { streak++; if (streak > worst) worst = streak; } else streak = 0; });
+  return { n: n, wins: wins.length, win: wins.length / n, avgR: sum(trades) / n, avgWinR: wins.length ? gw / wins.length : null, avgLossR: loss.length ? -gl / loss.length : null,
+    pf: gl > 0 ? gw / gl : (gw > 0 ? Infinity : null), worst: worst, days: trades.reduce(function (s, t) { return s + t.days; }, 0) / n };
+}
+
+// Bootstrap paths from the stock's own daily moves. Returns { pT, pS, pZ, pN, avgR } or null.
+function swingMonteCarlo_(bars, side, price, stop, target, cfg, paths, seed) {
+  const n = bars ? bars.length : 0, T = cfg.trade;
+  const dist = Math.abs(price - stop);
+  if (n < 120 || !(dist > 0)) return null;
+  const rh = [], rl = [], rc = [];
+  for (let k = 1; k < n; k++) { const pc = bars[k - 1][3]; rh.push(bars[k][1] / pc); rl.push(bars[k][2] / pc); rc.push(bars[k][3] / pc); }
+  const atr = swingAtr_(bars, 14) || 0, up = side === 'LONG', sgn = up ? 1 : -1;
+  let st = (seed >>> 0) || 1;
+  const rnd = function () { st = (Math.imul(st, 1664525) + 1013904223) >>> 0; return st / 4294967296; };
+  const c = { T: 0, S: 0, Z: 0, N: 0 };
+  let sumR = 0;
+  for (let q = 0; q < paths; q++) {
+    let p = price, stopL = stop, best = price, locked = false, kind = null, R = 0;
+    for (let d = 1; d <= T.maxHoldDays && !kind; d++) {
+      const k = Math.floor(rnd() * rc.length), hi = p * rh[k], lo = p * rl[k], cl = p * rc[k];
+      if (up ? lo <= stopL : hi >= stopL) { const px = up ? Math.min(stopL, hi) : Math.max(stopL, lo); R = sgn * (px - price) / dist; kind = R < -0.05 ? 'S' : 'Z'; break; }
+      if (up ? hi >= target : lo <= target) { R = sgn * (target - price) / dist; kind = 'T'; break; }
+      if (sgn * (cl - best) > 0) best = cl;
+      if (!locked && sgn * ((up ? hi : lo) - price) >= T.breakevenR * dist) { locked = true; stopL = up ? Math.max(stopL, price) : Math.min(stopL, price); }
+      if (locked && atr > 0) { const tr = best - sgn * T.trailAtr * atr; stopL = up ? Math.max(stopL, tr) : Math.min(stopL, tr); }
+      p = cl;
+    }
+    if (!kind) { kind = 'N'; R = sgn * (p - price) / dist; }
+    c[kind]++; sumR += R;
+  }
+  return { pT: c.T / paths, pS: c.S / paths, pZ: c.Z / paths, pN: c.N / paths, avgR: sumR / paths };
+}
+
+function swingLoadBt_() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('SWING_BT') || 'null'); } catch (e) { return null; }
+}
+
+// Everything the gate and the sheet need for one signal. bars = completed 5-year bars of the stock.
+function swingOdds_(side, setup, price, stop, target, bars, spyAt, cfg, bt) {
+  const G = cfg.gates.odds;
+  const hist = swingTmStats_(swingReplay_(bars, spyAt, cfg).filter(function (t) { return t.side === side && t.setup === setup; }));
+  const mc = swingMonteCarlo_(bars, side, price, stop, target, cfg, G.paths, G.seed);
+  const uni = bt && bt.by ? bt.by[setup + '|' + side] : null;
+  const o = { side: side, setup: setup, histN: hist.n, histAvgR: hist.n ? hist.avgR : null, histWin: hist.n ? hist.win : null,
+    mcAvgR: mc ? mc.avgR : null, pT: mc ? mc.pT : null, pS: mc ? mc.pS : null, uniN: uni ? uni.n : 0, uniAvgR: uni ? uni.avgR : null, uniWin: uni ? uni.win : null };
+  const bad = swingOddsGate_(o, G);
+  o.verdict = bad.length ? 'Unfavorable: ' + bad[0] : ((mc && mc.avgR >= 0.05 && (!hist.n || hist.avgR >= 0)) ? 'Favorable' : 'Mixed');
+  o.history = (hist.n ? hist.n + ' past ' + setup + ' signals on this stock: ' + hist.wins + ' winners, avg ' + swingR2_(hist.avgR) + 'R' : 'no past ' + setup + ' signal on this stock') +
+    (uni ? ' | your list (backtest): ' + uni.n + ' trades, avg ' + swingR2_(uni.avgR) + 'R, ' + Math.round(uni.win * 100) + '% winners' : ' | no backtest yet (menu: Backtest My Rules)');
+  return o;
+}
+
+// Pure: reasons to block, [] when the odds are fine.
+function swingOddsGate_(o, G) {
+  const why = [];
+  if (o.mcAvgR != null && o.mcAvgR < G.minMcAvgR) why.push('simulation average ' + swingR2_(o.mcAvgR) + 'R (needs at least ' + G.minMcAvgR + 'R)');
+  if (o.histN >= G.minHistN && o.histAvgR < G.minHistAvgR) why.push('this setup lost on this stock: ' + o.histN + ' past signals, avg ' + swingR2_(o.histAvgR) + 'R');
+  if (o.uniN >= G.minUniN && o.uniAvgR < G.minUniAvgR) why.push('across your list this setup averaged ' + swingR2_(o.uniAvgR) + 'R over ' + o.uniN + ' backtest trades');
+  return why;
+}
+
+function swingOddsApply_(out, o) {
+  if (!o) return;
+  if (o.missing) { out['TM Verdict'] = 'no odds: ' + o.missing; return; }
+  out['TM Verdict'] = o.verdict; out['TM History'] = o.history;
+  if (o.pT != null) { out['TM Target %'] = swingR1_(o.pT * 100); out['TM Stop %'] = swingR1_(o.pS * 100); }
+  if (o.mcAvgR != null) out['TM Avg R'] = swingR2_(o.mcAvgR);
+}
+
+// Rows for the SwingBacktest tab. Pure.
+function swingBacktestRows_(trades, meta) {
+  const rows = [], f2 = function (v) { return v == null ? '' : Math.round(v * 100) / 100; };
+  const head = ['', 'Trades', 'Win rate', 'Avg R', 'Avg win R', 'Avg loss R', 'Profit factor', 'Worst losing streak', 'Avg days held'];
+  const line = function (label, ts) { const s = swingTmStats_(ts); return s.n ? [label, s.n, Math.round(s.win * 100) + '%', f2(s.avgR), f2(s.avgWinR), f2(s.avgLossR), s.pf === Infinity ? 'inf' : f2(s.pf), s.worst, f2(s.days)] : [label, 0]; };
+  const group = function (title, keyFn) {
+    rows.push([title]); rows.push(head);
+    const keys = {}; trades.forEach(function (t) { const k = keyFn(t); if (k) keys[k] = 1; });
+    Object.keys(keys).sort().forEach(function (k) { rows.push(line(k, trades.filter(function (t) { return keyFn(t) === k; }))); });
+    rows.push([]);
+  };
+  rows.push(['SwingBacktest: the Swing rules replayed on ' + meta.years + ' years of daily bars for ' + meta.tickers + ' tickers (' + meta.date + '). Stock level, in R (1R = the planned stop distance). Not option P/L.']);
+  rows.push(['Assumptions: entry at the signal close; stop fills at the stop (or the best price if it gapped); target fills at the target; no commissions; no earnings filter; today\'s list of big names (survivorship). A past edge can disappear.']);
+  rows.push([]);
+  rows.push(['1. All signals']); rows.push(head); rows.push(line('All', trades)); rows.push([]);
+  group('2. By setup and direction', function (t) { return t.setup + ' | ' + t.side; });
+  group('3. How trades ended', function (t) { return t.status; });
+  group('4. By year of entry', function (t) { return t.date.slice(0, 4); });
+  group('5. By score at entry', function (t) { return t.score >= 80 ? '80+' : (t.score >= 70 ? '70-79' : '60-69'); });
+  const per = {}; trades.forEach(function (t) { (per[t.ticker] = per[t.ticker] || []).push(t); });
+  const ranked = Object.keys(per).filter(function (k) { return per[k].length >= 5; }).map(function (k) { return { k: k, s: swingTmStats_(per[k]) }; }).sort(function (a, b) { return b.s.avgR - a.s.avgR; });
+  rows.push(['6. Best and worst tickers (at least 5 trades)']); rows.push(head);
+  ranked.slice(0, 8).forEach(function (x) { rows.push(line(x.k, per[x.k])); });
+  rows.push(['...']);
+  ranked.slice(-8).forEach(function (x) { rows.push(line(x.k, per[x.k])); });
+  rows.push([]);
+  const all = swingTmStats_(trades);
+  rows.push(['7. Reading it']);
+  rows.push([!all.n ? 'No signals fired in the history.' : (all.n < 100 ? 'Only ' + all.n + ' trades: too few to say much.' :
+    (all.avgR > 0.1 && all.pf > 1.3 ? 'Positive: avg ' + f2(all.avgR) + 'R over ' + all.n + ' trades (profit factor ' + f2(all.pf) + '). A real edge needs to hold in every year above and survive costs: check section 4 and your option spreads.' :
+      'Weak or negative: avg ' + f2(all.avgR) + 'R over ' + all.n + ' trades (profit factor ' + f2(all.pf) + '). The gate will block any setup that is negative here.'))]);
+  return rows;
+}
+
+function swingBacktestNow_() {
+  const ui = tryGetUi_(), t0 = Date.now(), C = SWING_CONFIG, ss = SpreadsheetApp.getActiveSpreadsheet(), sheet = ss.getSheetByName(SWING_SHEET);
+  if (!sheet) { notify_(ui, 'Swing', 'Run setupSwing first.'); return; }
+  const map = swingHeaderMap_(sheet), last = sheet.getLastRow();
+  const list = last > 1 ? sheet.getRange(2, map['Ticker'], last - 1, 1).getValues().map(function (v) { return String(v[0]).trim().toUpperCase(); }).filter(function (t, i, a) { return t && a.indexOf(t) === i; }) : [];
+  if (!list.length) { notify_(ui, 'Swing', 'No tickers on the tab.'); return; }
+  const et = swingEt_(new Date());
+  const all = swingGetBars_(list.indexOf('SPY') === -1 ? list.concat(['SPY']) : list, et, '5y', true);
+  const spyAt = swingSpyAt_(all['SPY'] ? swingCompleted_(all['SPY'], et) : []);
+  const trades = [];
+  let done = 0, skipped = 0, timedOut = false;
+  list.forEach(function (t) {
+    if (timedOut) return;
+    if (Date.now() - t0 > 4.6 * 60 * 1000) { timedOut = true; return; }
+    const bars = all[t] ? swingCompleted_(all[t], et) : null;
+    if (!bars || bars.length < 300) { skipped++; return; }
+    swingReplay_(bars, spyAt, C).forEach(function (x) { x.ticker = t; trades.push(x); });
+    done++;
+  });
+  const by = {};
+  ['PULLBACK', 'BREAKOUT', 'BREAKDOWN'].forEach(function (su) { ['LONG', 'SHORT'].forEach(function (sd) {
+    const s = swingTmStats_(trades.filter(function (t) { return t.setup === su && t.side === sd; }));
+    if (s.n) by[su + '|' + sd] = { n: s.n, avgR: Math.round(s.avgR * 1000) / 1000, win: Math.round(s.win * 1000) / 1000 };
+  }); });
+  PropertiesService.getScriptProperties().setProperty('SWING_BT', JSON.stringify({ at: et.ymd, n: trades.length, by: by }));
+  const rows = swingBacktestRows_(trades, { years: 5, tickers: done, date: et.ymd });
+  const sh = ss.getSheetByName('SwingBacktest') || ss.insertSheet('SwingBacktest');
+  sh.clear();
+  const w = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
+  sh.getRange(1, 1, rows.length, w).setValues(rows.map(function (r) { const a = r.slice(); while (a.length < w) a.push(''); return a; }));
+  rows.forEach(function (r, i) { if (/^\d\. /.test(String(r[0] || '')) && r.length === 1) sh.getRange(i + 1, 1).setFontWeight('bold'); if (r[0] === '' && r[1] === 'Trades') sh.getRange(i + 1, 1, 1, w).setFontWeight('bold').setBackground('#eeeeee'); });
+  sh.getRange(1, 1).setFontWeight('bold'); sh.setColumnWidth(1, 260);
+  const s = swingTmStats_(trades);
+  notify_(ui, 'Swing backtest', done + ' tickers replayed in ' + Math.round((Date.now() - t0) / 1000) + 's' + (skipped ? ' (' + skipped + ' skipped: not enough history)' : '') + (timedOut ? '\n⚠️ Ran out of time: results cover only part of the list.' : '') +
+    '\n' + (s.n ? s.n + ' trades, win rate ' + Math.round(s.win * 100) + '%, average ' + Math.round(s.avgR * 100) / 100 + 'R, profit factor ' + (s.pf === Infinity ? 'inf' : Math.round(s.pf * 100) / 100) : 'No signals fired.') +
+    '\nDetails on the SwingBacktest tab. The gate now uses these results.');
 }
 
 /* ---------------------------------------------------------------------------
@@ -602,7 +826,7 @@ function swingFormatSheet_(sheet) {
   const fmt = function (h, f) { if (map[h]) sheet.getRange(2, map[h], n, 1).setNumberFormat(f); };
   ['Price', 'Entry', 'Mid', 'Limit', 'Stock Stop', 'Stock Target', 'Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   fmt('Change', '$#,##0.00;-$#,##0.00;$0.00'); fmt('P/L $', '$#,##0;-$#,##0;$0'); fmt('Risk $/lot', '$#,##0'); fmt('Expiry', 'yyyy-mm-dd'); fmt('LastRun', 'yyyy-mm-dd hh:mm');
-  ['Score', 'RSI', 'ATR %', 'RS vs SPY %', 'RVOL', 'Off High %', 'IV Rank', 'Spread %', 'P/L %', 'R:R', 'Delta'].forEach(function (h) { fmt(h, '0.0'); });
+  ['Score', 'RSI', 'ATR %', 'RS vs SPY %', 'RVOL', 'Off High %', 'IV Rank', 'TM Target %', 'TM Stop %', 'TM Avg R', 'Spread %', 'P/L %', 'R:R', 'Delta'].forEach(function (h) { fmt(h, '0.0'); });
   SWING_INPUT_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
   SWING_OUTPUT_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground(SWING_USER_COLS.indexOf(h) >= 0 ? '#fce5cd' : '#d9ead3'); });
   sheet.getRange(1, 1, 1, sheet.getLastColumn()).setFontWeight('bold');
@@ -614,7 +838,7 @@ function swingFormatSheet_(sheet) {
     sheet.setConditionalFormatRules(rules);
   }
 }
-const SWING_ACTION_COLORS = { BUY: '#b7e1cd', SHORT: '#f4cccc', WATCH: '#fff2cc', WAIT: '#eeeeee', SKIP: '#eeeeee', LATE: '#eeeeee', HOLD: '#cfe2f3', STOPPED: '#e06666', TARGET: '#93c47d',
+const SWING_ACTION_COLORS = { BUY: '#b7e1cd', SHORT: '#f4cccc', BLOCKED: '#fce5cd', WATCH: '#fff2cc', WAIT: '#eeeeee', SKIP: '#eeeeee', LATE: '#eeeeee', HOLD: '#cfe2f3', STOPPED: '#e06666', TARGET: '#93c47d',
   'PREMIUM STOP': '#e06666', 'DTE EXIT': '#f6b26b', 'TREND EXIT': '#f6b26b', 'TIME EXIT': '#f6b26b', 'NO PROGRESS': '#f6b26b', 'FILL IN': '#f4cccc' };
 function swingColorRows_(sheet, map, n) {
   if (!map['Action'] || n < 1) return;
@@ -636,16 +860,17 @@ function setupSwing() {
   if (!ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'swingAddMenu_'; })) ScriptApp.newTrigger('swingAddMenu_').forSpreadsheet(ss).onOpen().create();
   try { swingAddMenu_(); } catch (e) { /* appears on next open */ }
   notify_(tryGetUi_(), 'Swing set up',
-    'Created the Swing and SwingLog tabs. Menu "📈 Swing" appears after you reload the sheet.\n\nNext:\n  1. 📈 Swing > Run Scan Now\n  2. 📈 Swing > Start Schedule (09:50, 12:30 and 15:30 ET on trading days, plus a 16:10 summary)\n' +
-    '  3. Optional: 📈 Swing > Set Risk per Trade\n\nA position you really hold: type Ticker, Entry Date, Entry (premium paid), Qty, Side (LONG = call, SHORT = put), Expiry, Strike and, if you want a stock stop, Stock Stop / Stock Target. ' +
+    'Created the Swing and SwingLog tabs. Menu "🌊 Swing" appears after you reload the sheet.\n\nNext:\n  1. 🌊 Swing > Run Scan Now\n  2. 🌊 Swing > Start Schedule (09:50, 12:30 and 15:30 ET on trading days, plus a 16:10 summary)\n' +
+    '  3. Optional: 🌊 Swing > Set Risk per Trade\n\nA position you really hold: type Ticker, Entry Date, Entry (premium paid), Qty, Side (LONG = call, SHORT = put), Expiry, Strike and, if you want a stock stop, Stock Stop / Stock Target. ' +
     'The tab then follows it with the same exit rules as the paper trades. Rows with those cells filled are never overwritten.');
 }
 
 function swingAddMenu_() {
-  SpreadsheetApp.getUi().createMenu('📈 Swing')
+  SpreadsheetApp.getUi().createMenu('🌊 Swing')
     .addItem('Run Scan Now', 'swingScanNow_')
     .addItem('📒 Update Log Now', 'swingLogNow_')
     .addItem('📊 Update Scorecard (SwingScore tab)', 'swingScoreNow_')
+    .addItem('🧪 Backtest My Rules (5 years)', 'swingBacktestNow_')
     .addItem('Add Tickers…', 'swingAddTickers_')
     .addItem('Set Risk per Trade…', 'swingSetRisk_')
     .addSeparator()
@@ -890,33 +1115,52 @@ function swingScan_(opts) {
             } else actionable.push({ rw: rw, sg: sg, out: out, price: price, f: f });
           }
         }
-        counts[out.Action] = (counts[out.Action] || 0) + 1;
       } catch (err) { out.Action = 'WAIT'; out.Why = 'error: ' + (err && err.message ? err.message : err); errors.push(t + ': ' + (err && err.message ? err.message : err)); }
     });
 
     // option plans for the best signals only
     actionable.sort(function (a, b) { return b.sg.score - a.sg.score; });
+    // Time Machine: 5 years of daily bars for the best signals (one batched fetch, cached 6 h), same rules replayed on each stock's own history
+    const odds = {};
+    if (C.gates.odds.enabled && actionable.length) {
+      try {
+        const topT = actionable.slice(0, C.lookupsPerScan).map(function (a) { return a.rw.ticker; }).filter(function (v, i, arr) { return arr.indexOf(v) === i; });
+        const b5 = swingGetBars_(topT.concat(topT.indexOf('SPY') === -1 ? ['SPY'] : []), et, '5y');
+        const spyAt = swingSpyAt_(b5['SPY'] ? swingCompleted_(b5['SPY'], et) : []);
+        const bt = swingLoadBt_();
+        actionable.slice(0, C.lookupsPerScan).forEach(function (a) {
+          const t = a.rw.ticker;
+          if (odds[t] && odds[t].setup === a.sg.setup && odds[t].side === a.sg.side) return;
+          if (!b5[t]) { odds[t] = { missing: 'no 5-year bars' }; return; }
+          if (Date.now() - startMs > C.timeBudgetMs * 0.5) { odds[t] = { missing: 'out of time this run' }; return; }
+          odds[t] = swingOdds_(a.sg.side, a.sg.setup, a.price, a.sg.stop, a.sg.target, swingCompleted_(b5[t], et), spyAt, C, bt);
+        });
+      } catch (e) { logToSheet_('Swing time machine failed: ' + (e && e.message ? e.message : e)); }
+    }
     let ivr = {};
     if (token && typeof cspFetchIvRanks_ === 'function' && actionable.length) { try { ivr = cspFetchIvRanks_(actionable.slice(0, C.lookupsPerScan).map(function (a) { return a.rw.ticker; }), token) || {}; } catch (e) { ivr = {}; } }
     const newPaper = [], phone = [];
     let guardOpen = apprOpen, guardToday = apprToday, shadowN = shadowToday;
     actionable.forEach(function (a, i) {
       const out = a.out, sg = a.sg, t = a.rw.ticker;
-      if (i >= C.lookupsPerScan || Date.now() - startMs > C.timeBudgetMs * 0.7) { out.Gate = 'not looked up this run (' + C.lookupsPerScan + ' best signals per run)'; return; }
+      if (i >= C.lookupsPerScan || Date.now() - startMs > C.timeBudgetMs * 0.7) { out.Gate = 'not looked up this run (' + C.lookupsPerScan + ' best signals per run)'; out.Action = 'WATCH'; out.Why = 'signal ' + sg.action + ' but no option check yet: ' + out.Why; return; }
       const prop = token ? swingOptionProposal_(t, sg.side, a.price, sg.stop, sg.target, token, et, C) : { why: 'no TastyTrade token' };
       const earnYmd = (token && !LONG_ETF_LIKE_[t]) ? swingEarningsYmd_(t, a.finnhubKey || (typeof getFinnhubApiKey_ === 'function' ? getFinnhubApiKey_() : null)) : '';
-      const gate = swingGate_({ ticker: t, plan: prop.plan, noPlanWhy: prop.why, earnYmd: earnYmd, todayYmd: et.ymd, ivRank: ivr[t] }, { open: guardOpen, newToday: guardToday, haveTicker: !!openByTicker[t] }, C);
+      const gate = swingGate_({ ticker: t, plan: prop.plan, noPlanWhy: prop.why, earnYmd: earnYmd, todayYmd: et.ymd, ivRank: ivr[t], odds: odds[t] }, { open: guardOpen, newToday: guardToday, haveTicker: !!openByTicker[t] }, C);
       if (ivr[t] != null) out['IV Rank'] = swingR1_(ivr[t]);
+      swingOddsApply_(out, odds[t]);
       if (earnYmd) out['Earn Days'] = swingDaysBetween_(et.ymd, earnYmd);
       out.Gate = gate.ok ? 'PASS' : 'BLOCKED: ' + gate.why.join('; ');
+      if (!gate.ok) { out.Action = 'BLOCKED'; out.Why = 'signal ' + sg.action + ' but ' + gate.why.join('; ') + ' | ' + out.Why; }   // BUY / SHORT only when a tradable contract passed every gate
       if (prop.plan) {
         const p = prop.plan;
         out.Expiry = new Date(+prop.expiryYmd.slice(0, 4), +prop.expiryYmd.slice(5, 7) - 1, +prop.expiryYmd.slice(8, 10), 12); out.Strike = prop.strike; out.DTE = prop.dte;
         out.Delta = swingR2_(p.delta); out.Mid = p.mid; out.Limit = p.limit; out['Spread %'] = swingR1_(p.spreadPct); out.OI = p.oi == null ? '' : p.oi; out.VOL = p.volume == null ? '' : p.volume;
         out['R:R'] = swingR1_(p.rr); out['Risk $/lot'] = p.riskLot; out['Qty Sug'] = p.qtySug;
       }
+      if (!prop.plan && prop.expiryYmd) { out.Expiry = new Date(+prop.expiryYmd.slice(0, 4), +prop.expiryYmd.slice(5, 7) - 1, +prop.expiryYmd.slice(8, 10), 12); out.DTE = prop.dte; }
       const dedupe = t + '|' + sg.side + '|' + sg.setup;
-      const rec = prop.plan ? swingNewRecord_(t, sg, a.price, prop, et, gate) : null;
+      const rec = prop.plan ? swingNewRecord_(t, sg, a.price, prop, et, gate, odds[t]) : null;
       if (rec) {
         const key = t + '|' + sg.side + '|' + (rec.Why ? String(rec.Why).split('|')[0] : '');
         // one paper entry per signal day: an approved row once per ticker per day; a shadow row once per ticker per day within the daily cap
@@ -924,7 +1168,7 @@ function swingScan_(opts) {
         const already = logRecs.some(function (r) { return String(r.Ticker).toUpperCase() === t && r.Side === sg.side && swingYmdOfCell_(r.Date) === et.ymd; });
         if (!already && !openByTicker[t]) {
           if (gate.ok) { newPaper.push(rec); guardOpen++; guardToday++; openByTicker[t] = true; phone.push({ rec: rec, sg: sg, prop: prop, t: t }); }
-          else if (shadowN < C.shadowPerDay) { newPaper.push(rec); shadowN++; if (C.alertBlocked) phone.push({ rec: rec, sg: sg, prop: prop, t: t, blocked: gate.why.join('; ') }); }
+          else if (C.logBlocked && shadowN < C.shadowPerDay) { newPaper.push(rec); shadowN++; if (C.alertBlocked) phone.push({ rec: rec, sg: sg, prop: prop, t: t, blocked: gate.why.join('; ') }); }
         }
         void key; void dayKey; void dedupe;
       }
@@ -943,7 +1187,8 @@ function swingScan_(opts) {
     });
     try { swingLogTick_(true); swingScoreNow_(true); } catch (e) { logToSheet_('Swing log update failed: ' + (e && e.message ? e.message : e)); }
 
-    const order = ['BUY', 'SHORT', 'WATCH', 'HOLD', 'STOPPED', 'TARGET', 'TREND EXIT', 'TIME EXIT', 'DTE EXIT', 'NO PROGRESS', 'PREMIUM STOP', 'FILL IN', 'LATE', 'WAIT', 'SKIP'];
+    Object.keys(results).forEach(function (k) { const a = results[k].Action; if (a) counts[a] = (counts[a] || 0) + 1; });
+    const order = ['BUY', 'SHORT', 'BLOCKED', 'WATCH', 'HOLD', 'STOPPED', 'TARGET', 'TREND EXIT', 'TIME EXIT', 'DTE EXIT', 'NO PROGRESS', 'PREMIUM STOP', 'FILL IN', 'LATE', 'WAIT', 'SKIP'];
     const sec = Math.round((Date.now() - startMs) / 1000);
     const msg = (opts.dry ? '(DRY RUN: nothing written)\n' : '') + 'Swing scan of ' + rows.length + ' names in ' + sec + 's\n' +
       order.filter(function (k) { return counts[k]; }).map(function (k) { return k + ': ' + counts[k]; }).join('   ') + '\n' +
@@ -959,12 +1204,12 @@ function swingScan_(opts) {
 // ETFs have no earnings: skip the lookup
 const LONG_ETF_LIKE_ = { SPY: 1, QQQ: 1, IWM: 1, DIA: 1, XLK: 1, XLF: 1, XLE: 1, XLV: 1, SMH: 1, VOO: 1 };
 
-function swingNewRecord_(t, sg, price, prop, et, gate) {
+function swingNewRecord_(t, sg, price, prop, et, gate, od) {
   const p = prop.plan, hm = swingPad2_(Math.floor(et.m / 60)) + ':' + swingPad2_(et.m % 60);
-  return { Date: et.ymd, Ticker: t, Side: sg.side, Setup: sg.setup, Score: sg.score, Approved: gate.ok ? 'YES' : 'NO', Status: 'OPEN',
+  return { Date: et.ymd, Ticker: t, Action: gate.ok ? (sg.side === 'LONG' ? 'BUY' : 'SHORT') : 'BLOCKED', Side: sg.side, Setup: sg.setup, Score: sg.score, Approved: gate.ok ? 'YES' : 'NO', Status: 'OPEN',
     Contract: (sg.side === 'LONG' ? 'C ' : 'P ') + prop.strike, Expiry: prop.expiryYmd, DTE: prop.dte, Delta: swingR2_(p.delta), 'Entry Time': et.ymd + ' ' + hm,
     'Stock Entry': swingR2_(price), 'Stock Stop': swingR2_(sg.stop), 'Stock Target': swingR2_(sg.target), Entry: p.limit, 'Spread %': swingR1_(p.spreadPct),
-    Symbol: prop.sym, 'Blocked By': gate.ok ? '' : gate.why.join('; '), Why: sg.why.join(' | ') };
+    'TM Verdict': od && !od.missing ? od.verdict : '', 'TM Avg R': od && !od.missing ? swingR2_(od.mcAvgR) : '', Symbol: prop.sym, 'Blocked By': gate.ok ? '' : gate.why.join('; '), Why: sg.why.join(' | ') };
 }
 
 // A position you hold: the same exit rules as the paper trades, on the live option bid.
@@ -1028,7 +1273,7 @@ function swingWriteOutputs_(sheet, map, width, data, rows, results) {
   });
   swingColorRows_(sheet, map, n);
   // order: your positions / exits first, then signals by score
-  const rank = { STOPPED: 90, TARGET: 89, 'PREMIUM STOP': 88, ROLL: 87, 'TREND EXIT': 86, 'TIME EXIT': 85, 'NO PROGRESS': 84, 'FILL IN': 80, HOLD: 70, BUY: 60, SHORT: 60, WATCH: 40, LATE: 20, WAIT: 10, SKIP: 0 };
+  const rank = { STOPPED: 90, TARGET: 89, 'PREMIUM STOP': 88, ROLL: 87, 'TREND EXIT': 86, 'TIME EXIT': 85, 'NO PROGRESS': 84, 'FILL IN': 80, HOLD: 70, BUY: 60, SHORT: 60, BLOCKED: 50, WATCH: 40, LATE: 20, WAIT: 10, SKIP: 0 };
   const keys = [];
   for (let i = 0; i < n; i++) { const a = processed[i] && results[i] ? results[i].Action : ''; const sc = processed[i] && results[i] ? Number(results[i].Score) || 0 : 0; keys.push([(rank[a] || 0) * 1000 + sc]); }
   if (n > 1) {
