@@ -426,3 +426,16 @@ function chainKey_(sym) { return String(sym || '').replace(/\s+/g, ''); }
 function chainTry_(fn) {
   try { return fn(); } catch (e) { return NaN; }
 }
+
+/* ---------------------------------------------------------------- ONE-TIME KEY SAVER
+ * 1. Replace the three PASTE_... values below (keep the quotes).
+ * 2. Select chainSaveKeys in the function dropdown and click Run.
+ * 3. Put the placeholders back (or delete this function) and save.
+ */
+function chainSaveKeys() {
+  PropertiesService.getScriptProperties().setProperties({
+    TT_CLIENT_ID: 'PASTE_CLIENT_ID',
+    TT_CLIENT_SECRET: 'PASTE_CLIENT_SECRET',
+    TT_REFRESH_TOKEN: 'PASTE_REFRESH_TOKEN'
+  });
+}
