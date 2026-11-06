@@ -39,6 +39,7 @@ var OPTCHAIN = {
   DEFAULT_RATE: 0.04,                   // used if the 10Y yield cannot be read
   DIV: { SPY: 0.012, QQQ: 0.006, IWM: 0.012, DIA: 0.015 },
   DEFAULT_DIV: 0.01,
+  ROI: { DRIFT: 0.08, K: [-1, 0, 1], P: [0.25, 0.5, 0.25], MIN_OI: 100, MAX_SPREAD_CALL: 0.03, MAX_SPREAD_PUT: 0.10, TOP: 5 },
   MAX_SYMBOLS: 3000,                    // safety cap on option symbols requested per ticker
   HEADERS: ['Ticker', 'Expiry', 'Days', 'Strike', 'Mid', 'Extrinsic $', 'Stock', 'Extrinsic %', 'Delta', 'IV %',
             'Bid', 'Ask', 'Spread $', 'Volume', 'Open Int', 'Theta', 'Vega', 'Gamma', 'Yield %', 'Ann. Yield %']
@@ -109,6 +110,7 @@ function chainRun_(isAuto) {
   const rate = chainMarket_(sh, token, notes);
   const inputs = sh.getRange(OPTCHAIN.INPUT_FIRST_ROW, 1, OPTCHAIN.INPUT_ROWS, OPTCHAIN.INPUT_COLS).getValues();
   let rows = [];
+  let allCands = [];
   let greeksComputed = false;
   let oiMissing = false;
 
@@ -118,6 +120,7 @@ function chainRun_(isAuto) {
     try {
       const res = chainOne_(token, ticker, r, rate);
       rows = rows.concat(res.rows);
+      allCands = allCands.concat(res.cands);
       if (res.computed) greeksComputed = true;
       if (res.oiMissing) oiMissing = true;
       if (!res.rows.length) notes.push(ticker + ': no strikes matched the filters');
@@ -137,6 +140,7 @@ function chainRun_(isAuto) {
     chainFormat_(sh, rows.length);
     chainHighlight_(sh, rows);
   }
+  chainTop_(sh, allCands);
 
   const parts = ['OK: ' + rows.length + ' rows'];
   if (greeksComputed) parts.push('Greeks computed by script (Black-Scholes), not broker values');
@@ -185,6 +189,7 @@ function chainOne_(token, ticker, r, rate) {
 
   const quotes = chainQuotes_(token, wanted.map(function (w) { return w.sym; }));
   const byExpiry = {};
+  const cands = [];
   let computed = false, anyOi = false;
 
   wanted.forEach(function (w) {
@@ -223,6 +228,13 @@ function chainOne_(token, ticker, r, rate) {
     const row = [ticker, w.exp, w.days, w.k, mid, extr, spot, extr / mid, absDelta, iv * 100,
                  bid, ask, ask - bid, isFinite(vol) ? vol : 0, isFinite(oi) ? oi : 0, theta, vega, gamma,
                  mid / (isPut ? w.k : spot), (mid / (isPut ? w.k : spot)) * 365 / w.days];
+    const rr = chainRoi_(isPut, spot, w.k, mid, w.days, iv);
+    const maxSp = isPut ? OPTCHAIN.ROI.MAX_SPREAD_PUT : OPTCHAIN.ROI.MAX_SPREAD_CALL;
+    cands.push({
+      liquid: (isFinite(oi) ? oi : 0) >= OPTCHAIN.ROI.MIN_OI && (ask - bid) / mid <= maxSp,
+      ann: rr.ann,
+      vals: [ticker + (isPut ? ' P' : ' C'), w.exp, w.k, mid, absDelta, isFinite(oi) ? oi : 0, rr.be, rr.bear, rr.base, rr.bull, rr.ann]
+    });
     (byExpiry[w.exp] = byExpiry[w.exp] || []).push({ row: row, oi: isFinite(oi) ? oi : 0, vol: isFinite(vol) ? vol : 0, sp: (ask - bid) / mid });
   });
 
@@ -237,7 +249,7 @@ function chainOne_(token, ticker, r, rate) {
   });
   picked.sort(function (a, b) { return a.row[2] - b.row[2] || a.row[3] - b.row[3]; });
 
-  return { rows: picked.slice(0, maxRows).map(function (p) { return p.row; }), computed: computed, oiMissing: !anyOi && picked.length > 0 };
+  return { rows: picked.slice(0, maxRows).map(function (p) { return p.row; }), computed: computed, oiMissing: !anyOi && picked.length > 0, cands: cands };
 }
 
 /* ---------------------------------------------------------------- market block */
@@ -406,6 +418,40 @@ function onEdit(e) {
       else if (t === 'CALL') sh.getRange(r, 3, 1, 4).setValues([[0.70, 0.85, 300, 800]]);
     }
   } catch (err) { /* never block an edit */ }
+}
+
+// ROI under bear / base / bull scenarios, held to expiry.
+// Stock move over the period = (1 + drift + k x IV) ^ (days/365), k = -1, 0, +1 (probabilities 25/50/25).
+// CALL (buying): return on the premium paid.   PUT (selling, cash-secured): return on the strike collateral.
+function chainRoi_(isPut, S, K, mid, days, iv) {
+  const R = OPTCHAIN.ROI, T = days / 365;
+  const ret = R.K.map(function (k) {
+    const g = S * Math.pow(Math.max(1 + R.DRIFT + k * iv, 0.01), T);
+    return isPut ? (mid - Math.max(K - g, 0)) / K : Math.max(g - K, 0) / mid - 1;
+  });
+  const exp = ret[0] * R.P[0] + ret[1] * R.P[1] + ret[2] * R.P[2];
+  return {
+    bear: ret[0], base: ret[1], bull: ret[2],
+    ann: (1 + exp) > 0 ? Math.pow(1 + exp, 1 / T) - 1 : -1,
+    be: isPut ? (K - mid) / S - 1 : (K + mid) / S - 1
+  };
+}
+
+// Top results by annualized expected ROI (liquid contracts only) in J1:T7
+function chainTop_(sh, cands) {
+  const top = cands.filter(function (c) { return c.liquid; })
+    .sort(function (a, b) { return b.ann - a.ann; })
+    .slice(0, OPTCHAIN.ROI.TOP);
+  sh.getRange(1, 10, OPTCHAIN.ROI.TOP + 2, 11).clearContent();
+  sh.getRange(1, 10).setValue('TOP ' + OPTCHAIN.ROI.TOP + ' BY EXPECTED ROI (liquid only: OI>=' + OPTCHAIN.ROI.MIN_OI + ')');
+  sh.getRange(2, 10, 1, 11).setValues([['Ticker', 'Expiry', 'Strike', 'Mid', 'Delta', 'Open Int',
+    'Breakeven %', 'ROI Bear', 'ROI Base', 'ROI Bull', 'Annualized ROI']]).setFontWeight('bold');
+  if (!top.length) { sh.getRange(3, 10).setValue('none liquid'); return; }
+  sh.getRange(3, 10, top.length, 11).setValues(top.map(function (c) { return c.vals; }));
+  sh.getRange(3, 12, top.length, 2).setNumberFormat('0.00');
+  sh.getRange(3, 14, top.length, 1).setNumberFormat('0.00');
+  sh.getRange(3, 15, top.length, 1).setNumberFormat('#,##0');
+  sh.getRange(3, 16, top.length, 5).setNumberFormat('0.0%');
 }
 
 // Highlight, for each ticker + expiry, the row with the highest open interest
