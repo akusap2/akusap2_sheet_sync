@@ -138,7 +138,7 @@ function chainRun_(isAuto) {
   if (rows.length) {
     const rng = sh.getRange(OPTCHAIN.FIRST_ROW, 1, rows.length, OPTCHAIN.HEADERS.length);
     rng.setValues(rows);
-    chainFormat_(sh, rows.length);
+    chainFormat_(sh, rows.length, rows);
     chainHighlight_(sh, rows);
   }
   chainTop_(sh, allCands);
@@ -267,6 +267,7 @@ function chainMarket_(sh, token, notes) {
   sh.getRange(M.SPY).setValue(isFinite(spy) ? spy : 'n/a');
   sh.getRange(M.QQQ).setValue(isFinite(qqq) ? qqq : 'n/a');
   sh.getRange(M.TNX).setValue(isFinite(tnx) ? tnx : 'n/a');
+  sh.getRange(M.VIX).setNumberFormat('0'); sh.getRange(M.SPY).setNumberFormat('#,##0'); sh.getRange(M.QQQ).setNumberFormat('#,##0'); sh.getRange(M.TNX).setNumberFormat('0.0');
   sh.getRange(M.STAMP).setValue(new Date()).setNumberFormat('yyyy-mm-dd hh:mm:ss');
   if (!isFinite(vix)) notes.push('VIX not available from API');
   if (!isFinite(tnx)) notes.push('10Y yield not available, using ' + (OPTCHAIN.DEFAULT_RATE * 100) + '%');
@@ -481,8 +482,8 @@ function chainTop_(sh, cands) {
     if (b >= 0) sh.getRange(3 + i, 11 + b * 3, 1, 3).setBackground('#b7e1cd');
   });
   for (let b = 0; b < 3; b++) {
-    sh.getRange(3, 12 + b * 3, out.length, 1).setNumberFormat('#,##0.00');
-    sh.getRange(3, 13 + b * 3, out.length, 1).setNumberFormat('0.0%');
+    sh.getRange(3, 12 + b * 3, out.length, 1).setNumberFormat(put ? '#,##0.00' : '#,##0');
+    sh.getRange(3, 13 + b * 3, out.length, 1).setNumberFormat('0%');
   }
 }
 
@@ -520,16 +521,22 @@ function chainStatus_(sh, msg) {
   sh.getRange(OPTCHAIN.STATUS_ROW, 3).setValue(msg);
 }
 
-function chainFormat_(sh, n) {
+function chainFormat_(sh, n, rows) {
   const r0 = OPTCHAIN.FIRST_ROW;
-  sh.getRange(r0, 4, n, 4).setNumberFormat('0.00');        // strike, mid, extrinsic $, stock
-  sh.getRange(r0, 8, n, 1).setNumberFormat('0.0%');        // extrinsic %
-  sh.getRange(r0, 9, n, 1).setNumberFormat('0.00');        // delta
-  sh.getRange(r0, 10, n, 1).setNumberFormat('0.0');        // IV %
-  sh.getRange(r0, 11, n, 3).setNumberFormat('0.00');       // bid, ask, spread
-  sh.getRange(r0, 14, n, 2).setNumberFormat('#,##0');      // volume, open interest
-  sh.getRange(r0, 16, n, 3).setNumberFormat('0.000');      // theta, vega, gamma
-  sh.getRange(r0, 19, n, 2).setNumberFormat('0.0%');       // yield, annualized yield (put: mid/strike; call: mid/stock)
+  // whole numbers everywhere, except cheap options (avg price under $20, e.g. short-dated puts) keep cents
+  const avg = rows.reduce(function (a, r) { return a + r[4]; }, 0) / Math.max(rows.length, 1);
+  const px = avg < 20 ? '#,##0.00' : '#,##0';
+  sh.getRange(r0, 4, n, 1).setNumberFormat('General');       // strike (keeps 152.5)
+  sh.getRange(r0, 5, n, 2).setNumberFormat(px);              // mid, extrinsic $
+  sh.getRange(r0, 7, n, 1).setNumberFormat('#,##0');         // stock
+  sh.getRange(r0, 8, n, 1).setNumberFormat('0%');            // extrinsic %
+  sh.getRange(r0, 9, n, 1).setNumberFormat('0.00');          // delta (a whole number would be meaningless)
+  sh.getRange(r0, 10, n, 1).setNumberFormat('0');            // IV %
+  sh.getRange(r0, 11, n, 3).setNumberFormat(px);             // bid, ask, spread
+  sh.getRange(r0, 14, n, 2).setNumberFormat('#,##0');        // volume, open interest
+  sh.getRange(r0, 16, n, 2).setNumberFormat('0.00');         // theta, vega
+  sh.getRange(r0, 18, n, 1).setNumberFormat('0.000');        // gamma
+  sh.getRange(r0, 19, n, 2).setNumberFormat(avg < 20 ? '0.0%' : '0%');   // yield, annualized yield
 }
 
 function chainPick_(o, keys) {
