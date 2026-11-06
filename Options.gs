@@ -39,7 +39,8 @@ var OPTCHAIN = {
   DEFAULT_RATE: 0.04,                   // used if the 10Y yield cannot be read
   DIV: { SPY: 0.012, QQQ: 0.006, IWM: 0.012, DIA: 0.015 },
   DEFAULT_DIV: 0.01,
-  ROI: { DRIFT: 0.08, K: [-1, 0, 1], P: [0.25, 0.5, 0.25], MIN_OI: 100, MAX_SPREAD_CALL: 0.03, MAX_SPREAD_PUT: 0.10, TOP: 5 },
+  ROI: { DRIFT: 0.08, Z: [-0.6745, 0, 0.6745], MIN_OI: 100, MAX_SPREAD_CALL: 0.03, MAX_SPREAD_PUT: 0.10,
+         EDGES_CALL: [420, 600], EDGES_PUT: [35, 47] },
   MAX_SYMBOLS: 3000,                    // safety cap on option symbols requested per ticker
   HEADERS: ['Ticker', 'Expiry', 'Days', 'Strike', 'Mid', 'Extrinsic $', 'Stock', 'Extrinsic %', 'Delta', 'IV %',
             'Bid', 'Ask', 'Spread $', 'Volume', 'Open Int', 'Theta', 'Vega', 'Gamma', 'Yield %', 'Ann. Yield %']
@@ -232,8 +233,8 @@ function chainOne_(token, ticker, r, rate) {
     const maxSp = isPut ? OPTCHAIN.ROI.MAX_SPREAD_PUT : OPTCHAIN.ROI.MAX_SPREAD_CALL;
     cands.push({
       liquid: (isFinite(oi) ? oi : 0) >= OPTCHAIN.ROI.MIN_OI && (ask - bid) / mid <= maxSp,
-      ann: rr.ann,
-      vals: [ticker + (isPut ? ' P' : ' C'), w.exp, w.k, mid, absDelta, isFinite(oi) ? oi : 0, rr.be, rr.bear, rr.base, rr.bull, rr.ann]
+      ann: rr.ann, rr: rr, isPut: isPut, label: ticker + (isPut ? ' P' : ' C'),
+      exp: w.exp, days: w.days, k: w.k, mid: mid, delta: absDelta, oi: isFinite(oi) ? oi : 0
     });
     (byExpiry[w.exp] = byExpiry[w.exp] || []).push({ row: row, oi: isFinite(oi) ? oi : 0, vol: isFinite(vol) ? vol : 0, sp: (ask - bid) / mid });
   });
@@ -420,38 +421,69 @@ function onEdit(e) {
   } catch (err) { /* never block an edit */ }
 }
 
-// ROI under bear / base / bull scenarios, held to expiry.
-// Stock move over the period = (1 + drift + k x IV) ^ (days/365), k = -1, 0, +1 (probabilities 25/50/25).
+// Expected ROI if held to expiry. Stock at expiry is lognormal with the option's own IV:
+//   S_T = S * exp((drift - IV^2/2) * T + z * IV * sqrt(T))
+// Expected ROI uses the exact expected payoff (drift in place of the risk-free rate), so a longer
+// option does not get extra credit just for being longer. Bear / Base / Bull = 25th / 50th / 75th percentile.
 // CALL (buying): return on the premium paid.   PUT (selling, cash-secured): return on the strike collateral.
 function chainRoi_(isPut, S, K, mid, days, iv) {
-  const R = OPTCHAIN.ROI, T = days / 365;
-  const ret = R.K.map(function (k) {
-    const g = S * Math.pow(Math.max(1 + R.DRIFT + k * iv, 0.01), T);
-    return isPut ? (mid - Math.max(K - g, 0)) / K : Math.max(g - K, 0) / mid - 1;
+  const R = OPTCHAIN.ROI, T = days / 365, sq = iv * Math.sqrt(T), mu = R.DRIFT;
+  const d1 = (Math.log(S / K) + (mu + iv * iv / 2) * T) / sq, d2 = d1 - sq;
+  const fwd = S * Math.exp(mu * T);
+  const ePay = isPut ? K * chainCdf_(-d2) - fwd * chainCdf_(-d1) : fwd * chainCdf_(d1) - K * chainCdf_(d2);
+  const exp = isPut ? (mid - ePay) / K : ePay / mid - 1;
+  const sc = R.Z.map(function (z) {
+    const g = S * Math.exp((mu - iv * iv / 2) * T + z * sq);
+    const pay = isPut ? Math.max(K - g, 0) : Math.max(g - K, 0);
+    return isPut ? (mid - pay) / K : pay / mid - 1;
   });
-  const exp = ret[0] * R.P[0] + ret[1] * R.P[1] + ret[2] * R.P[2];
   return {
-    bear: ret[0], base: ret[1], bull: ret[2],
+    bear: sc[0], base: sc[1], bull: sc[2],
     ann: (1 + exp) > 0 ? Math.pow(1 + exp, 1 / T) - 1 : -1,
     be: isPut ? (K - mid) / S - 1 : (K + mid) / S - 1
   };
 }
 
-// Top results by annualized expected ROI (liquid contracts only) in J1:T7
+// Best liquid contract per ticker for three expiry buckets, shown in J1:S7 (hover a contract cell for details)
 function chainTop_(sh, cands) {
-  const top = cands.filter(function (c) { return c.liquid; })
-    .sort(function (a, b) { return b.ann - a.ann; })
-    .slice(0, OPTCHAIN.ROI.TOP);
-  sh.getRange(1, 10, OPTCHAIN.ROI.TOP + 2, 11).clearContent();
-  sh.getRange(1, 10).setValue('TOP ' + OPTCHAIN.ROI.TOP + ' BY EXPECTED ROI (liquid only: OI>=' + OPTCHAIN.ROI.MIN_OI + ')');
-  sh.getRange(2, 10, 1, 11).setValues([['Ticker', 'Expiry', 'Strike', 'Mid', 'Delta', 'Open Int',
-    'Breakeven %', 'ROI Bear', 'ROI Base', 'ROI Bull', 'Annualized ROI']]).setFontWeight('bold');
-  if (!top.length) { sh.getRange(3, 10).setValue('none liquid'); return; }
-  sh.getRange(3, 10, top.length, 11).setValues(top.map(function (c) { return c.vals; }));
-  sh.getRange(3, 12, top.length, 2).setNumberFormat('0.00');
-  sh.getRange(3, 14, top.length, 1).setNumberFormat('0.00');
-  sh.getRange(3, 15, top.length, 1).setNumberFormat('#,##0');
-  sh.getRange(3, 16, top.length, 5).setNumberFormat('0.0%');
+  const R = OPTCHAIN.ROI;
+  sh.getRange(1, 10, 7, 11).clearContent().clearNote();
+  sh.getRange(3, 10, OPTCHAIN.INPUT_ROWS, 10).setBackground(null);
+  const labels = [];
+  cands.forEach(function (c) { if (labels.indexOf(c.label) < 0) labels.push(c.label); });
+  const put = cands.length && cands[0].isPut;
+  const E = put ? R.EDGES_PUT : R.EDGES_CALL;
+  const names = [ '<=' + E[0] + 'd', (E[0] + 1) + '-' + E[1] + 'd', '>' + E[1] + 'd' ];
+  const bucket = function (d) { return d <= E[0] ? 0 : (d <= E[1] ? 1 : 2); };
+  sh.getRange(1, 10).setValue('BEST BY EXPECTED ROI, ONE PER TICKER PER EXPIRY BUCKET (liquid only: OI>=' + R.MIN_OI + ')');
+  const head = ['Ticker'];
+  names.forEach(function (n) { head.push(n + ' contract', 'Mid', 'Ann ROI'); });
+  sh.getRange(2, 10, 1, 10).setValues([head]).setFontWeight('bold');
+  const out = [], notes = [], winners = [];
+  labels.slice(0, OPTCHAIN.INPUT_ROWS).forEach(function (lb) {
+    const row = [lb], nrow = [''];
+    let bestB = -1, bestA = -Infinity;
+    for (let b = 0; b < 3; b++) {
+      const best = cands.filter(function (c) { return c.label === lb && c.liquid && bucket(c.days) === b; })
+        .sort(function (a, z) { return z.ann - a.ann; })[0];
+      if (!best) { row.push('-', '', ''); nrow.push('', '', ''); continue; }
+      row.push(best.exp + ' $' + best.k, best.mid, best.ann);
+      if (best.ann > bestA) { bestA = best.ann; bestB = b; }
+      nrow.push('Delta ' + best.delta.toFixed(2) + ' | OI ' + best.oi + ' | Breakeven ' + (best.rr.be * 100).toFixed(1) + '%\n' +
+        'Bear ' + (best.rr.bear * 100).toFixed(0) + '% / Base ' + (best.rr.base * 100).toFixed(0) + '% / Bull ' + (best.rr.bull * 100).toFixed(0) + '%', '', '');
+    }
+    out.push(row); notes.push(nrow); winners.push(bestB);
+  });
+  if (!out.length) { sh.getRange(3, 10).setValue('none'); return; }
+  sh.getRange(3, 10, out.length, 10).setValues(out).setNumberFormat('General');
+  sh.getRange(3, 10, out.length, 10).setNotes(notes);
+  winners.forEach(function (b, i) {   // highlight the best bucket for each ticker
+    if (b >= 0) sh.getRange(3 + i, 11 + b * 3, 1, 3).setBackground('#b7e1cd');
+  });
+  for (let b = 0; b < 3; b++) {
+    sh.getRange(3, 12 + b * 3, out.length, 1).setNumberFormat('#,##0.00');
+    sh.getRange(3, 13 + b * 3, out.length, 1).setNumberFormat('0.0%');
+  }
 }
 
 // Highlight, for each ticker + expiry, the row with the highest open interest
