@@ -4,7 +4,7 @@
  *
  * ONE-TIME SETUP
  *  1. Project Settings > Script Properties. Add:
- *       TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REFRESH_TOKEN
+ *       TASTY_CLIENT_SECRET, TASTY_REFRESH_TOKEN  (already set if Momentum.gs works)
  *     (never paste these into the sheet or into this file)
  *  2. Paste this whole file into a NEW file named Option.gs and save.
  *  3. In the editor pick the function chainSetup and click Run (authorize when asked).
@@ -20,8 +20,8 @@
  *   Market  V2 VIX | V3 SPY | V4 QQQ | V5 10Y yield % | V6 updated time
  *   Status  A8 "Last run:" | B8 time | C8 status message
  *   Results row 10 = headers, rows 11+ = data, columns A-R:
- *           Ticker | Expiry | Days | Strike | Delta | IV % | Stock | Bid | Ask | Mid | Spread $ |
- *           Extrinsic $ | Extrinsic % | Volume | Open Int | Theta | Vega | Gamma
+ *           Ticker | Expiry | Days | Strike | Mid | Extrinsic $ | Stock | Extrinsic % | Delta | IV % |
+ *           Bid | Ask | Spread $ | Volume | Open Int | Theta | Vega | Gamma
  *   Columns X onward (spread calculator) are never touched.
  */
 
@@ -35,13 +35,13 @@ var OPTCHAIN = {
   FIRST_ROW: 11,
   CLEAR_COLS: 23,                       // clears A:W below the header; X+ (calculator) is left alone
   MKT: { VIX: 'V2', SPY: 'V3', QQQ: 'V4', TNX: 'V5', STAMP: 'V6' },
-  BASES: ['https://api.tastytrade.com', 'https://api.tastyworks.com'],
+  BASES: ['https://api.tastyworks.com', 'https://api.tastytrade.com'],
   DEFAULT_RATE: 0.04,                   // used if the 10Y yield cannot be read
   DIV: { SPY: 0.012, QQQ: 0.006, IWM: 0.012, DIA: 0.015 },
   DEFAULT_DIV: 0.01,
   MAX_SYMBOLS: 3000,                    // safety cap on option symbols requested per ticker
-  HEADERS: ['Ticker', 'Expiry', 'Days', 'Strike', 'Delta', 'IV %', 'Stock', 'Bid', 'Ask', 'Mid',
-            'Spread $', 'Extrinsic $', 'Extrinsic %', 'Volume', 'Open Int', 'Theta', 'Vega', 'Gamma']
+  HEADERS: ['Ticker', 'Expiry', 'Days', 'Strike', 'Mid', 'Extrinsic $', 'Stock', 'Extrinsic %', 'Delta', 'IV %',
+            'Bid', 'Ask', 'Spread $', 'Volume', 'Open Int', 'Theta', 'Vega', 'Gamma', 'Yield %', 'Ann. Yield %']
 };
 
 /* ---------------------------------------------------------------- menu / setup */
@@ -129,10 +129,13 @@ function chainRun_(isAuto) {
   chainWriteHeaders_(sh);
   const total = Math.max(sh.getMaxRows() - OPTCHAIN.FIRST_ROW + 1, 1);
   sh.getRange(OPTCHAIN.FIRST_ROW, 1, total, OPTCHAIN.CLEAR_COLS).clearContent();
+  sh.getRange(OPTCHAIN.FIRST_ROW, 1, total, OPTCHAIN.HEADERS.length).setBackground(null);   // clear old highlights
+  chainTypeDropdown_(sh);
   if (rows.length) {
     const rng = sh.getRange(OPTCHAIN.FIRST_ROW, 1, rows.length, OPTCHAIN.HEADERS.length);
     rng.setValues(rows);
     chainFormat_(sh, rows.length);
+    chainHighlight_(sh, rows);
   }
 
   const parts = ['OK: ' + rows.length + ' rows'];
@@ -145,7 +148,7 @@ function chainRun_(isAuto) {
 /* ---------------------------------------------------------------- one ticker */
 
 function chainOne_(token, ticker, r, rate) {
-  const isPut = String(r[1]).toUpperCase() === 'PUT';
+  const isPut = String(r[1]).toUpperCase().trim() === 'PUT';
   const minD = chainNum_(r[2], 0), maxD = chainNum_(r[3], 1);
   const minDays = chainNum_(r[4], 0), maxDays = chainNum_(r[5], 100000);
   const topN = Math.max(1, Math.round(chainNum_(r[6], 6)));
@@ -167,7 +170,10 @@ function chainOne_(token, ticker, r, rate) {
         const sym = isPut ? s.put : s.call;
         if (!sym || !isFinite(k)) return;
         // rough pre-filter: only strikes that can plausibly sit inside a 0.6-0.9 delta window
-        const ok = isPut ? (k >= spot * 0.98 && k <= spot * 1.6) : (k <= spot * 1.02 && k >= spot * 0.5);
+        const otm = maxD <= 0.5;   // low-delta request (CSP / covered call) -> look at OTM strikes
+        const ok = isPut
+          ? (otm ? (k <= spot * 1.02 && k >= spot * 0.7) : (k >= spot * 0.98 && k <= spot * 1.6))
+          : (otm ? (k >= spot * 0.98 && k <= spot * 1.3) : (k <= spot * 1.02 && k >= spot * 0.5));
         if (ok) wanted.push({ sym: sym, exp: expStr, days: days, k: k });
       });
     });
@@ -214,8 +220,9 @@ function chainOne_(token, ticker, r, rate) {
     const oi = chainPick_(m, ['open-interest', 'openInterest']);
     if (oi > 0) anyOi = true;
 
-    const row = [ticker, w.exp, w.days, w.k, absDelta, iv * 100, spot, bid, ask, mid, ask - bid,
-                 extr, extr / mid, isFinite(vol) ? vol : 0, isFinite(oi) ? oi : 0, theta, vega, gamma];
+    const row = [ticker, w.exp, w.days, w.k, mid, extr, spot, extr / mid, absDelta, iv * 100,
+                 bid, ask, ask - bid, isFinite(vol) ? vol : 0, isFinite(oi) ? oi : 0, theta, vega, gamma,
+                 mid / (isPut ? w.k : spot), (mid / (isPut ? w.k : spot)) * 365 / w.days];
     (byExpiry[w.exp] = byExpiry[w.exp] || []).push({ row: row, oi: isFinite(oi) ? oi : 0, vol: isFinite(vol) ? vol : 0, sp: (ask - bid) / mid });
   });
 
@@ -275,10 +282,11 @@ function chainToken_() {
   if (cached) return cached;
 
   const p = PropertiesService.getScriptProperties();
-  const secret = p.getProperty('TT_CLIENT_SECRET');
-  const refresh = p.getProperty('TT_REFRESH_TOKEN');
-  const cid = p.getProperty('TT_CLIENT_ID');
-  if (!secret || !refresh) throw new Error('Missing Script Properties TT_CLIENT_SECRET / TT_REFRESH_TOKEN');
+  // Uses the same property names as Momentum.gs (TASTY_*); falls back to TT_* if present
+  const secret = p.getProperty('TASTY_CLIENT_SECRET') || p.getProperty('TT_CLIENT_SECRET');
+  const refresh = p.getProperty('TASTY_REFRESH_TOKEN') || p.getProperty('TT_REFRESH_TOKEN');
+  const cid = p.getProperty('TASTY_CLIENT_ID') || p.getProperty('TT_CLIENT_ID');
+  if (!secret || !refresh) throw new Error('Missing Script Properties TASTY_CLIENT_SECRET / TASTY_REFRESH_TOKEN');
 
   const body = { grant_type: 'refresh_token', refresh_token: refresh, client_secret: secret };
   if (cid) body.client_id = cid;
@@ -324,8 +332,8 @@ function chainGet_(path, token) {
 
 function chainQuotes_(token, symbols) {
   const out = {};
-  for (let i = 0; i < symbols.length; i += 100) {
-    const q = symbols.slice(i, i + 100).map(function (s) { return 'equity-option=' + encodeURIComponent(s); }).join('&');
+  for (let i = 0; i < symbols.length; i += 25) {
+    const q = symbols.slice(i, i + 25).map(function (s) { return 'equity-option=' + encodeURIComponent(s); }).join('&');
     const j = chainGet_('/market-data/by-type?' + q, token);
     ((j.data && j.data.items) || []).forEach(function (it) { out[chainKey_(it.symbol)] = it; });
   }
@@ -380,6 +388,46 @@ function chainGreeks_(isPut, S, K, T, r, q, mid) {
 
 /* ---------------------------------------------------------------- small helpers */
 
+// Switching Type (column B, rows 3-7) auto-fills the filters for that row:
+//   CALL -> delta 0.70-0.85, 300-800 days   (deep ITM LEAPS)
+//   PUT  -> delta 0.15-0.30, 25-60 days     (cash-secured puts)
+// You can still overwrite the numbers afterwards (e.g. an OTM covered call).
+// Simple trigger: runs by itself, no setup. If another file of yours also defines onEdit, merge the two.
+function onEdit(e) {
+  try {
+    const rg = e && e.range;
+    if (!rg) return;
+    const sh = rg.getSheet();
+    if (sh.getName() !== OPTCHAIN.SHEET || rg.getColumn() !== 2) return;
+    const first = OPTCHAIN.INPUT_FIRST_ROW, last = first + OPTCHAIN.INPUT_ROWS - 1;
+    for (let r = Math.max(rg.getRow(), first); r <= Math.min(rg.getLastRow(), last); r++) {
+      const t = String(sh.getRange(r, 2).getValue()).toUpperCase().trim();
+      if (t === 'PUT') sh.getRange(r, 3, 1, 4).setValues([[0.15, 0.30, 25, 60]]);
+      else if (t === 'CALL') sh.getRange(r, 3, 1, 4).setValues([[0.70, 0.85, 300, 800]]);
+    }
+  } catch (err) { /* never block an edit */ }
+}
+
+// Highlight, for each ticker + expiry, the row with the highest open interest
+function chainHighlight_(sh, rows) {
+  const nCols = OPTCHAIN.HEADERS.length;
+  const best = {};
+  rows.forEach(function (r, i) {
+    const key = r[0] + '|' + r[1];
+    const oi = Number(r[14]) || 0;
+    if (oi > 0 && (best[key] === undefined || oi > (Number(rows[best[key]][14]) || 0))) best[key] = i;
+  });
+  const bg = rows.map(function () { return new Array(nCols).fill(null); });
+  Object.keys(best).forEach(function (k) { bg[best[k]] = new Array(nCols).fill('#ffe599'); });
+  sh.getRange(OPTCHAIN.FIRST_ROW, 1, rows.length, nCols).setBackgrounds(bg);
+}
+
+// CALL / PUT dropdown in the Type column of the input rows
+function chainTypeDropdown_(sh) {
+  const rule = SpreadsheetApp.newDataValidation().requireValueInList(['CALL', 'PUT'], true).setAllowInvalid(false).build();
+  sh.getRange(OPTCHAIN.INPUT_FIRST_ROW, 2, OPTCHAIN.INPUT_ROWS, 1).setDataValidation(rule);
+}
+
 function chainHeadersRow_() { return [OPTCHAIN.HEADERS]; }
 
 function chainWriteHeaders_(sh) {
@@ -396,13 +444,14 @@ function chainStatus_(sh, msg) {
 
 function chainFormat_(sh, n) {
   const r0 = OPTCHAIN.FIRST_ROW;
-  sh.getRange(r0, 5, n, 1).setNumberFormat('0.00');        // delta
-  sh.getRange(r0, 6, n, 1).setNumberFormat('0.0');         // IV %
-  sh.getRange(r0, 7, n, 5).setNumberFormat('0.00');        // stock, bid, ask, mid, spread
-  sh.getRange(r0, 12, n, 1).setNumberFormat('0.00');       // extrinsic $
-  sh.getRange(r0, 13, n, 1).setNumberFormat('0.0%');       // extrinsic %
+  sh.getRange(r0, 4, n, 4).setNumberFormat('0.00');        // strike, mid, extrinsic $, stock
+  sh.getRange(r0, 8, n, 1).setNumberFormat('0.0%');        // extrinsic %
+  sh.getRange(r0, 9, n, 1).setNumberFormat('0.00');        // delta
+  sh.getRange(r0, 10, n, 1).setNumberFormat('0.0');        // IV %
+  sh.getRange(r0, 11, n, 3).setNumberFormat('0.00');       // bid, ask, spread
   sh.getRange(r0, 14, n, 2).setNumberFormat('#,##0');      // volume, open interest
   sh.getRange(r0, 16, n, 3).setNumberFormat('0.000');      // theta, vega, gamma
+  sh.getRange(r0, 19, n, 2).setNumberFormat('0.0%');       // yield, annualized yield (put: mid/strike; call: mid/stock)
 }
 
 function chainPick_(o, keys) {
@@ -425,17 +474,4 @@ function chainKey_(sym) { return String(sym || '').replace(/\s+/g, ''); }
 
 function chainTry_(fn) {
   try { return fn(); } catch (e) { return NaN; }
-}
-
-/* ---------------------------------------------------------------- ONE-TIME KEY SAVER
- * 1. Replace the three PASTE_... values below (keep the quotes).
- * 2. Select chainSaveKeys in the function dropdown and click Run.
- * 3. Put the placeholders back (or delete this function) and save.
- */
-function chainSaveKeys() {
-  PropertiesService.getScriptProperties().setProperties({
-    TT_CLIENT_ID: 'd2905764-2a6e-47bb-9347-0bcefc9cd4a8',
-    TT_CLIENT_SECRET: '8d403d21be46a55ef8ffe3e99c0017b3e4acf4b9',
-    TT_REFRESH_TOKEN: 'eyJhbGciOiJFZERTQSIsInR5cCI6InJ0K2p3dCIsImtpZCI6InhlZURLbTI1MV9sU3BjV1BEbWJvYVlEUWVfamlwUksySFZzYWJOcFZMSkkiLCJqa3UiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbS9vYXV0aC9qd2tzIn0.eyJpc3MiOiJodHRwczovL2FwaS50YXN0eXRyYWRlLmNvbSIsInN1YiI6IlU3OTY4MWUxMC1lZWFkLTQ3MGYtOWI0NS1iZWM0NjI5ZGM2ZjQiLCJpYXQiOjE3OTM0NzIxODAsImF1ZCI6ImQyOTA1NzY0LTJhNmUtNDdiYi05MzQ3LTBiY2VmYzljZDRhOCIsImdyYW50X2lkIjoiR2RmYmMxMzZiLTc4NTMtNDY0OS1hY2E0LTg2YjdlZWNmNTgxYyIsInNjb3BlIjoicmVhZCB0cmFkZSJ9.iI6iew0-QH_3gk93rMbKbzUkt3jPyjbZ9pelyph5VoSX3BAtVvMmfVGxl2vXNgBeqrJYCrBSYmf-TuUe9QviDQ'
-  });
 }
