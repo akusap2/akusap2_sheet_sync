@@ -1062,6 +1062,7 @@ function swingScan_(opts) {
   const running = parseInt(props.getProperty('SWING_RUNNING') || '0', 10);
   if (running && Date.now() - running < 8 * 60000) { notify_(ui, 'Swing', 'A Swing run is still going. Try again in a minute.'); return null; }
   const map = swingEnsureHeaders_(sheet, SWING_HEADERS);
+  if (typeof applyExpiryFormat_ === 'function') applyExpiryFormat_(sheet, map);   // Expiry shows as Jan 21, 2028 on every scan
   const last = sheet.getLastRow();
   if (last < 2) { notify_(ui, 'Swing', 'No tickers on the tab.'); return null; }
   const width = sheet.getLastColumn(), data = sheet.getRange(2, 1, last - 1, width).getValues();
