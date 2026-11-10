@@ -1051,6 +1051,7 @@ function runLongScan(timeBudgetMsOverride, dryRun, opts) {
   const sheet = ss.getSheetByName(LONG_SHEET_NAME);
   if (!sheet) { notify_(ui, 'Long', 'No "' + LONG_SHEET_NAME + '" tab. Run setupLong once from the Apps Script editor.'); return; }
   const map = longEnsureHeaders_(sheet);
+  if (typeof applyExpiryFormat_ === 'function') applyExpiryFormat_(sheet, map);   // Expiry shows as Jan 21, 2028 on every scan
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) { notify_(ui, 'Long', 'Add tickers in column A first.'); return; }
   const width = sheet.getLastColumn();
