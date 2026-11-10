@@ -1321,6 +1321,7 @@ function runFlipScan(timeBudgetMsOverride, dryRun, opts) {
   }
 
   const map = flipEnsureHeaders_(sheet);
+  if (typeof applyExpiryFormat_ === 'function') applyExpiryFormat_(sheet, map);   // Expiry shows as Jan 21, 2028 on every scan
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) { notify_(ui, 'Flip', 'No tickers yet. Run 🔁 Flip > Promote Research Picks, or type tickers in column A.'); return null; }
   const width = sheet.getLastColumn();
