@@ -95,6 +95,11 @@ function swingLin_(v, zero, full) {
   const t = (v - zero) / (full - zero);
   return t < 0 ? 0 : (t > 1 ? 1 : t);
 }
+// 'Jan 21, 2028' from a yyyy-mm-dd string (no time zone involved)
+function swingNiceDate_(ymd) {
+  const p = String(ymd || '').split('-');
+  return p.length === 3 ? ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][+p[1] - 1] + ' ' + (+p[2]) + ', ' + p[0] : String(ymd || '');
+}
 function swingR2_(v) { return v == null || !isFinite(v) ? '' : Math.round(v * 100) / 100; }
 function swingR1_(v) { return v == null || !isFinite(v) ? '' : Math.round(v * 10) / 10; }
 function swingNum_(v) { if (v === '' || v == null) return null; const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[$,%\s]/g, '')); return isNaN(n) ? null : n; }
@@ -588,7 +593,7 @@ function swingOptionProposal_(ticker, side, price, stopPx, targetPx, token, et, 
     const q = fetchTastyMarketDataBatch_(syms, token);
     const cands = near.map(function (s, i) { const m = q[syms[i]] || {}; return { strike: s.strike, delta: m.delta, bid: m.bid, ask: m.ask, oi: m.oi, volume: m.volume, sym: syms[i] }; });
     const best = swingChooseContract_(cands, side, price, cfg);
-    if (!best) return { why: 'no liquid contract for ' + expYmd + ': ' + swingRejectText_(swingRejects_(cands, cfg), cfg, et.m >= 9 * 60 + 35 && et.m < 16 * 60 && et.dow < 6), expiryYmd: expYmd, dte: swingDaysBetween_(et.ymd, expYmd) };
+    if (!best) return { why: 'no liquid contract for ' + swingNiceDate_(expYmd) + ': ' + swingRejectText_(swingRejects_(cands, cfg), cfg, et.m >= 9 * 60 + 35 && et.m < 16 * 60 && et.dow < 6), expiryYmd: expYmd, dte: swingDaysBetween_(et.ymd, expYmd) };
     return { plan: swingPlan_(best, price, stopPx, targetPx, cfg, swingRiskUsd_()), expiryYmd: expYmd, strike: best.strike, sym: best.sym, dte: swingDaysBetween_(et.ymd, expYmd) };
   } catch (e) { return { why: 'option lookup failed: ' + (e && e.message ? e.message : e) }; }
 }
@@ -825,7 +830,7 @@ function swingFormatSheet_(sheet) {
   const map = swingHeaderMap_(sheet), n = Math.max(sheet.getMaxRows() - 1, 1);
   const fmt = function (h, f) { if (map[h]) sheet.getRange(2, map[h], n, 1).setNumberFormat(f); };
   ['Price', 'Entry', 'Mid', 'Limit', 'Stock Stop', 'Stock Target', 'Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); });
-  fmt('Change', '$#,##0.00;-$#,##0.00;$0.00'); fmt('P/L $', '$#,##0;-$#,##0;$0'); fmt('Risk $/lot', '$#,##0'); fmt('Expiry', 'yyyy-mm-dd'); fmt('LastRun', 'yyyy-mm-dd hh:mm');
+  fmt('Change', '$#,##0.00;-$#,##0.00;$0.00'); fmt('P/L $', '$#,##0;-$#,##0;$0'); fmt('Risk $/lot', '$#,##0'); fmt('Expiry', 'mmm d, yyyy'); fmt('LastRun', 'yyyy-mm-dd hh:mm');
   ['Score', 'RSI', 'ATR %', 'RS vs SPY %', 'RVOL', 'Off High %', 'IV Rank', 'TM Target %', 'TM Stop %', 'TM Avg R', 'Spread %', 'P/L %', 'R:R', 'Delta'].forEach(function (h) { fmt(h, '0.0'); });
   SWING_INPUT_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
   SWING_OUTPUT_HEADERS.forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground(SWING_USER_COLS.indexOf(h) >= 0 ? '#fce5cd' : '#d9ead3'); });
@@ -902,13 +907,18 @@ function swingAddTickers_() {
 function swingLogSheet_(create) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sh = ss.getSheetByName(SWING_LOG_SHEET);
-  if (sh) { swingEnsureHeaders_(sh, SWING_LOG_HEADERS); return sh; }
+  if (sh) {
+    const m0 = swingEnsureHeaders_(sh, SWING_LOG_HEADERS);
+    if (m0['Expiry']) sh.getRange(2, m0['Expiry'], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('mmm d, yyyy');
+    return sh;
+  }
   if (!create) return null;
   sh = ss.insertSheet(SWING_LOG_SHEET);
   sh.getRange(1, 1, 1, SWING_LOG_HEADERS.length).setValues([SWING_LOG_HEADERS]).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(1); sh.setFrozenColumns(2);
   const map = swingHeaderMap_(sh);
-  ['Date', 'Entry Time', 'Exit Time', 'Expiry'].forEach(function (h) { sh.getRange(2, map[h], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('@'); });   // plain text: dates stay exactly as written
+  ['Date', 'Entry Time', 'Exit Time'].forEach(function (h) { sh.getRange(2, map[h], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('@'); });   // plain text: dates stay exactly as written
+  sh.getRange(2, map['Expiry'], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('mmm d, yyyy');   // a real date (Jan 21, 2028)
   ['Entry', 'Mark', 'Exit', 'Stock Entry', 'Stock Stop', 'Stock Target', 'Stock Exit'].forEach(function (h) { sh.getRange(2, map[h], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('$#,##0.00'); });
   ['P/L $', 'Open P/L $'].forEach(function (h) { sh.getRange(2, map[h], Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('$#,##0;-$#,##0;$0'); });
   return sh;
@@ -1181,7 +1191,7 @@ function swingScan_(opts) {
     phone.forEach(function (p) {
       const r = p.rec, plan = p.prop.plan;
       swingAlertOnce_('sig|' + p.t + '|' + r.Side + '|' + et.ymd, (p.blocked ? 'Swing (not approved) ' : 'Swing ') + (r.Side === 'LONG' ? 'BUY ' : 'SHORT ') + p.t,
-        (p.blocked ? 'NOT approved: ' + p.blocked + '\n' : 'Paper trade logged.\n') + r.Setup + ' | score ' + r.Score + '\n' + r.Contract + ' ' + r.Expiry + ' (' + r.DTE + 'd) delta ' + swingR2_(plan.delta) + ' limit ' + plan.limit +
+        (p.blocked ? 'NOT approved: ' + p.blocked + '\n' : 'Paper trade logged.\n') + r.Setup + ' | score ' + r.Score + '\n' + r.Contract + ' ' + r._expiryText + ' (' + r.DTE + 'd) delta ' + swingR2_(plan.delta) + ' limit ' + plan.limit +
         '\nstock ' + swingR2_(r['Stock Entry']) + ' stop ' + swingR2_(r['Stock Stop']) + ' target ' + swingR2_(r['Stock Target']) + ' | risk about $' + plan.riskLot + '/contract, qty ' + plan.qtySug + ' for $' + swingRiskUsd_() +
         '\nExit rules: stop, target, 50-day break, ' + C.trade.maxHoldDays + ' trading days, or ' + C.option.exitDte + ' DTE.', !p.blocked);
     });
@@ -1207,7 +1217,7 @@ const LONG_ETF_LIKE_ = { SPY: 1, QQQ: 1, IWM: 1, DIA: 1, XLK: 1, XLF: 1, XLE: 1,
 function swingNewRecord_(t, sg, price, prop, et, gate, od) {
   const p = prop.plan, hm = swingPad2_(Math.floor(et.m / 60)) + ':' + swingPad2_(et.m % 60);
   return { Date: et.ymd, Ticker: t, Action: gate.ok ? (sg.side === 'LONG' ? 'BUY' : 'SHORT') : 'BLOCKED', Side: sg.side, Setup: sg.setup, Score: sg.score, Approved: gate.ok ? 'YES' : 'NO', Status: 'OPEN',
-    Contract: (sg.side === 'LONG' ? 'C ' : 'P ') + prop.strike, Expiry: prop.expiryYmd, DTE: prop.dte, Delta: swingR2_(p.delta), 'Entry Time': et.ymd + ' ' + hm,
+    Contract: (sg.side === 'LONG' ? 'C ' : 'P ') + prop.strike, Expiry: new Date(+prop.expiryYmd.slice(0, 4), +prop.expiryYmd.slice(5, 7) - 1, +prop.expiryYmd.slice(8, 10), 12), _expiryText: swingNiceDate_(prop.expiryYmd), DTE: prop.dte, Delta: swingR2_(p.delta), 'Entry Time': et.ymd + ' ' + hm,
     'Stock Entry': swingR2_(price), 'Stock Stop': swingR2_(sg.stop), 'Stock Target': swingR2_(sg.target), Entry: p.limit, 'Spread %': swingR1_(p.spreadPct),
     'TM Verdict': od && !od.missing ? od.verdict : '', 'TM Avg R': od && !od.missing ? swingR2_(od.mcAvgR) : '', Symbol: prop.sym, 'Blocked By': gate.ok ? '' : gate.why.join('; '), Why: sg.why.join(' | ') };
 }

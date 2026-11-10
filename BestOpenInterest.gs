@@ -1014,7 +1014,7 @@ function writeResults_(sheet, resultRows) {
       numberOfRows,
       1
     )
-    .setNumberFormat('m/d/yyyy');
+    .setNumberFormat('mmm d, yyyy');
 
 
 

@@ -79,8 +79,15 @@ const LONG_CONFIG = {
     riskGate: 30,            // Risk = chance the premium is down 20%+ in 30 days (computeLeapPremiumLoss_)
     scoreBuy: 65, scoreReady: 50,
     qualityFloor: 65, qualityFloorEtf: 55,
-    regimeGate: true         // SPY under its 200-day: no new BUY (a would-be BUY is shown as READY). Set false to turn off.
+    regimeGate: true,        // SPY under its 200-day: no new BUY (a would-be BUY is shown as READY). Set false to turn off.
+    // The stock itself under its 200-day: no longer an automatic SKIP. It may sit this far under the 200-day (and its 50-day this far under the 200-day)
+    // and is still evaluated; Score then carries only a small 200-day weight. A strong moat + growth edge (edge.minForTolerance) earns the wider band.
+    below200: { tolerancePct: 8, edgeTolerancePct: 15, maxX50Under: 4, edgeMaxX50Under: 8 }
   },
+  // --- moat + growth edge (Yahoo fundamentals, cached 14 days per ticker; stocks only) -------------------------------------------
+  // Moat cannot be read off a feed: this rewards what a moat shows up as in the numbers (high gross / operating / free-cash-flow margins and returns on equity, size).
+  // Growth momentum = the latest quarter's revenue and earnings growth vs a year ago (price momentum is the RS vs SPY part of Trend). Adds up to moatPts + growthPts to Score (cap 100).
+  edge: { enabled: true, moatPts: 6, growthPts: 4, minForTolerance: 0.6, refreshDays: 14, sleepMs: 150 },
   // --- exits (held positions) -------------------------------------------------
   exits: { trendBandPct: 3, takeProfitPct: 50, rollDte: 180, reviewCarryPct: 12 },
   // --- runtime ---------------------------------------------------------------
@@ -152,7 +159,7 @@ function longNever_() {
 const LONG_INPUT_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry'];            // yours
 const LONG_HELD_WHEN_OPEN = ['Strike', 'Expiry'];                                // your entries while Qty is filled: never overwritten
 const LONG_EXTRA_HEADERS = ['Quality', 'Source', 'Type'];                        // written by Promote, not by the scan
-const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality',
+const LONG_VISIBLE_HEADERS = ['Ticker', 'Qty', 'Entry Date', 'Entry', 'Action', 'Score', 'Risk', 'Price', 'Change', 'Trend', 'Off High %', 'Quality', 'Moat', 'Growth',
   'Earn Days', 'IV Rank', 'Insider', 'Expiry', 'Strike', 'Delta', 'Mid', 'Spread %', 'OI', 'Vol', 'Lev', 'Roll By',
   'Days', 'P/L $', 'Why', 'LastRun'];
 const LONG_DETAIL_HEADERS = ['DTE', 'T200 %', 'X50 %', 'RSI', 'Bounce', '52w High', '52w Low', 'Analyst', 'Upside %', 'Next Earnings', 'HV20', 'RS vs SPY %', 'Ret 1M %',
@@ -316,9 +323,9 @@ function longFormatSheet_(sheet) {
   ['Entry', 'Price', 'Strike', 'Mid', 'Bid', 'Ask', '52w High', '52w Low', 'Analyst', 'Extrinsic $'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   fmt('Change', '$#,##0.00;-$#,##0.00;$0.00');
   fmt('Stock Equiv $', '$#,##0'); fmt('Capital Saved $', '$#,##0'); fmt('P/L $', '$#,##0;-$#,##0;$0');
-  ['Expiry', 'Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });   // Entry Date is yours: its format is never changed
+  ['Roll By', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); }); fmt('Expiry', 'mmm d, yyyy');   // Entry Date is yours: its format is never changed
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
-  ['Off High %', 'T200 %', 'X50 %', 'RS vs SPY %', 'Ret 1M %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RS vs SPY %', 'Ret 1M %', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality']
+  ['Off High %', 'T200 %', 'X50 %', 'RS vs SPY %', 'Ret 1M %', 'Spread %', 'Carry %/yr', 'Breakeven %', 'P/L %', 'Upside %', 'IV Rank', 'HV20', 'RS vs SPY %', 'Ret 1M %', 'RSI', 'Bounce', 'Risk', 'Risk 10%', 'Risk 30%', 'Quality', 'Moat', 'Growth']
     .forEach(function (h) { fmt(h, '0.0'); });
   ['Score', 'Delta', 'Lev'].forEach(function (h) { fmt(h, '0.00'); });
   LONG_INPUT_HEADERS.concat(LONG_HELD_WHEN_OPEN).forEach(function (h) { if (map[h]) sheet.getRange(1, map[h]).setBackground('#fff2cc'); });
@@ -340,7 +347,7 @@ function longLin_(v, zero, full) {
   return x < 0 ? 0 : (x > 1 ? 1 : x);
 }
 function longRound_(v, d) { const p = Math.pow(10, d == null ? 1 : d); return Math.round(v * p) / p; }
-function longFmtDate_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), 'MMM-dd-yyyy'); }
+function longFmtDate_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), 'MMM d, yyyy'); }
 function longYmd_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd'); }
 function longIsDate_(v) { return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime()); }
 function longDaysBetween_(from, to) { return Math.round((to.getTime() - from.getTime()) / 86400000); }
@@ -422,20 +429,45 @@ function longChooseContract_(cands, spot, cfg) {
   };
 }
 
-// Score 0-100: Quality 30 + Trend 20 + Entry timing 20 + Contract efficiency 20 + Upside 10. Missing inputs get half credit.
+// Moat + growth from Yahoo fundamentals f {roe, opm, gm, fcf, rev, rg, eg, capB} (fractions, as cspFetchFundamentals_ returns them). Pure.
+// moat / growth are 0..1 or null when too little data; edge = 0.6 moat + 0.4 growth (a missing part counts as 0), null when both are null.
+function longEdge_(f) {
+  if (!f) return null;
+  const lin = function (v, zero, full) { if (v == null || isNaN(v)) return null; const x = (v - zero) / (full - zero); return x < 0 ? 0 : (x > 1 ? 1 : x); };
+  const mean = function (a, min) { const v = a.filter(function (z) { return z != null; }); return v.length >= min ? v.reduce(function (t, z) { return t + z; }, 0) / v.length : null; };
+  const fcfM = (f.fcf != null && f.rev) ? f.fcf / f.rev * 100 : null;
+  const moat = mean([lin(f.gm != null ? f.gm * 100 : null, 35, 65), lin(f.opm != null ? f.opm * 100 : null, 15, 35), lin(f.roe != null ? f.roe * 100 : null, 15, 35),
+    lin(fcfM, 8, 28), lin(f.capB, 50, 300)], 3);
+  const growth = mean([lin(f.rg != null ? f.rg * 100 : null, 0, 15), lin(f.eg != null ? f.eg * 100 : null, 0, 20)], 1);
+  if (moat == null && growth == null) return null;
+  return { moat: moat, growth: growth, edge: 0.6 * (moat || 0) + 0.4 * (growth || 0) };
+}
+
+// Fundamentals once per refreshDays per ticker (the same Yahoo call the CSP quality screen uses). Returns longEdge_ output or null.
+function longFetchEdge_(ticker, ctx) {
+  const K = LONG_CONFIG.edge;
+  if (!K.enabled || typeof cspFetchFundamentals_ !== 'function') return null;
+  const res = getSlowCached_(ctx.slowCache, ctx.pending, 'LONGFUND', ticker, K.refreshDays, function () { return cspFetchFundamentals_(ticker); });
+  if (res.fetchAttempted) Utilities.sleep(K.sleepMs);
+  return longEdge_(res.value);
+}
+
+// Score 0-100: Quality 30 + Trend 17 + Entry timing 20 + Contract efficiency 20 + Upside 10 + Moat/growth edge up to 10 (capped at 100). Missing inputs get half credit
+// (edge: none). Trend 17 = vs 200-day 3 (partial credit down to -10%) + 50/200 gap 5 + relative strength vs SPY 9: the 200-day carries little weight now.
 function longScore_(x) {
   const p = {};
   p.quality = 30 * longLin_(x.quality, 50, 90);
-  // Trend 20 = vs 200-day 8 + 50/200 gap 5 + relative strength vs SPY 7 (stock's 3- and 6-month return minus SPY's, in points).
-  p.trend = 8 * longLin_(x.vs200, 0, 15) + 5 * longLin_(x.x50, 0, 8) + 7 * longLin_(x.rs, -5, 10);
+  p.trend = 3 * longLin_(x.vs200, -10, 10) + 5 * longLin_(x.x50, -4, 8) + 9 * longLin_(x.rs, -5, 10);
   // Timing 20 = RSI 7 + last-month dip 5 (full credit at -8% or lower) + closeness to the 52w high 4 + IV Rank 4.
   p.timing = 7 * longLin_(x.rsi, 60, 40) + 5 * longLin_(x.ret21, 0, -8) + 4 * longLin_(x.offHigh, 25, 10) + 4 * longLin_(x.ivr, 60, 20);
   p.contract = 13 * longLin_(x.carry, 8, 3) +      // bid-ask spread no longer scores; its 6 points moved to carry (+3) and delta (+3) so the total stays 20
     7 * (x.delta == null ? 0.5 : 1 - Math.min(1, Math.abs(x.delta - 0.85) / 0.1));
   p.upside = 10 * longLin_(x.upside, -5, 20);
+  const K = LONG_CONFIG.edge;
+  p.edge = K.enabled ? K.moatPts * (x.moat || 0) + K.growthPts * (x.growth || 0) : 0;
   let s = 0;
   Object.keys(p).forEach(function (k) { s += p[k]; });
-  return { score: longRound_(s, 1), parts: p };
+  return { score: longRound_(Math.min(100, s), 1), parts: p };
 }
 
 // Entry decision for a row you do NOT hold. x: vs200, x50, offHigh, rsi, ivr, bounce, fall, lowAge, quality (null ok), isEtf, risk (null ok),
@@ -443,8 +475,11 @@ function longScore_(x) {
 function longEvaluateEntry_(x, cfg) {
   const E = cfg.entry;
   const skip = [];
-  if (!(x.vs200 > 0)) skip.push('price under the 200-day' + (x.vs200 != null ? ' (' + longRound_(x.vs200, 1) + '%)' : ''));
-  if (!(x.x50 > 0)) skip.push('50-day under the 200-day');
+  const B = E.below200 || { tolerancePct: 0, edgeTolerancePct: 0, maxX50Under: 0, edgeMaxX50Under: 0 };
+  const strongEdge = x.edge != null && x.edge >= cfg.edge.minForTolerance;
+  const tol = strongEdge ? B.edgeTolerancePct : B.tolerancePct, tol50 = strongEdge ? B.edgeMaxX50Under : B.maxX50Under;
+  if (x.vs200 == null || x.vs200 < -tol) skip.push('price ' + (x.vs200 != null ? longRound_(-x.vs200, 1) + '% under' : 'vs') + ' the 200-day (limit ' + tol + '%' + (strongEdge ? ', widened by moat/growth' : '') + ')');
+  if (x.x50 == null || x.x50 < -tol50) skip.push('50-day ' + (x.x50 != null ? longRound_(-x.x50, 1) + '% ' : '') + 'under the 200-day (limit ' + tol50 + '%)');
   if (x.offHigh != null && x.offHigh > E.skipOffHigh) skip.push(longRound_(x.offHigh, 1) + '% under the 52-week high (limit ' + E.skipOffHigh + '%)');
   const qFloor = x.isEtf ? E.qualityFloorEtf : E.qualityFloor;
   if (x.quality != null && x.quality < qFloor) skip.push('Quality ' + longRound_(x.quality, 1) + ' < ' + qFloor);
@@ -471,7 +506,8 @@ function longEvaluateEntry_(x, cfg) {
   if (timingOk && x.score >= E.scoreBuy && E.regimeGate && x.regimeOk === false) {
     return { action: 'READY', why: ['market regime: SPY is under its 200-day, so no new BUY (this would otherwise be a BUY, Score ' + x.score + ')'] };
   }
-  if (timingOk && x.score >= E.scoreBuy) return { action: 'BUY', why: [(strong ? 'strong' : 'light') + ' pullback in an uptrend, Risk ' + longRound_(x.risk, 1) + ', Score ' + x.score] };
+  const belowNote = (x.vs200 != null && x.vs200 < 0) ? 'price ' + longRound_(-x.vs200, 1) + '% under the 200-day (allowed' + (strongEdge ? ': moat/growth edge' : '') + ')' : '';
+  if (timingOk && x.score >= E.scoreBuy) return { action: 'BUY', why: [(strong ? 'strong' : 'light') + ' pullback ' + (belowNote ? 'near' : 'in') + ' an uptrend, Risk ' + longRound_(x.risk, 1) + ', Score ' + x.score, belowNote] };
   if (x.score >= E.scoreReady) {
     if (!timingOk && bounceLane) return { action: 'READY', why: ['bounce lane (recovering ' + Math.round(x.bounce) + '% of the fall, low ' + x.lowAge + ' sessions ago), not a BUY', missing.join('; ')] };
     return { action: 'READY', why: missing };
@@ -887,6 +923,8 @@ function longProcessRow_(inp, ctx) {
   const target = isEtf ? null : longFetchAnalyst_(t, ctx);
   const upside = target ? (target / spot - 1) * 100 : null;
   if (target) { out.Analyst = target; out['Upside %'] = upside; }
+  const edgeInfo = isEtf ? null : longFetchEdge_(t, ctx);
+  if (edgeInfo) { out.Moat = edgeInfo.moat != null ? Math.round(edgeInfo.moat * 100) : ''; out.Growth = edgeInfo.growth != null ? Math.round(edgeInfo.growth * 100) : ''; }
 
   if (incomplete) {
     out.Action = 'FILL IN'; out.Why = fillMsg; out.SortKey = longSortKey_('FILL IN');
@@ -954,7 +992,8 @@ function longProcessRow_(inp, ctx) {
     // Score for a position you hold: the same 0-100 scoring a new candidate gets, applied to the position as it stands today (not an entry signal).
     try {
       out.Score = longScore_({ quality: inp.quality, vs200: vs200, x50: x50, rsi: tech.rsi, offHigh: offHigh, ivr: ivr, carry: m.carry, delta: c.delta,
-        upside: upside, ret21: tech.ret21, rs: rs }).score;
+        upside: upside, ret21: tech.ret21, rs: rs,
+        moat: edgeInfo ? edgeInfo.moat : null, growth: edgeInfo ? edgeInfo.growth : null }).score;
     } catch (e) { /* score is informational */ }
     out.SortKey = longSortKey_(ha.action, null, pl);
     return out;
@@ -963,7 +1002,9 @@ function longProcessRow_(inp, ctx) {
   // ----- a candidate -----
   // Speed: the chain download is the slowest call. A stock that already fails a hard gate is a SKIP whatever its contract looks like, so skip the lookup.
   const E0 = cfg.entry, qFloor0 = isEtf ? E0.qualityFloorEtf : E0.qualityFloor;
-  const stockFails = !(vs200 > 0) || !(x50 > 0) || (offHigh != null && offHigh > E0.skipOffHigh) || (inp.quality != null && inp.quality < qFloor0);
+  const strong0 = !!edgeInfo && edgeInfo.edge >= cfg.edge.minForTolerance, B0 = E0.below200;
+  const tol0 = strong0 ? B0.edgeTolerancePct : B0.tolerancePct, tol50_0 = strong0 ? B0.edgeMaxX50Under : B0.maxX50Under;
+  const stockFails = vs200 == null || vs200 < -tol0 || x50 == null || x50 < -tol50_0 || (offHigh != null && offHigh > E0.skipOffHigh) || (inp.quality != null && inp.quality < qFloor0);
   const pick = stockFails ? { ok: false, near: null, why: '' } : longGetContract_(t, spot, ctx);
   let contractOk = false, risk = null, score = null, m = null, c = null;
   if (pick.ok) {
@@ -984,7 +1025,7 @@ function longProcessRow_(inp, ctx) {
   const x = { vs200: vs200, x50: x50, offHigh: offHigh, rsi: tech.rsi, ivr: ivr, bounce: tech.bounce, fall: tech.fall, lowAge: tech.lowAge,
     quality: inp.quality, isEtf: isEtf, risk: risk, contractOk: contractOk, contractWhy: pick.why, upside: upside,
     carry: m ? m.carry : null, spreadPct: m ? m.spreadPct : null, delta: c ? c.delta : null,
-    ret21: tech.ret21, rs: rs, regimeOk: regimeOk };
+    ret21: tech.ret21, rs: rs, regimeOk: regimeOk, moat: edgeInfo ? edgeInfo.moat : null, growth: edgeInfo ? edgeInfo.growth : null, edge: edgeInfo ? edgeInfo.edge : null };
   if (contractOk) { score = longScore_(x).score; out.Score = score; }
   x.score = score;
   const ev = longEvaluateEntry_(x, cfg);
@@ -1292,7 +1333,7 @@ function longBuildAlertItems_(rw, res) {
   const r2 = function (v) { return (v === '' || v == null || isNaN(v)) ? '?' : (Math.round(v * 100) / 100).toFixed(2); };
   const a = res.Action;
   if (rw.isOpen && longIsDate_(rw.openExpiry)) {
-    const label = t + ' $' + rw.openStrike + 'C ' + Utilities.formatDate(rw.openExpiry, Session.getScriptTimeZone(), 'MMM d yyyy');
+    const label = t + ' $' + rw.openStrike + 'C ' + Utilities.formatDate(rw.openExpiry, Session.getScriptTimeZone(), 'MMM d, yyyy');
     const key = a + '|' + t + '|' + rw.openStrike + '|' + longYmd_(rw.openExpiry);
     const why = String(res.Why || '').replace(/^HELD: /, '');
     const mk = ' Mid ' + r2(res.Mid) + ' vs entry ' + r2(rw.openEntry) + (res['P/L %'] !== '' && res['P/L %'] != null ? ' (' + r2(res['P/L %']) + '%)' : '') + '.';
@@ -1303,7 +1344,7 @@ function longBuildAlertItems_(rw, res) {
   } else if (a === 'BUY' && longIsDate_(res.Expiry)) {
     items.push({
       kind: 'buy', key: 'BUY|' + t + '|' + longYmd_(res.Expiry),
-      text: 'BUY ' + t + ' ' + Utilities.formatDate(res.Expiry, Session.getScriptTimeZone(), 'MMM d yyyy') + ' $' + res.Strike + 'C @ ' + r2(res.Mid) +
+      text: 'BUY ' + t + ' ' + Utilities.formatDate(res.Expiry, Session.getScriptTimeZone(), 'MMM d, yyyy') + ' $' + res.Strike + 'C @ ' + r2(res.Mid) +
         ' (' + res.DTE + 'd, delta ' + r2(res.Delta) + ', carry ' + r2(res['Carry %/yr']) + '%/yr, spread ' + r2(res['Spread %']) + '%, Risk ' + r2(res.Risk) +
         ', Score ' + r2(res.Score) + '). Stock equiv $' + Math.round(res['Stock Equiv $']) + ' for $' + Math.round(res.Mid * 100) + ' per contract.'
     });

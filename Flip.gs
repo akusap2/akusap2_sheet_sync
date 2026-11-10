@@ -524,7 +524,7 @@ function flipFormatSheet_(sheet) {
   ['Risk $'].forEach(function (h) { fmt(h, '$#,##0'); });
   if (flipPnlCol_(map)) sheet.getRange(2, flipPnlCol_(map), maxRows, 1).setNumberFormat('$#,##0;-$#,##0;$0');
   fmt('Change', FLIP_CHANGE_FORMAT);
-  ['Expiry', 'Next Earnings'].forEach(function (h) { fmt(h, 'yyyy-mm-dd'); });   // Entry Date is yours: its format is never changed
+  fmt('Expiry', 'mmm d, yyyy'); fmt('Next Earnings', 'yyyy-mm-dd');   // Entry Date is yours: its format is never changed
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
   ['Off High %', 'T200 %', 'SMA20 %', 'RS5 %', 'ATR %', 'Sigma Day %', 'Spread %', 'Time Val %', 'Decay %/d', 'IV', 'VW %', 'Need %', 'P Hit %', 'BE Win %',
     'Edge Needed', 'Stop %', 'P/L %', 'Day %', 'Fit', 'Lev', 'Score', 'RVOL', 'Delta', 'AUP', 'ADN', 'RSI'].forEach(function (h) { fmt(h, '0.0'); });
@@ -700,7 +700,7 @@ function flipChooseContract_(cands, spot, cfg) {
     if (extPct > cfg.maxTimeValuePct) fails.push('time value ' + extPct.toFixed(0) + '% > ' + cfg.maxTimeValuePct + '%');
     if (fails.length) {
       const nScore = fails.length * 1000 + spreadPct;
-      if (!nearest || nScore < nearest.score) nearest = { score: nScore, x: x, mid: mid, spreadPct: spreadPct, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM-dd-yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
+      if (!nearest || nScore < nearest.score) nearest = { score: nScore, x: x, mid: mid, spreadPct: spreadPct, text: '$' + x.strike + 'C ' + (x.expiry ? Utilities.formatDate(x.expiry, 'America/New_York', 'MMM d, yyyy') : x.dte + 'd') + ': ' + fails.join(', ') };
       fails.forEach(function (f) { const k = f.replace(/[0-9.]+/g, '#'); rejects[k] = (rejects[k] || 0) + 1; }); if (!why) why = fails[0]; return; }
     const lev = x.delta * spot / mid;
     let decay = null;

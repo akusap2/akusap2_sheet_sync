@@ -1003,7 +1003,7 @@ function dayPushToAutoTrade_(rows, ymd, opt) {
       if (lastRow > 2) sh.getRange(2, 1, 1, sh.getLastColumn()).copyTo(sh.getRange(row, 1, 1, sh.getLastColumn()), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
       const put = function (c, v) { if (c) sh.getRange(row, c).setValue(v); };
       put(m.rank, ++rank); put(m.ticker, o.ticker);
-      put(m.expiry, expDate); if (m.expiry) sh.getRange(row, m.expiry).setNumberFormat('m/d/yyyy');
+      put(m.expiry, expDate); if (m.expiry) sh.getRange(row, m.expiry).setNumberFormat('mmm d, yyyy');
       put(m.strike, o.strikeText); put(m.type, o.orderType); put(m.lots, o.lots);
       put(m.limit, o.limit); if (m.limit) sh.getRange(row, m.limit).setNumberFormat('$#,##0.00');
       // option-premium exit prices from the Day plan (the tab's own stop/profit formulas assume a call; this is right for a put too)
@@ -2029,7 +2029,7 @@ function dayFormat_(sheet, n, map) {
   ['Price', 'Change', 'Entry Date', 'Entry', 'Qty'].forEach(center);
   ['Trigger', 'Stop', 'Target', 'OR High', 'OR Low', 'Prev Close', 'Pre High', 'Pre Low'].forEach(function (h) { fmt(h, '$#,##0.00'); });
   ['Gap %', 'VW %', 'ATR %', 'Spread %', 'P/L %'].forEach(function (h) { fmt(h, '0.00'); });
-  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0'); fmt('RSI 1m', '0.0'); fmt('AUP 5m', '0'); fmt('ADN 5m', '0'); center('RSI 1m'); center('AUP 5m'); center('ADN 5m'); fmt('TM Target %', '0.0'); fmt('TM Stop %', '0.0'); fmt('TM Open %', '0.0'); fmt('TM Avg R', '0.00');
+  ['Opt Mid', 'Opt Limit', 'Opt Stop', 'Opt Target', 'Opt Strike'].forEach(function (h) { fmt(h, '$#,##0.00'); }); fmt('Opt Expiry', 'mmm d, yyyy'); fmt('Opt Delta', '0.00'); fmt('Opt Spread %', '0.0'); fmt('Opt Qty', '0'); fmt('RSI 1m', '0.0'); fmt('AUP 5m', '0'); fmt('ADN 5m', '0'); center('RSI 1m'); center('AUP 5m'); center('ADN 5m'); fmt('TM Target %', '0.0'); fmt('TM Stop %', '0.0'); fmt('TM Open %', '0.0'); fmt('TM Avg R', '0.00');
   fmt('RVOL', '0.0'); fmt('Pre RVOL', '0.0'); fmt('Score', '0'); fmt('R', '0.0'); fmt('P/L $', '$#,##0.00;-$#,##0.00;$0.00'); fmt('LastRun', 'hh:mm');
   if (map.Change) {
     const rules = sheet.getConditionalFormatRules();

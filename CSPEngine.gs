@@ -506,7 +506,7 @@ function cspFormatSheet_(sheet) {
   fmt('Price', '$#,##0.00'); fmt('Strike', '$#,##0.00'); fmt('Bid', '$#,##0.00'); fmt('Ask', '$#,##0.00'); fmt('Mid', '$#,##0.00');
   fmt('Credit $', '$#,##0'); fmt('Cash Req', '$#,##0'); fmt('Breakeven', '$#,##0.00');
   fmt('TP25 Buyback', '$#,##0.00'); fmt('TP50 Buyback', '$#,##0.00'); fmt('Review Level', '$#,##0.00'); fmt('Open Mark', '$#,##0.00');
-  fmt('Expiry', 'yyyy-mm-dd'); fmt('Next Earnings', 'yyyy-mm-dd'); fmt('Time-Stop Date', 'yyyy-mm-dd');
+  fmt('Expiry', 'mmm d, yyyy'); fmt('Next Earnings', 'yyyy-mm-dd'); fmt('Time-Stop Date', 'yyyy-mm-dd');
   fmt('LastRun', 'yyyy-mm-dd hh:mm');
   ['Off 52w High %', 'vs 200d %', 'vs 50d %', 'Spread %', 'Yield %', 'Annualized %', 'Cushion %', 'Prob ITM %', 'P25 in 10d %', 'P50 in 10d %', 'Basis vs Max Buy %', 'Open P/L %', 'IV Rank', 'IV', 'HV20']
     .forEach(function (h) { fmt(h, '0.0'); });

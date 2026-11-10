@@ -290,7 +290,7 @@ function txSetupSheet() {
   const n = 300;
   if (m.type) sh.getRange(2, m.type, n, 1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['BTO', 'STO', 'BTC', 'STC', 'STP'], true).setAllowInvalid(false).build());
   if (m.status) sh.getRange(2, m.status, n, 1).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['Draft', TX_CONFIG.readyStatus, 'Sent', 'Live', 'In Position', 'Closed', 'Filled', 'Cancel sent', 'Cancelled', 'Rejected', 'Error', 'CHECK'], true).setAllowInvalid(true).build());
-  if (m.expiry) sh.getRange(2, m.expiry, n, 1).setNumberFormat('m/d/yyyy');
+  if (m.expiry) sh.getRange(2, m.expiry, n, 1).setNumberFormat('mmm d, yyyy');
   ['limit', 'stop', 'profit'].forEach(function (k) { if (m[k]) sh.getRange(2, m[k], n, 1).setNumberFormat('$#,##0.00'); });
   if (m.result) sh.setColumnWidth(m.result, 380);
   notify_(tryGetUi_(), 'Auto_Trade', 'Auto_Trade is ready. Rows with Status "' + TX_CONFIG.readyStatus + '" are what Dry Run / Place Orders send.');
