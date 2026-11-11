@@ -15,11 +15,11 @@
  * other script files, and no onOpen() is defined, so your existing menus are untouched.
  *
  * SHEET LAYOUT (tab "Chain")
- *   Inputs  rows 3-7, columns A-H:
+ *   Inputs  rows 3-17, columns A-H:
  *           Ticker | Type (CALL/PUT) | Min Delta | Max Delta | Min Days | Max Days | Top N per expiry | Max Rows
  *   Market  V2 VIX | V3 SPY | V4 QQQ | V5 10Y yield % | V6 updated time
- *   Status  A8 "Last run:" | B8 time | C8 status message
- *   Results row 10 = headers, rows 11+ = data, columns A-R:
+ *   Status  A18 "Last run:" | B18 time | C18 status message
+ *   Results row 20 = headers, rows 21+ = data, columns A-T:
  *           Ticker | Expiry | Days | Strike | Mid | Extrinsic $ | Stock | Extrinsic % | Delta | IV % |
  *           Bid | Ask | Spread $ | Volume | Open Int | Theta | Vega | Gamma
  *   Columns X onward (spread calculator) are never touched.
@@ -28,11 +28,11 @@
 var OPTCHAIN = {
   SHEET: 'Chain',
   INPUT_FIRST_ROW: 3,
-  INPUT_ROWS: 5,
+  INPUT_ROWS: 15,
   INPUT_COLS: 8,
-  STATUS_ROW: 8,
-  HEADER_ROW: 10,
-  FIRST_ROW: 11,
+  STATUS_ROW: 18,
+  HEADER_ROW: 20,
+  FIRST_ROW: 21,
   CLEAR_COLS: 23,                       // clears A:W below the header; X+ (calculator) is left alone
   MKT: { VIX: 'V2', SPY: 'V3', QQQ: 'V4', TNX: 'V5', STAMP: 'V6' },
   BASES: ['https://api.tastyworks.com', 'https://api.tastytrade.com'],
@@ -115,9 +115,11 @@ function chainRun_(isAuto) {
   let greeksComputed = false;
   let oiMissing = false;
 
+  const runStart = Date.now();
   inputs.forEach(function (r) {
     const ticker = String(r[0] || '').toUpperCase().trim();
     if (!ticker) return;
+    if (Date.now() - runStart > 270000) { notes.push(ticker + ': skipped (time budget)'); return; }   // stay under the 6-min limit
     try {
       const res = chainOne_(token, ticker, r, rate);
       rows = rows.concat(res.rows);
@@ -402,7 +404,7 @@ function chainGreeks_(isPut, S, K, T, r, q, mid) {
 
 /* ---------------------------------------------------------------- small helpers */
 
-// Switching Type (column B, rows 3-7) auto-fills the filters for that row:
+// Switching Type (column B, rows 3-17) auto-fills the filters for that row:
 //   CALL -> delta 0.70-0.85, 300-800 days   (deep ITM LEAPS)
 //   PUT  -> delta 0.15-0.30, 25-60 days     (cash-secured puts)
 // You can still overwrite the numbers afterwards (e.g. an OTM covered call).
@@ -448,7 +450,7 @@ function chainRoi_(isPut, S, K, mid, days, iv) {
 // Best liquid contract per ticker for three expiry buckets, shown in J1:S7 (hover a contract cell for details)
 function chainTop_(sh, cands) {
   const R = OPTCHAIN.ROI;
-  sh.getRange(1, 10, 7, 11).clearContent().clearNote();
+  sh.getRange(1, 10, OPTCHAIN.INPUT_ROWS + 2, 11).clearContent().clearNote();
   sh.getRange(3, 10, OPTCHAIN.INPUT_ROWS, 10).setBackground(null);
   const labels = [];
   cands.forEach(function (c) { if (labels.indexOf(c.label) < 0) labels.push(c.label); });
